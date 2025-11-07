@@ -1,0 +1,6 @@
+python-telegram-bot==21.*
+httpx
+openai
+python-dotenv
+Pillow
+aiosqlite
