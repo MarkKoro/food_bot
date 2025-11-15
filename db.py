@@ -3,549 +3,293 @@ import time
 from pathlib import Path
 from datetime import date
 
-DB_PATH = Path(__file__).with_name("credits.db")
+# Отдельная база под food-бота, чтобы не пересекаться с другими
+DB_PATH = Path(__file__).with_name("foodbot.db")
 
 
-async def create_tables(db):
-    await db.execute(
+async def create_tables(db: aiosqlite.Connection) -> None:
+    """Создать все таблицы, если их ещё нет."""
+    await db.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
-          id            INTEGER PRIMARY KEY,
-          credits       INTEGER    DEFAULT 0,
-          free_photo    INTEGER    DEFAULT 1,
-          free_text_dt  DATE       DEFAULT '',
-          ref_parent    INTEGER    DEFAULT 0,
-          text_cnt      INTEGER    DEFAULT 0,
-          photo_cnt     INTEGER    DEFAULT 0,
-          menu_msg      INTEGER    DEFAULT 0,
-          alias         TEXT       UNIQUE,
-          last_dt       DATE       DEFAULT '',
-          subscribed    INTEGER    DEFAULT 0,
-          last_sub_check INTEGER   DEFAULT 0
+            id            INTEGER PRIMARY KEY,
+            created_ts    INTEGER NOT NULL,
+            credits       INTEGER NOT NULL DEFAULT 0,
+            is_premium    INTEGER NOT NULL DEFAULT 0,
+            premium_until INTEGER NOT NULL DEFAULT 0,
+            referrer_id   INTEGER,
+            meals_total   INTEGER NOT NULL DEFAULT 0
         );
-        """
-    )
-    # upgrade legacy tables
-    try:
-        await db.execute("ALTER TABLE users ADD COLUMN text_cnt INTEGER DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        await db.execute("ALTER TABLE users ADD COLUMN photo_cnt INTEGER DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        await db.execute("ALTER TABLE users ADD COLUMN menu_msg INTEGER DEFAULT 0")
-    except Exception:
-        pass
-    try:
-        await db.execute("ALTER TABLE users ADD COLUMN alias TEXT UNIQUE")
-    except Exception:
-        pass
-    try:
-        await db.execute("ALTER TABLE users ADD COLUMN last_dt DATE DEFAULT ''")
-    except Exception:
-        pass
-    await db.execute(
-        """
+
+        CREATE TABLE IF NOT EXISTS invites (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            inviter_id  INTEGER NOT NULL,
+            invited_id  INTEGER NOT NULL,
+            created_ts  INTEGER NOT NULL
+        );
+
+        -- Сквозной учёт оплат: рубли, звёзды, промокоды и т.п.
         CREATE TABLE IF NOT EXISTS payments (
-          uid   INTEGER,
-          rub   INTEGER DEFAULT 0,
-          stars INTEGER DEFAULT 0,
-          ts    INTEGER DEFAULT (strftime('%s','now')),
-          method TEXT DEFAULT '',
-          provider_charge_id TEXT
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid         INTEGER NOT NULL,
+            provider    TEXT    NOT NULL,     -- 'rub', 'stars', 'promo'
+            amount      INTEGER NOT NULL,     -- копейки, звёзды или условные единицы
+            payload     TEXT,
+            created_ts  INTEGER NOT NULL
         );
-        """
-    )
-    try:
-        await db.execute(
-            "ALTER TABLE payments ADD COLUMN ts INTEGER DEFAULT (strftime('%s','now'))"
-        )
-    except Exception:
-        pass
-    try:
-        await db.execute(
-            "ALTER TABLE payments ADD COLUMN method TEXT DEFAULT ''"
-        )
-    except Exception:
-        pass
-    try:
-        await db.execute(
-            "ALTER TABLE payments ADD COLUMN provider_charge_id TEXT"
-        )
-    except Exception:
-        pass
-    await db.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS ix_payments_charge ON payments(provider_charge_id)"
-    )
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pay_clicks (
-          uid INTEGER,
-          ts  DATE DEFAULT CURRENT_DATE
+
+        -- Приёмы пищи
+        CREATE TABLE IF NOT EXISTS meals (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid      INTEGER NOT NULL,
+            ts       INTEGER NOT NULL,        -- unix time
+            date     TEXT    NOT NULL,        -- YYYY-MM-DD
+            kcal     REAL    NOT NULL,
+            protein  REAL    NOT NULL,
+            fat      REAL    NOT NULL,
+            carbs    REAL    NOT NULL,
+            raw_json TEXT    NOT NULL         -- полный ответ модели
         );
-        """
-    )
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS feedback (
-          uid  INTEGER,
-          kind TEXT,
-          good INTEGER
-        );
-        """
-    )
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS funnels (
-          kind  TEXT PRIMARY KEY,
-          start INTEGER DEFAULT 0,
-          done  INTEGER DEFAULT 0
+
+        -- Цели по КБЖУ на день
+        CREATE TABLE IF NOT EXISTS goals (
+            uid            INTEGER PRIMARY KEY,
+            kcal_target    INTEGER NOT NULL,
+            protein_target REAL    NOT NULL,
+            fat_target     REAL    NOT NULL,
+            carbs_target   REAL    NOT NULL
         );
         """
     )
     await db.commit()
 
 
-async def init_subscription(db):
-    """Add subscription cache columns if missing."""
-    try:
-        await db.execute(
-            "ALTER TABLE users ADD COLUMN subscribed INTEGER DEFAULT 0"
-        )
-    except Exception:
-        pass
-    try:
-        await db.execute(
-            "ALTER TABLE users ADD COLUMN last_sub_check INTEGER DEFAULT 0"
-        )
-    except Exception:
-        pass
-    await db.commit()
+# ── Пользователи и кредиты ────────────────────────────
 
 
-async def _ensure_user(db, uid: int):
-    await db.execute("INSERT OR IGNORE INTO users(id) VALUES(?)", (uid,))
-
-
-async def get_credits(db, uid: int) -> int:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT credits FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else 0
-
-
-async def add_credits(db, uid: int, n: int):
-    if n <= 0:
-        return
-    await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET credits = credits + ? WHERE id=?", (n, uid))
-    await db.commit()
-
-
-async def dec_credits(db, uid: int, n: int):
-    if n <= 0:
-        return
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT credits FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    have = row[0] if row else 0
-    if have < n:
-        raise ValueError("not enough credits")
-    await db.execute("UPDATE users SET credits = credits - ? WHERE id=?", (n, uid))
-    await db.commit()
-
-
-async def inc_text_cnt(db, uid: int):
-    await _ensure_user(db, uid)
-    today = date.today().isoformat()
-    await db.execute(
-        "UPDATE users SET text_cnt = text_cnt + 1, last_dt=? WHERE id=?",
-        (today, uid),
-    )
-    await db.commit()
-
-
-async def inc_photo_cnt(db, uid: int):
-    await _ensure_user(db, uid)
-    today = date.today().isoformat()
-    await db.execute(
-        "UPDATE users SET photo_cnt = photo_cnt + 1, last_dt=? WHERE id=?",
-        (today, uid),
-    )
-    await db.commit()
-
-
-async def get_counts(db, uid: int) -> tuple[int, int]:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT text_cnt, photo_cnt FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    if row:
-        return row[0], row[1]
-    return 0, 0
-
-
-async def can_use_daily_text(db, uid: int) -> bool:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT free_text_dt FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    last = row[0] if row else ''
-    return last != date.today().isoformat()
-
-
-async def mark_daily_text(db, uid: int):
-    today = date.today().isoformat()
-    await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET free_text_dt=? WHERE id=?", (today, uid))
-    await db.commit()
-
-
-async def get_free_photo(db, uid: int) -> int:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT free_photo FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else 0
-
-
-async def use_free_photo(db, uid: int):
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT free_photo FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    qty = row[0] if row else 0
-    if qty <= 0:
-        raise ValueError("no free photo")
-    await db.execute("UPDATE users SET free_photo = free_photo - 1 WHERE id=?", (uid,))
-    await db.commit()
-
-
-async def grant_start_bonus(db, uid: int):
-    await _ensure_user(db, uid)
-    await db.commit()
-
-
-async def grant_referral_bonus(db, uid: int):
-    await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET free_photo = free_photo + 1 WHERE id=?", (uid,))
-    await db.commit()
-
-
-async def set_ref_parent(db, child_uid: int, parent_uid: int):
-    if child_uid == parent_uid:
-        return
-    await _ensure_user(db, child_uid)
-    await _ensure_user(db, parent_uid)
-    await db.execute(
-        "UPDATE users SET ref_parent=? WHERE id=? AND ref_parent=0",
-        (parent_uid, child_uid),
-    )
-    await db.commit()
-
-
-async def get_subscribed(db, uid: int) -> tuple[int, int]:
-    await _ensure_user(db, uid)
-    async with db.execute(
-        "SELECT subscribed, last_sub_check FROM users WHERE id=?",
-        (uid,),
-    ) as cur:
-        row = await cur.fetchone()
-    if row:
-        return row[0], row[1]
-    return 0, 0
-
-
-async def set_subscribed(db, uid: int, ok: bool, now_ts: int):
-    await _ensure_user(db, uid)
-    await db.execute(
-        "UPDATE users SET subscribed=?, last_sub_check=? WHERE id=?",
-        (1 if ok else 0, now_ts, uid),
-    )
-    await db.commit()
-
-
-async def get_all_uids(db) -> list[int]:
-    async with db.execute("SELECT id FROM users") as cur:
-        rows = await cur.fetchall()
-    return [r[0] for r in rows]
-
-
-async def set_menu_msg(db, uid: int, msg_id: int):
-    await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET menu_msg=? WHERE id=?", (msg_id, uid))
-    await db.commit()
-
-
-async def get_menu_msg(db, uid: int) -> int:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT menu_msg FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else 0
-
-
-async def get_ref_count(db, uid: int) -> int:
-    async with db.execute("SELECT COUNT(*) FROM users WHERE ref_parent=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else 0
-
-
-async def set_free_photo(db, uid: int, qty: int):
-    await _ensure_user(db, uid)
-    await db.execute("UPDATE users SET free_photo=? WHERE id=?", (qty, uid))
-    await db.commit()
-
-
-async def set_alias(db, uid: int, alias: str) -> bool:
-    await _ensure_user(db, uid)
-    try:
-        await db.execute("UPDATE users SET alias=? WHERE id=?", (alias, uid))
-        await db.commit()
-        return True
-    except aiosqlite.IntegrityError:
-        return False
-
-
-async def get_uid_by_alias(db, alias: str) -> int:
-    async with db.execute("SELECT id FROM users WHERE alias=?", (alias,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else 0
-
-
-async def get_alias(db, uid: int) -> str:
-    await _ensure_user(db, uid)
-    async with db.execute("SELECT alias FROM users WHERE id=?", (uid,)) as cur:
-        row = await cur.fetchone()
-    return row[0] if row else ''
-
-
-async def log_payment(
-    db,
+async def ensure_user(
+    db: aiosqlite.Connection,
     uid: int,
-    rub: int = 0,
-    stars: int = 0,
-    method: str = "",
-    provider_charge_id: str | None = None,
-    ts: int | None = None,
-):
-    if rub <= 0 and stars <= 0:
+    referrer_id: int | None = None,
+) -> None:
+    """Убедиться, что юзер есть в таблице users."""
+    async with db.execute("SELECT id FROM users WHERE id=?", (uid,)) as cur:
+        row = await cur.fetchone()
+    if row:
         return
-    await _ensure_user(db, uid)
-    ts = int(ts or time.time())
-    try:
-        await db.execute(
-            "INSERT INTO payments(uid, rub, stars, ts, method, provider_charge_id) VALUES(?,?,?,?,?,?)",
-            (uid, rub, stars, ts, method, provider_charge_id),
-        )
-        await db.commit()
-    except aiosqlite.IntegrityError:
-        pass
-
-
-async def log_pay_click(db, uid: int):
-    await _ensure_user(db, uid)
-    await db.execute("INSERT INTO pay_clicks(uid) VALUES(?)", (uid,))
+    ts = int(time.time())
+    await db.execute(
+        "INSERT INTO users (id, created_ts, referrer_id) VALUES (?, ?, ?)",
+        (uid, ts, referrer_id),
+    )
     await db.commit()
 
 
-async def get_pay_stats(db) -> tuple[int, int, float]:
-    async with db.execute("SELECT COUNT(*), IFNULL(SUM(rub),0) FROM payments") as cur:
+async def get_credits(db: aiosqlite.Connection, uid: int) -> int:
+    await ensure_user(db, uid)
+    async with db.execute("SELECT credits FROM users WHERE id=?", (uid,)) as cur:
         row = await cur.fetchone()
-    pays = row[0]
-    rub_sum = row[1]
-    async with db.execute("SELECT COUNT(*) FROM pay_clicks") as cur:
-        clicks = (await cur.fetchone())[0]
-    avg = (rub_sum / pays) if pays else 0.0
-    return clicks, pays, avg
+    return int(row[0]) if row else 0
 
 
-async def inc_funnel_start(db, kind: str):
+async def add_credits(db: aiosqlite.Connection, uid: int, amount: int) -> None:
+    if amount <= 0:
+        return
+    await ensure_user(db, uid)
     await db.execute(
-        "INSERT INTO funnels(kind,start,done) VALUES(?,1,0) "
-        "ON CONFLICT(kind) DO UPDATE SET start=start+1",
-        (kind,),
+        "UPDATE users SET credits = credits + ? WHERE id=?",
+        (amount, uid),
     )
     await db.commit()
 
 
-async def inc_funnel_done(db, kind: str):
-    await db.execute(
-        "INSERT INTO funnels(kind,start,done) VALUES(?,0,1) "
-        "ON CONFLICT(kind) DO UPDATE SET done=done+1",
-        (kind,),
-    )
-    await db.commit()
-
-
-async def get_funnel(db) -> dict:
-    async with db.execute("SELECT kind, start, done FROM funnels") as cur:
-        rows = await cur.fetchall()
-    return {r[0]: {"start": r[1], "done": r[2]} for r in rows}
-
-
-async def add_feedback(db, uid: int, kind: str, good: bool):
-    await _ensure_user(db, uid)
-    await db.execute(
-        "INSERT INTO feedback(uid, kind, good) VALUES(?,?,?)",
-        (uid, kind, 1 if good else 0),
-    )
-    await db.commit()
-
-
-async def get_feedback_stats(db) -> tuple[int, int]:
-    async with db.execute("SELECT COUNT(*), IFNULL(SUM(good),0) FROM feedback") as cur:
+async def dec_credits(db: aiosqlite.Connection, uid: int, amount: int) -> bool:
+    """Списать кредиты. Вернёт False, если кредитов не хватило."""
+    if amount <= 0:
+        return True
+    await ensure_user(db, uid)
+    async with db.execute("SELECT credits FROM users WHERE id=?", (uid,)) as cur:
         row = await cur.fetchone()
-    total, good = row[0], row[1]
-    return total, good
+    current = int(row[0]) if row else 0
+    if current < amount:
+        return False
+    await db.execute(
+        "UPDATE users SET credits = credits - ? WHERE id=?",
+        (amount, uid),
+    )
+    await db.commit()
+    return True
 
 
-async def get_active(db) -> tuple[int, int]:
-    today = date.today()
-    week_ago = today.fromordinal(today.toordinal() - 6)
-    async with db.execute(
-        "SELECT COUNT(*) FROM users WHERE last_dt=?",
-        (today.isoformat(),),
-    ) as cur:
-        dau = (await cur.fetchone())[0]
-    async with db.execute(
-        "SELECT COUNT(*) FROM users WHERE last_dt>=?",
-        (week_ago.isoformat(),),
-    ) as cur:
-        wau = (await cur.fetchone())[0]
-    return dau, wau
+# ── Цели по КБЖУ ──────────────────────────────────────
 
 
-async def get_referral_stats(db) -> list[dict]:
-    """Return referral statistics grouped by parent with child details."""
-    async with db.execute(
+async def set_goal(
+    db: aiosqlite.Connection,
+    uid: int,
+    kcal: int,
+    protein: float,
+    fat: float,
+    carbs: float,
+) -> None:
+    await ensure_user(db, uid)
+    await db.execute(
         """
-        SELECT p.id, p.alias,
-               c.id, c.alias, c.text_cnt, c.photo_cnt,
-               IFNULL(SUM(pay.rub),0) AS rub,
-               IFNULL(SUM(pay.stars),0) AS stars
-        FROM users AS c
-        JOIN users AS p ON c.ref_parent = p.id
-        LEFT JOIN payments AS pay ON pay.uid = c.id
-        GROUP BY p.id, c.id
-        """
-    ) as cur:
-        rows = await cur.fetchall()
-    stats: dict[int, dict] = {}
-    for pid, palias, cid, calias, tc, pc, rub, stars in rows:
-        item = stats.setdefault(
-            pid,
-            {
-                "id": pid,
-                "alias": palias or "",
-                "count": 0,
-                "rub": 0,
-                "stars": 0,
-                "users": [],
-            },
-        )
-        item["count"] += 1
-        item["rub"] += rub
-        item["stars"] += stars
-        item["users"].append(
-            {
-                "id": cid,
-                "alias": calias or "",
-                "rub": rub,
-                "stars": stars,
-                "text": tc,
-                "photo": pc,
-            }
-        )
-    return list(stats.values())
-
-
-async def get_alias_stats(db, uid: int) -> dict:
-    """Return detailed stats for a single alias owner."""
-    async with db.execute(
-        """
-        SELECT c.id, c.alias, c.text_cnt, c.photo_cnt,
-               IFNULL(SUM(pay.rub),0) AS rub,
-               IFNULL(SUM(pay.stars),0) AS stars
-        FROM users AS c
-        LEFT JOIN payments AS pay ON pay.uid = c.id
-        WHERE c.ref_parent=?
-        GROUP BY c.id
+        INSERT INTO goals (uid, kcal_target, protein_target, fat_target, carbs_target)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(uid) DO UPDATE SET
+          kcal_target = excluded.kcal_target,
+          protein_target = excluded.protein_target,
+          fat_target = excluded.fat_target,
+          carbs_target = excluded.carbs_target
         """,
+        (uid, kcal, protein, fat, carbs),
+    )
+    await db.commit()
+
+
+async def get_goal(db: aiosqlite.Connection, uid: int) -> dict | None:
+    async with db.execute(
+        "SELECT kcal_target, protein_target, fat_target, carbs_target FROM goals WHERE uid=?",
         (uid,),
     ) as cur:
-        rows = await cur.fetchall()
-    cnt = 0
-    rub_sum = 0
-    stars_sum = 0
-    users = []
-    for cid, alias, tc, pc, rub, stars in rows:
-        cnt += 1
-        rub_sum += rub
-        stars_sum += stars
-        users.append(
-            {
-                "id": cid,
-                "alias": alias or "",
-                "rub": rub,
-                "stars": stars,
-                "text": tc,
-                "photo": pc,
-            }
-        )
-    return {"count": cnt, "rub": rub_sum, "stars": stars_sum, "users": users}
-
-
-async def get_global_stats(db) -> dict:
-    """Return overall bot statistics."""
-    today = date.today()
-    week_ago = today.fromordinal(today.toordinal() - 6)
-
-    async with db.execute("SELECT COUNT(*) FROM users") as cur:
-        total_users = (await cur.fetchone())[0]
-
-    async with db.execute(
-        "SELECT COUNT(*) FROM users WHERE last_dt>=?", (week_ago.isoformat(),)
-    ) as cur:
-        week_active = (await cur.fetchone())[0]
-
-    async with db.execute(
-        """
-        SELECT IFNULL(SUM(rub),0), IFNULL(SUM(stars),0), COUNT(DISTINCT uid),
-               COUNT(DISTINCT CASE WHEN rub>0 THEN uid END),
-               COUNT(DISTINCT CASE WHEN stars>0 THEN uid END)
-        FROM payments
-        """
-    ) as cur:
-        rub_sum, stars_sum, pay_users, rub_users, star_users = await cur.fetchone()
-
-    async with db.execute("SELECT SUM(text_cnt + photo_cnt) FROM users") as cur:
-        total_checks = (await cur.fetchone())[0] or 0
-
-    async with db.execute(
-        "SELECT SUM(text_cnt + photo_cnt) FROM users WHERE last_dt>=?",
-        (week_ago.isoformat(),),
-    ) as cur:
-        week_checks = (await cur.fetchone())[0] or 0
-
-    async with db.execute(
-        "SELECT COUNT(*) FROM users WHERE last_dt>=? AND text_cnt + photo_cnt <= 1",
-        (week_ago.isoformat(),),
-    ) as cur:
-        new_users = (await cur.fetchone())[0]
-
+        row = await cur.fetchone()
+    if not row:
+        return None
     return {
-        "users": {
-            "total": total_users,
-            "week_active": week_active,
-            "new_week": new_users,
-        },
-        "payments": {
-            "rub": rub_sum,
-            "stars": stars_sum,
-            "users": {
-                "total": pay_users,
-                "rub": rub_users,
-                "stars": star_users,
-            },
-        },
-        "checks": {"total": total_checks, "week_free": week_checks},
+        "kcal": row[0],
+        "protein": row[1],
+        "fat": row[2],
+        "carbs": row[3],
     }
 
+
+# ── Приёмы пищи ───────────────────────────────────────
+
+
+async def add_meal(
+    db: aiosqlite.Connection,
+    uid: int,
+    totals: dict,
+    raw_json: str,
+    ts: int | None = None,
+) -> None:
+    """Добавить приём пищи из totals + сырой JSON ответа модели."""
+    await ensure_user(db, uid)
+    if ts is None:
+        ts = int(time.time())
+    day = date.fromtimestamp(ts).isoformat()
+
+    kcal = float(totals.get("kcal", 0) or 0)
+    protein = float(totals.get("protein_g", 0) or 0)
+    fat = float(totals.get("fat_g", 0) or 0)
+    carbs = float(totals.get("carbs_g", 0) or 0)
+
+    await db.execute(
+        """
+        INSERT INTO meals (uid, ts, date, kcal, protein, fat, carbs, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (uid, ts, day, kcal, protein, fat, carbs, raw_json),
+    )
+    await db.execute(
+        "UPDATE users SET meals_total = meals_total + 1 WHERE id=?",
+        (uid,),
+    )
+    await db.commit()
+
+
+async def get_daily_totals(
+    db: aiosqlite.Connection,
+    uid: int,
+    day: date | None = None,
+) -> dict:
+    """Суммарные КБЖУ за день (по умолчанию — сегодня)."""
+    if day is None:
+        day = date.today()
+    day_str = day.isoformat()
+    async with db.execute(
+        """
+        SELECT
+          COALESCE(SUM(kcal), 0),
+          COALESCE(SUM(protein), 0),
+          COALESCE(SUM(fat), 0),
+          COALESCE(SUM(carbs), 0)
+        FROM meals
+        WHERE uid = ? AND date = ?
+        """,
+        (uid, day_str),
+    ) as cur:
+        row = await cur.fetchone()
+    return {
+        "kcal": float(row[0] or 0),
+        "protein": float(row[1] or 0),
+        "fat": float(row[2] or 0),
+        "carbs": float(row[3] or 0),
+    }
+
+
+# ── Приглашения и оплаты ─────────────────────────────-
+
+
+async def add_invite(
+    db: aiosqlite.Connection,
+    inviter_id: int,
+    invited_id: int,
+) -> None:
+    ts = int(time.time())
+    await db.execute(
+        "INSERT INTO invites (inviter_id, invited_id, created_ts) VALUES (?, ?, ?)",
+        (inviter_id, invited_id, ts),
+    )
+    await db.commit()
+
+
+async def get_invite_stats(db: aiosqlite.Connection, uid: int) -> dict:
+    """Статистика по приглашениям для одного пользователя."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM invites WHERE inviter_id=?", (uid,)
+    ) as cur:
+        row = await cur.fetchone()
+    count = int(row[0] or 0)
+    return {"count": count}
+
+
+async def save_payment(
+    db: aiosqlite.Connection,
+    uid: int,
+    provider: str,
+    amount: int,
+    payload: str | None = None,
+) -> None:
+    ts = int(time.time())
+    await db.execute(
+        """
+        INSERT INTO payments (uid, provider, amount, payload, created_ts)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (uid, provider, amount, payload or ""),
+    )
+    await db.commit()
+
+
+# ── Общая статистика для админов ─────────────────────-
+
+
+async def get_user_count(db: aiosqlite.Connection) -> int:
+    async with db.execute("SELECT COUNT(*) FROM users") as cur:
+        row = await cur.fetchone()
+    return int(row[0] or 0)
+
+
+async def get_meal_count(db: aiosqlite.Connection) -> int:
+    async with db.execute("SELECT COUNT(*) FROM meals") as cur:
+        row = await cur.fetchone()
+    return int(row[0] or 0)
+
+
+async def get_total_payments(db: aiosqlite.Connection) -> int:
+    """Сколько всего условных единиц записано в payments.amount."""
+    async with db.execute("SELECT COALESCE(SUM(amount),0) FROM payments") as cur:
+        row = await cur.fetchone()
+    return int(row[0] or 0)

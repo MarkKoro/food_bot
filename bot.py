@@ -1,211 +1,234 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Простой бот «Решало».
 
-Бот отвечает на текстовые вопросы через DeepSeek и умеет анализировать
-фотографии через GPT‑4o. Логика оплаты и бонусов реализована через
-асинхронную SQLite-базу.
+"""
+Food_bot — бот, который по фото тарелки оценивает КБЖУ и ведёт дневник питания.
+
+Философия:
+- Всегда одно "служебное" сообщение бота с inline-клавиатурой (кроме стадии "считаю").
+- Никаких reply-клавиатур.
+- Все переходы по меню — через callback-кнопки, меняем текст этого сообщения.
+- Пользовательские сообщения (команды, текст, фото) после обработки удаляются,
+  чтобы в чате визуально оставалось только одно сообщение бота + (временно) фото еды.
 """
 
-import os, io, asyncio, logging, sys, httpx, time
-import aiosqlite, json
-from datetime import date
+import os
+import io
+import json
+import base64
+import logging
+
+import httpx
+import aiosqlite
 from dotenv import load_dotenv
-from PIL import Image
+
 from telegram import (
     Update,
-    InlineKeyboardButton as Btn,
-    InlineKeyboardMarkup as Mk,
-    LabeledPrice,
-    CopyTextButton,
-    InputMediaPhoto,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
-from telegram.constants import ParseMode
-from telegram.error import NetworkError, RetryAfter, BadRequest, Forbidden
-from telegram.request import HTTPXRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
-    PreCheckoutQueryHandler,
+    CallbackQueryHandler,
     ContextTypes,
-    JobQueue,
     AIORateLimiter,
     filters,
 )
 
-from utils.llm import ask_deepseek, analyze_photo, PolicyError
-from openai import APIError, RateLimitError
-from assets import load_assets, save_assets, SLOTS
 from db import (
+    DB_PATH,
+    create_tables,
+    ensure_user,
+    add_meal,
+    get_daily_totals,
+    get_goal,
+    set_goal,
+    add_invite,
+    save_payment,
     get_credits,
     add_credits,
     dec_credits,
-    can_use_daily_text,
-    mark_daily_text,
-    get_free_photo,
-    use_free_photo,
-    grant_start_bonus,
-    grant_referral_bonus,
-    set_ref_parent,
-    create_tables,
-    inc_text_cnt,
-    inc_photo_cnt,
-    get_counts,
-    get_all_uids,
-    set_menu_msg,
-    get_menu_msg,
-    get_ref_count,
-    set_free_photo,
-    set_alias,
-    get_uid_by_alias,
-    get_alias,
-    log_payment,
-    log_pay_click,
-    inc_funnel_start,
-    inc_funnel_done,
-    get_pay_stats,
-    get_funnel,
-    add_feedback,
-    get_feedback_stats,
-    get_active,
-    get_referral_stats,
-    get_alias_stats,
-    get_global_stats,
-    DB_PATH,
-    init_subscription,
-    get_subscribed,
-    set_subscribed,
+    get_user_count,
+    get_meal_count,
+    get_total_payments,
+    get_invite_stats,
 )
 
-# ── Глобальные настройки ─────────────────────────────
+# ── Конфиг из .env ────────────────────────────────────
+
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-YK_TOKEN = os.getenv("YK_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
+
 ADMINS = {
     int(x)
     for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS", "")).split(",")
-    if x
+    if x.strip()
 }
 
-USER_LOCKS: dict[int, asyncio.Lock] = {}
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+JOIN_URL = os.getenv("JOIN_URL", "")
 
-ASSETS = load_assets()
-CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID") or ASSETS.get("cache_chat_id", 0))
-if ASSETS.get("cache_chat_id") != CACHE_CHAT_ID:
-    ASSETS["cache_chat_id"] = CACHE_CHAT_ID
-    save_assets(ASSETS)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в .env")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY не задан в .env")
+if not CHANNEL_ID:
+    raise RuntimeError("CHANNEL_ID не задан в .env")
+if not JOIN_URL:
+    logging.warning("JOIN_URL не задан — кнопка подписки будет без ссылки")
 
-TEXT_COST = 10
-PHOTO_COST = 20
-# Ключ словаря — количество баллов, значение — цена
-PRICE_PACKS_RUB = {100: 100_00, 350: 300_00, 600: 500_00}
-PRICE_PACKS_STARS = {100: 55, 350: 170, 600: 280}
-SUPPORT_URL = "https://t.me/obotizatciaSupp_bot"
+# ── Клавиатуры ────────────────────────────────────────
 
-# ── Подписка ─────────────────────────────────────────
-CHANNEL_ID = -1002883355776
-JOIN_URL = "https://t.me/obotization/3"
-SUB_CACHE_TTL = 0
+
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📷 Добавить приём пищи", callback_data="add_meal")],
+            [InlineKeyboardButton("📊 Моя статистика", callback_data="stats")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+        ]
+    )
+
+
+def kb_back_to_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")]]
+    )
+
+
+def kb_settings() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎯 Задать цель", callback_data="set_goal")],
+            [InlineKeyboardButton("💳 Подписка (скоро)", callback_data="sub_stub")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+        ]
+    )
+
+
+KB_SUB = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("✅ Подписаться", url=JOIN_URL or "https://t.me")],
+        [InlineKeyboardButton("🔁 Проверить подписку", callback_data="chk_sub")],
+    ]
+)
+
+# ── Промпт для GPT-Vision ─────────────────────────────
+
+FOOD_SYSTEM_PROMPT = (
+    "Ты — ассистент-нутрициолог. По фотографии еды ты примерно оцениваешь "
+    "калорийность и количество белков, жиров и углеводов. "
+    "Оценивай реалистично. Если еда плохо различима, всё равно делай "
+    "осторожную оценку на основе типичных порций."
+)
+
+FOOD_USER_INSTRUCTIONS = (
+    "На фотографии показан приём пищи человека.\n\n"
+    "1. Определи основные блюда/ингредиенты.\n"
+    "2. Для каждого оцени:\n"
+    "   - name — краткое название продукта или блюда на русском;\n"
+    "   - weight_g — примерный вес порции в граммах;\n"
+    "   - kcal_total — примерные калории для этой порции;\n"
+    "   - protein_g, fat_g, carbs_g — примерные граммы белков, жиров и углеводов.\n"
+    "3. В конце посчитай суммарные калории и БЖУ по всей тарелке.\n\n"
+    "Верни строго JSON без пояснений и текста вокруг."
+)
+
+# ── Инициализация БД ─────────────────────────────────-
 
 
 async def init_db(app: Application) -> None:
     db = await aiosqlite.connect(DB_PATH, check_same_thread=False)
     await create_tables(db)
-    await init_subscription(db)
     app.bot_data["db"] = db
+    logging.info("DB initialised at %s", DB_PATH)
 
 
 async def close_db(app: Application) -> None:
     db = app.bot_data.get("db")
     if db:
         await db.close()
-
-MAIN_TEXT = (
-    "Привет. Я — Решала. Что у тебя за задача?\n"
-    "\n"
-    "Отправь мне свой вопрос — подскажу, как действовать.\n"
-    "\n"
-    "Хочешь помощь по фотографии — кидай снимок и пару строк контекста — разберём и это.\n"
-    "\n"
-    "Каждый день у тебя есть один бесплатный текстовый вопрос.\n"
-    "А если хочешь больше разбора по фото - кидай меня друзьям или заходи в оплату.\n"
-)
-HOW_IT_WORKS = (
-    "Коротко. Я Решу вашу делему\запрос\пробему\ступор\уравнение.\n"
-    "\n"
-    "• Текст: задаёшь вопрос — я выдаю практичный план на 1–2 шага вперёд.\n"
-    "• Фото + текст: прикладываешь снимок и контекст — даю выводы и конкретные действия.\n"
-    "• Под балансом указана стоимость проверок, справа от вариантов в меню — сколько бесплатных осталось. "
-    "Если бесплатных нет, запрос списывает баллы; их число видно под кнопкой пополнения баланса.\n"
-    "\n"
-    "Фото — платно, но на старте есть бонус, а за приглашённого друга — ещё бонус.\n"
-    "Идея одна: меньше теории, больше дела. Я всегда под рукой, утром и вечером.\n"
-    "\n"
-    " А если тебе грустно, то и это как то порешаем"
-)
-TEXT_BLOCKED = "Выявлено нарушение нашего сервиса. С твоим запросом ничего не порешать. Давай другой."
-PHOTO_BLOCKED = (
-    "Твою проблему не решить, потому что фото нарушает правила сервиса. "
-    "Если есть другая задача — скидывай, но будь осторожнее."
-)
-PHOTO_RULES = (
-    '🖼Допустим ты видишь картину перед собой, и вообще не понимаешь: "И что дальше?"\n'
-    "Так вот с абсолютно любой такой диллемой я здесь что бы решить и помочь.\n"
-    "🚫Запрещено: харассмент, насилие и другое, что нарушает обьективные правила контента\n"
-    "А то мы баллы спишем, а ответ не дадим, оно вам не надо\n"
-    "\n"
-    "Скинь фото\n"
-    "(Подсказка: сейчас отправь только фотографию, позже опиши проблему)"
-)
-
-REMINDER_TEXT = (
-    "Ты всё ещё на связи? Если что — я здесь. Запрос в день — бесплатно. "
-    "Сформулируй задачу, а я — план."
-)
-
-async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = ctx.job.data
-    await ctx.bot.send_message(uid, REMINDER_TEXT)
+        logging.info("DB connection closed")
 
 
-async def schedule_reminder(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    name = f"rem_{uid}"
-    for job in ctx.job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
-    ctx.job_queue.run_once(reminder_job, 72 * 3600, name=name, data=uid)
+def get_db(ctx: ContextTypes.DEFAULT_TYPE) -> aiosqlite.Connection:
+    return ctx.bot_data["db"]
 
 
-async def send_invoice_retry(bot, *args, **kwargs):
-    for attempt in range(5):
+# ── Вспомогательное: одно служебное сообщение ─────────
+
+
+async def edit_menu_message(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup=None,
+) -> None:
+    """
+    Обновляет (или создаёт) главное служебное сообщение с меню/статусом.
+    Пытается редактировать предыдущее, если оно есть, иначе отправляет новое.
+    """
+    chat = update.effective_chat
+    if not chat:
+        return
+    chat_id = chat.id
+    chat_data = ctx.chat_data
+    msg_id = chat_data.get("menu_message_id")
+
+    # Пытаемся отредактировать
+    if msg_id:
         try:
-            return await bot.send_invoice(*args, **kwargs)
-        except RetryAfter as exc:
-            await asyncio.sleep(max(exc.retry_after, 2 ** attempt))
-        except NetworkError:
-            if attempt == 4:
-                raise
-            await asyncio.sleep(2 ** attempt)
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+            return
+        except BadRequest:
+            # Например, сообщение слишком старое или уже удалено
+            pass
 
-KB_MENU = Mk([[Btn("◀️ В меню", callback_data="back")]])
-KB_BACK = Mk([[Btn("◀️ Передумал", callback_data="back")]])
-KB_NAZAD = Mk([[Btn("◀️ Назад", callback_data="back")]])
-KB_PAY = Mk([[Btn("Перевести Решале", pay=True)], [Btn("◀️ Передумал", callback_data="back")]])
-KB_ANS = Mk(
-    [
-        [Btn("👍", callback_data="fb_good"), Btn("👎", callback_data="fb_bad")],
-        [Btn("◀️ В меню", callback_data="back")],
-    ]
-)
-KB_SUB = Mk(
-    [
-        [Btn("✅ Подписаться", url=JOIN_URL)],
-        [Btn("🔁 Проверить подписку", callback_data="chk_sub")],
-    ]
-)
+    # Если редактирование не удалось или сообщения нет — отправляем новое
+    msg = await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
 
-async def _check_member(bot, user_id) -> bool:
+    # Пытаемся удалить старое меню, если оно было
+    if msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except BadRequest:
+            pass
+
+    chat_data["menu_message_id"] = msg.message_id
+
+
+async def delete_user_message(update: Update) -> None:
+    """Удалить сообщение пользователя, если оно есть (команда, текст, фото)."""
+    if update.message:
+        try:
+            await update.message.delete()
+        except BadRequest:
+            pass
+
+
+# ── Проверка подписки на канал ───────────────────────-
+
+
+async def _check_member(bot, user_id: int) -> bool:
+    if user_id in ADMINS:
+        return True
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
     except (BadRequest, Forbidden) as e:
@@ -217,924 +240,663 @@ async def _check_member(bot, user_id) -> bool:
     return member.status in {"member", "administrator", "creator"}
 
 
-async def ensure_subscription(update, ctx) -> bool:
+async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
-    if uid in ADMINS:
-        return True
-    db = ctx.bot_data["db"]
-    sub, last = await get_subscribed(db, uid)
-    now = int(time.time())
-    if sub and now - last < SUB_CACHE_TTL:
-        return True
     ok = await _check_member(ctx.bot, uid)
-    await set_subscribed(db, uid, ok, now)
     if ok:
         return True
+
     text = (
-        "Чтобы пользоваться ботом, подпишись на наш канал. После подписки нажми «Проверить подписку» ниже."
+        "Чтобы пользоваться ботом, нужно быть подписчиком канала.\n\n"
+        "1. Нажми «✅ Подписаться».\n"
+        "2. Подпишись на канал.\n"
+        "3. Вернись в бот и нажми «🔁 Проверить подписку»."
     )
-    chat = update.effective_chat
-    if chat:
-        await chat.send_message(text, reply_markup=KB_SUB)
-    else:
-        await ctx.bot.send_message(uid, text, reply_markup=KB_SUB)
+    await edit_menu_message(update, ctx, text, KB_SUB)
     return False
 
-def clean_md(text: str) -> str:
-    for ch in "#*🔹":
-        text = text.replace(ch, "")
-    return text
 
-async def clear_menu(
-    chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE, delete: bool = False
-) -> None:
-    """Убрать клавиатуру у предыдущих сообщений.
-
-    Если ``delete`` истинно, то сообщение с меню удаляется полностью,
-    чтобы не плодить несколько меню в чате.
-    """
-    ans_id = ctx.user_data.pop("ans_msg_id", None)
-    if ans_id:
-        try:
-            await ctx.bot.edit_message_reply_markup(
-                chat_id=chat.id, message_id=ans_id, reply_markup=None
-            )
-        except Exception:
-            logging.exception("failed to remove reply_markup from answer")
-    msg_id = ctx.user_data.get("menu_msg_id")
-    if msg_id is None:
-        msg_id = await get_menu_msg(ctx.bot_data["db"], uid)
-    if msg_id:
-        try:
-            if delete:
-                await ctx.bot.delete_message(chat_id=chat.id, message_id=msg_id)
-            else:
-                await ctx.bot.edit_message_reply_markup(
-                    chat_id=chat.id, message_id=msg_id, reply_markup=None
-                )
-        except BadRequest as exc:
-            if delete and "can't be deleted for everyone" in str(exc):
-                logging.info("menu message %s can't be deleted: %s", msg_id, exc)
-            else:
-                logging.exception("failed to remove menu message")
-        except Exception:
-            logging.exception("failed to remove menu message")
-        if delete:
-            ctx.user_data.pop("menu_msg_id", None)
-            ctx.user_data.pop("menu_slot", None)
-            await set_menu_msg(ctx.bot_data["db"], uid, 0)
-
-async def send_menu(
-    chat, uid: int, text: str, kb: Mk, ctx: ContextTypes.DEFAULT_TYPE, slot: str | None = None
-):
-    """Показать меню, редактируя существующее фото-сообщение."""
-    msg_id = ctx.user_data.get("menu_msg_id")
-    if msg_id is None:
-        msg_id = await get_menu_msg(ctx.bot_data["db"], uid)
-        if msg_id:
-            ctx.user_data["menu_msg_id"] = msg_id
-    cur_slot = ctx.user_data.get("menu_slot")
-    target_slot = slot or cur_slot or "main"
-    banner = ASSETS.get("banners", {}).get(target_slot, {})
-    banner_id = banner.get("msg_id", 0)
-    banner_file = banner.get("file_id")
-
-    if msg_id and target_slot == cur_slot:
-        try:
-            await ctx.bot.edit_message_caption(
-                chat_id=chat.id,
-                message_id=msg_id,
-                caption=text[:1024],
-                reply_markup=kb,
-            )
-            return
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                return
-            logging.exception("failed to edit existing menu message")
-        except Exception:
-            logging.exception("failed to edit existing menu message")
-
-    if msg_id and target_slot != cur_slot and banner_file:
-        try:
-            await ctx.bot.edit_message_media(
-                chat_id=chat.id,
-                message_id=msg_id,
-                media=InputMediaPhoto(banner_file, caption=text[:1024]),
-                reply_markup=kb,
-            )
-            ctx.user_data["menu_slot"] = target_slot
-            return
-        except Exception:
-            logging.exception("failed to edit menu media")
-
-    if banner_id:
-        msg = await ctx.bot.copy_message(
-            chat_id=chat.id,
-            from_chat_id=CACHE_CHAT_ID,
-            message_id=banner_id,
-            caption=text[:1024],
-            reply_markup=kb,
+async def on_check_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if await ensure_subscription(update, ctx):
+        await edit_menu_message(
+            update,
+            ctx,
+            "Подписка найдена, можно пользоваться ботом ✅\n\nВыбери действие:",
+            kb_main(),
         )
-    else:
-        msg = await chat.send_message(text[:1024], reply_markup=kb)
-    if msg_id:
-        try:
-            await ctx.bot.delete_message(chat_id=chat.id, message_id=msg_id)
-        except Exception:
-            logging.exception("failed to delete old menu message")
-    ctx.user_data["menu_msg_id"] = msg.message_id
-    ctx.user_data["menu_slot"] = target_slot
-    await set_menu_msg(ctx.bot_data["db"], uid, msg.message_id)
-    return msg
 
-def kb_main(free_txt: bool, free_ph: int) -> Mk:
-    """Главное меню."""
-    return Mk(
-        [
-            [
-                Btn(
-                    f"📝 Решаем вопрос — {'1' if free_txt else '0'} бесплатно",
-                    callback_data="ask_text",
-                )
+
+# ── GPT-Vision: анализ фото еды ───────────────────────
+
+
+def _truncate_description_to_5_sentences(text: str) -> str:
+    """Грубое ограничение до ~5 предложений, чтобы не раздувать токены."""
+    text = text.strip()
+    if not text:
+        return ""
+    # Наивно режем по точкам/воскл/вопрос
+    import re
+
+    sentences = re.split(r"([.!?])", text)
+    parts = []
+    sentence_count = 0
+    buf = ""
+    for chunk in sentences:
+        buf += chunk
+        if chunk in {".", "!", "?"}:
+            parts.append(buf.strip())
+            buf = ""
+            sentence_count += 1
+            if sentence_count >= 5:
+                break
+    if not parts:
+        return text
+    result = " ".join(parts)
+    # Дополнительное ограничение по длине
+    if len(result) > 600:
+        result = result[:600]
+    return result
+
+
+async def analyze_food_photo(
+    image_bytes: bytes,
+    extra_description: str | None = None,
+) -> dict:
+    """
+    Отправить фото в GPT-Vision и получить JSON с КБЖУ.
+    extra_description — опциональное текстовое описание от пользователя.
+    """
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    user_text = FOOD_USER_INSTRUCTIONS
+    if extra_description:
+        extra_description = _truncate_description_to_5_sentences(extra_description)
+        if extra_description:
+            user_text += (
+                "\n\nДополнительное описание от человека "
+                "(учти его при оценке, если информация по фото неполная):\n"
+                f"{extra_description}"
+            )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    messages = [
+        {"role": "system", "content": FOOD_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                },
             ],
-            [
-                Btn(
-                    f"📷 Смотрим и решаем — {free_ph} бесплатно",
-                    callback_data="ask_photo",
-                )
-            ],
-            [Btn("💳 Дать решале за работу", callback_data="pay")],
-            [Btn("🎁 Пригласить друга", callback_data="ref")],
-            [Btn("ℹ️ Как я это делаю?", callback_data="how")],
-            [Btn("🆘 Техподдержка", url=SUPPORT_URL)],
-        ]
-    )
+        },
+    ]
+    payload = {
+        "model": VISION_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data["choices"][0]["message"]["content"].strip()
+    return json.loads(content)
 
 
-def kb_ref(link: str) -> Mk:
-    return Mk(
-        [
-            [Btn("📋 Скопировать ссылку", copy_text=CopyTextButton(link))],
-            [Btn("📤 Отправить другу", url=f"https://t.me/share/url?url={link}")],
-            [Btn("◀️ Назад", callback_data="back")],
-        ]
-    )
+# ── Хендлеры команд ───────────────────────────────────
 
-async def show_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(ctx)
     uid = update.effective_user.id
-    db = ctx.bot_data["db"]
-    credits = "∞" if uid in ADMINS else await get_credits(db, uid)
-    kb = kb_main(
-        await can_use_daily_text(db, uid),
-        await get_free_photo(db, uid),
-    )
-    text = (
-        f"{MAIN_TEXT}\n\n"
-        f"ДОСТУПНО БАЛЛОВ: {credits}\n"
-        "Цена текстового вопроса: 10\n"
-        "Цена вопроса с фото: 20"
-    )
-    await send_menu(chat, uid, text, kb, ctx, slot="main")
+    await ensure_user(db, uid)
 
-# ── Команда /start ───────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    text = getattr(update.message, "text", "")
-    logging.info("command %s from %s", text, uid)
+    # Удаляем команду пользователя
+    await delete_user_message(update)
+
     if not await ensure_subscription(update, ctx):
         return
-    db = ctx.bot_data["db"]
-    if ctx.args:
-        arg = ctx.args[0]
-        parent = 0
-        alias_mode = False
-        try:
-            parent = int(arg)
-        except ValueError:
-            parent = await get_uid_by_alias(db, arg)
-            alias_mode = parent > 0
-        if parent and parent != uid:
-            await set_ref_parent(db, uid, parent)
-            await grant_referral_bonus(db, parent)
-            if parent not in ADMINS:
-                link = f"tg://user?id={uid}"
-                try:
-                    text = (
-                        f"По вашей ссылке зарегистрировался "
-                        f"<a href=\"{link}\">{uid}</a>"
-                    )
-                    await ctx.bot.send_message(parent, text, parse_mode=ParseMode.HTML)
-                except Exception:
-                    logging.exception("failed to notify referrer")
-            if alias_mode:
-                await set_free_photo(db, uid, 2)
-    await grant_start_bonus(db, uid)
-    await show_main(update, ctx)
-    ctx.user_data["stage"] = "main"
 
-async def send_profile(chat, uid: int, ctx: ContextTypes.DEFAULT_TYPE):
-    db = ctx.bot_data["db"]
-    credits = "∞" if uid in ADMINS else await get_credits(db, uid)
-    tc, pc = await get_counts(db, uid)
-    refs = await get_ref_count(db, uid)
-    msg = (
-        f"Баланс: {credits} баллов\n"
-        f"Вопросов: {tc}\n"
-        f"Фотоанализов: {pc}\n"
-        f"Друзей по ссылке: {refs}"
+    text = (
+        "Привет! Я помогу считать КБЖУ по фото тарелки и вести дневник питания.\n\n"
+        "Выбери действие ниже:"
     )
-    await send_menu(chat, uid, msg, KB_BACK, ctx)
+    ctx.user_data["state"] = None
+    await edit_menu_message(update, ctx, text, kb_main())
 
-async def cmd_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await delete_user_message(update)
+    if not await ensure_subscription(update, ctx):
+        return
+    text = (
+        "Как пользоваться ботом:\n\n"
+        "• Нажми «📷 Добавить приём пищи» и пришли фото еды сверху.\n"
+        "• Я оценю калории и БЖУ и сохраню это как приём пищи.\n"
+        "• В «📊 Моя статистика» ты увидишь суммарное КБЖУ за сегодня.\n"
+        "• В «⚙️ Настройки» можно задать дневную цель и позже — подписку.\n"
+    )
+    await edit_menu_message(update, ctx, text, kb_main())
+
+
+# ── Основные экраны ───────────────────────────────────
+
+
+async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"] = None
+    # очищаем возможные "висящие" данные по прошлой фотке
+    ctx.user_data.pop("meal_photo_file_id", None)
+    ctx.user_data.pop("meal_photo_msg_id", None)
+    ctx.user_data.pop("meal_chat_id", None)
+    text = "Главное меню. Выбери действие:"
+    await edit_menu_message(update, ctx, text, kb_main())
+
+
+async def show_add_meal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"] = "await_meal_photo"
+    text = (
+        "Пришли фотографию тарелки (желательно вид сверху, достаточно освещения).\n\n"
+        "После фото я спрошу, хочешь ли ты добавить короткое описание блюда, "
+        "чтобы посчитать точнее."
+    )
+    await edit_menu_message(update, ctx, text, kb_back_to_main())
+
+
+async def show_today_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(ctx)
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    await send_profile(update.message.chat, uid, ctx)
-    ctx.user_data["stage"] = "profile"
+
+    totals = await get_daily_totals(db, uid)
+    goal = await get_goal(db, uid)
+
+    kcal = totals["kcal"]
+    p = totals["protein"]
+    f = totals["fat"]
+    c = totals["carbs"]
+
+    if kcal == 0:
+        text = "За сегодня ещё нет записанных приёмов пищи."
+    else:
+        text = (
+            "Сегодняшние суммарные КБЖУ:\n"
+            f"🍽 Калории: {round(kcal)} ккал\n"
+            f"🥩 Белки: {round(p)} г\n"
+            f"🧈 Жиры: {round(f)} г\n"
+            f"🍞 Углеводы: {round(c)} г\n"
+        )
+
+    if goal:
+        def perc(current, target):
+            if target <= 0:
+                return 0
+            return round(current / target * 100)
+
+        text += (
+            "\nЦель на день:\n"
+            f"🎯 Калории: {goal['kcal']} ккал ({perc(kcal, goal['kcal'])}% выполнено)\n"
+            f"🥩 Белки: {goal['protein']} г ({perc(p, goal['protein'])}% выполнено)\n"
+            f"🧈 Жиры: {goal['fat']} г ({perc(f, goal['fat'])}% выполнено)\n"
+            f"🍞 Углеводы: {goal['carbs']} г ({perc(c, goal['carbs'])}% выполнено)\n"
+        )
+
+    await edit_menu_message(update, ctx, text, kb_back_to_main())
 
 
-async def cmd_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"] = None
+    text = (
+        "Настройки:\n\n"
+        "• 🎯 Задать цель по калориям и БЖУ.\n"
+        "• 💳 Подписка (скоро).\n"
+    )
+    await edit_menu_message(update, ctx, text, kb_settings())
+
+
+async def show_set_goal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"] = "await_goal"
+    example = (
+        "Напиши свою цель на день.\n\n"
+        "Можно в одну строку:\n"
+        "`2300 150 70 250`\n\n"
+        "Или в столбик:\n"
+        "`2300\n150\n70\n250`\n\n"
+        "Порядок: калории, белки, жиры, углеводы."
+    )
+    await edit_menu_message(update, ctx, example, kb_settings())
+
+
+async def show_sub_stub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "Подписка скоро появится здесь.\n\n"
+        "План: лимиты на бесплатные фото, безлимит для подписчиков "
+        "и бонусы за приглашённых друзей."
+    )
+    await edit_menu_message(update, ctx, text, kb_settings())
+
+
+# ── Обработка приёма пищи (общий helper) ──────────────
+
+
+async def _process_meal_calculation(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    extra_description: str | None,
+) -> None:
+    """
+    Общий код подсчёта КБЖУ:
+    - скачиваем фото по file_id;
+    - показываем статус "считаю";
+    - вызываем GPT-Vision;
+    - сохраняем в БД;
+    - удаляем фотку;
+    - показываем результат + главное меню.
+    """
+    db = get_db(ctx)
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    await update.message.reply_text(f"Техподдержка: {SUPPORT_URL}")
 
-# ── Callback router ──────────────────────────────────
-async def router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    uid = q.from_user.id
-    data = q.data
-    logging.info("callback %s from %s", data, uid)
-    db = ctx.bot_data["db"]
+    file_id = ctx.user_data.get("meal_photo_file_id")
+    photo_msg_id = ctx.user_data.get("meal_photo_msg_id")
+    chat_id = ctx.user_data.get("meal_chat_id")
+
+    if not file_id or not chat_id or not photo_msg_id:
+        # Что-то пошло не так, возвращаем в меню
+        logging.warning("No pending meal photo for user %s", uid)
+        ctx.user_data["state"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            "Что-то пошло не так с фото. Попробуй отправить его ещё раз.",
+            kb_main(),
+        )
+        return
+
+    # Сообщение-статус: считаем, без кнопок
+    await edit_menu_message(
+        update,
+        ctx,
+        "Мы приняли фото и считаем КБЖУ. Это может занять несколько секунд…",
+        reply_markup=None,
+    )
+
+    # Скачиваем фото по file_id
+    try:
+        file = await ctx.bot.get_file(file_id)
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+        image_bytes = bio.read()
+    except Exception:
+        logging.exception("failed to download photo for user %s", uid)
+        ctx.user_data["state"] = "await_meal_photo"
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог скачать фото. Попробуй ещё раз отправить снимок.",
+            kb_back_to_main(),
+        )
+        return
+
+    # Считаем КБЖУ
+    try:
+        data = await analyze_food_photo(image_bytes, extra_description)
+    except Exception:
+        logging.exception("analyze_food_photo failed for %s", uid)
+        ctx.user_data["state"] = "await_meal_photo"
+        await edit_menu_message(
+            update,
+            ctx,
+            (
+                "Не смог оценить это фото. Попробуй ещё раз, по возможности — светлее "
+                "и сверху. Если блюдо сложно распознать, можно добавить короткое описание."
+            ),
+            kb_back_to_main(),
+        )
+        # Фото в этом случае оставляем, чтобы человек видел, что отправлял
+        return
+
+    totals = data.get("totals") or {}
+    kcal = round(float(totals.get("kcal", 0) or 0))
+    protein = round(float(totals.get("protein_g", 0) or 0))
+    fat = round(float(totals.get("fat_g", 0) or 0))
+    carbs = round(float(totals.get("carbs_g", 0) or 0))
+
+    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+
+    # Удаляем фото
+    try:
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=photo_msg_id)
+    except BadRequest:
+        pass
+
+    # Чистим состояние
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("meal_photo_file_id", None)
+    ctx.user_data.pop("meal_photo_msg_id", None)
+    ctx.user_data.pop("meal_chat_id", None)
+
+    msg = (
+        "Оценка приёма пищи:\n"
+        f"🍽 Калории: ~{kcal} ккал\n"
+        f"🥩 Белки: ~{protein} г\n"
+        f"🧈 Жиры: ~{fat} г\n"
+        f"🍞 Углеводы: ~{carbs} г\n\n"
+        "Это приблизительная оценка по фото, не медицинская рекомендация."
+    )
+    await edit_menu_message(update, ctx, msg, kb_main())
+
+
+# ── Обработка фото ────────────────────────────────────
+
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Проверяем подписку
+    if not await ensure_subscription(update, ctx):
+        await delete_user_message(update)
+        return
+
+    state = ctx.user_data.get("state")
+
+    if state != "await_meal_photo":
+        # Фото не в том контексте — удаляем и возвращаем меню
+        await delete_user_message(update)
+        await show_main_menu(update, ctx)
+        return
+
+    message = update.message
+    chat = message.chat
+    photo = message.photo[-1]
+
+    # Сохраняем данные по фото
+    ctx.user_data["meal_photo_file_id"] = photo.file_id
+    ctx.user_data["meal_photo_msg_id"] = message.message_id
+    ctx.user_data["meal_chat_id"] = chat.id
+    ctx.user_data["state"] = "await_meal_extra"
+
+    # Показываем экран: хотим ли добавить описание
+    text = (
+        "Фото принято.\n\n"
+        "Если хочешь более точную оценку, одним сообщением опиши блюдо "
+        "(до 5 предложений): что за блюда, примерные порции, если знаешь — граммовки.\n\n"
+        "Или нажми «Посчитать без описания»."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➡️ Посчитать без описания", callback_data="meal_skip_extra"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")],
+        ]
+    )
+    await edit_menu_message(update, ctx, text, kb)
+
+
+# ── Обработка текста (цель / описание блюда / остальное) ──────
+
+
+async def handle_goal_input(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> None:
+    # Удаляем сообщение пользователя
+    await delete_user_message(update)
+
+    # Поддерживаем формат "в одну строку" и "в столбик"
+    cleaned = text.replace(",", " ")
+    parts = [p for p in cleaned.split() if p.strip()]
+
+    if len(parts) != 4:
+        example = (
+            "Не понял формат.\n\n"
+            "Пример одной строкой:\n"
+            "`2300 150 70 250`\n\n"
+            "Или в столбик:\n"
+            "`2300\\n150\\n70\\n250`"
+        )
+        await edit_menu_message(update, ctx, example, kb_settings())
+        return
+
+    try:
+        kcal, p, f, c = map(float, parts)
+    except ValueError:
+        example = (
+            "Должны быть только числа.\n\n"
+            "Пример: `2300 150 70 250`"
+        )
+        await edit_menu_message(update, ctx, example, kb_settings())
+        return
+
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    await set_goal(db, uid, int(kcal), p, f, c)
+
+    ctx.user_data["state"] = None
+    msg = (
+        "Цель обновлена ✅\n\n"
+        f"🎯 Калории: {int(kcal)} ккал\n"
+        f"🥩 Белки: {p} г\n"
+        f"🧈 Жиры: {f} г\n"
+        f"🍞 Углеводы: {c} г"
+    )
+    await edit_menu_message(update, ctx, msg, kb_settings())
+
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    state = ctx.user_data.get("state")
+
+    if not await ensure_subscription(update, ctx):
+        await delete_user_message(update)
+        return
+
+    if state == "await_goal":
+        await handle_goal_input(update, ctx, text)
+        return
+
+    if state == "await_meal_extra":
+        # Это описание блюда для текущего фото
+        # Стираем текст пользователя и запускаем подсчёт
+        await delete_user_message(update)
+        await _process_meal_calculation(update, ctx, extra_description=text)
+        return
+
+    # Любой другой текст — просто удаляем и показываем меню
+    await delete_user_message(update)
+    await show_main_menu(update, ctx)
+
+
+# ── Callback-кнопки ───────────────────────────────────
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    await query.answer()
 
     if data == "chk_sub":
-        ok = await _check_member(ctx.bot, uid)
-        now = int(time.time())
-        await set_subscribed(db, uid, ok, now)
-        if ok:
-            await q.answer()
-            await q.edit_message_reply_markup(None)
-            pend = ctx.user_data.pop("pending_update", None)
-            handler = ctx.user_data.pop("pending_handler", None)
-            if pend and handler == "text":
-                await handle_text(pend, ctx)
-            elif pend and handler == "photo":
-                await handle_photo(pend, ctx)
-            else:
-                await q.message.reply_text("Подписка подтверждена. Продолжаем!")
-                await show_main(update, ctx)
-                ctx.user_data["stage"] = "main"
-        else:
-            await q.answer(
-                "Подписка пока не найдена. Проверь, что ты подписан/а, и нажми ещё раз."
-            )
-            await q.edit_message_reply_markup(KB_SUB)
+        await on_check_sub_callback(update, ctx)
         return
 
-    await q.answer()
-
-    if data == "ask_text":
-        ctx.user_data["stage"] = "await_text"
-        await inc_funnel_start(db, "text")
-        await send_menu(
-            q.message.chat,
-            uid,
-            "Опиши, в чём суть. Без лишнего — факты и цель. Дальше — мой ход. (Подсказка: напишите в сообщениях вопрос, который вы хотели бы задать)",
-            KB_BACK,
-            ctx,
-        )
-    elif data == "ask_photo":
-        ctx.user_data["stage"] = "await_photo"
-        await send_menu(
-            q.message.chat,
-            uid,
-            PHOTO_RULES,
-            KB_BACK,
-            ctx,
-        )
-    elif data == "back":
-        await clear_menu(q.message.chat, uid, ctx, delete=True)
-        ctx.user_data["stage"] = "main"
-        await show_main(update, ctx)
-    elif data == "pay":
-        await log_pay_click(db, uid)
-        kb_rows = []
-        for c, price in PRICE_PACKS_RUB.items():
-            stars = PRICE_PACKS_STARS[c]
-            kb_rows.append(
-                [
-                    Btn(f"{price/100:.0f}₽ → {c} баллов", callback_data=f"buy_{c}_card"),
-                    Btn(f"{stars}⭐ → {c} баллов", callback_data=f"buy_{c}_stars"),
-                ]
-            )
-        kb_rows.append([Btn("◀️ Передумал", callback_data="back")])
-        await send_menu(
-            q.message.chat,
-            uid,
-            "Здесь ты решаешь, будет ли решала с тобой по-серьезному, или это просто так. Баллы не сгорают.",
-            Mk(kb_rows),
-            ctx,
-            slot="pay",
-        )
-        ctx.user_data["stage"] = "pay"
-    elif data in {"fb_good", "fb_bad"}:
-        kind = ctx.user_data.get("last_kind", "")
-        await add_feedback(db, uid, kind, data == "fb_good")
-        await q.edit_message_reply_markup(KB_MENU)
-        ctx.user_data["stage"] = "answer"
-    elif data == "ref":
-        alias = await get_alias(db, uid)
-        bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
-        link = f"https://t.me/{bot_name}?start={alias or uid}"
-        msg = (
-            "Скинь другу или родителям, я помогу им с их проблемами, а ты получаешь дополнительный "
-            f"фото-разбор.\nТвоя ссылка: {link}\n"
-        )
-        await send_menu(q.message.chat, uid, msg, kb_ref(link), ctx, slot="ref")
-        ctx.user_data["stage"] = "ref"
-    elif data == "how":
-        await send_menu(q.message.chat, uid, HOW_IT_WORKS, KB_NAZAD, ctx, slot="how")
-        ctx.user_data["stage"] = "how"
-    elif data.startswith("buy_"):
-        await clear_menu(q.message.chat, uid, ctx, delete=True)
-        _, c, method = data.split("_")
-        credits = int(c)
-        if method == "card":
-            price = PRICE_PACKS_RUB[credits]
-            currency = "RUB"
-            token = YK_TOKEN
-        else:
-            price = PRICE_PACKS_STARS[credits]
-            currency = "XTR"
-            token = ""
-        invoice = await send_invoice_retry(
-            ctx.bot,
-            chat_id=q.message.chat_id,
-            title=f"{credits} баллов",
-            description="Пакет баллов",
-            payload=f"buy_{credits}_{method}",
-            provider_token=token,
-            currency=currency,
-            prices=[LabeledPrice(f"{credits} баллов", price)],
-            reply_markup=KB_PAY,
-        )
-        await set_menu_msg(ctx.bot_data["db"], uid, invoice.message_id)
-
-# ── Message handlers ─────────────────────────────────
-async def handle_text(update: Update, ctx):
-    stage = ctx.user_data.get("stage")
-    if stage not in {"await_text", "await_photo_text", "await_photo"}:
-        await update.message.reply_text("Используй меню")
-        return
     if not await ensure_subscription(update, ctx):
-        ctx.user_data["pending_update"] = update
-        ctx.user_data["pending_handler"] = "text"
         return
-    uid = update.effective_user.id
-    text = update.message.text
-    db = ctx.bot_data["db"]
-    lock = USER_LOCKS.setdefault(uid, asyncio.Lock())
-    if lock.locked():
-        await update.message.reply_text("Погодь, я ещё отвечаю на предыдущий вопрос")
-        return
-    async with lock:
-        if stage == "await_text":
-            await clear_menu(update.message.chat, uid, ctx)
-            free = await can_use_daily_text(db, uid)
-            if not free and uid not in ADMINS:
-                credits = await get_credits(db, uid)
-                if credits < TEXT_COST:
-                    kb_topup = Mk(
-                        [
-                            [Btn("Заплатить Решале", callback_data="pay")],
-                            [Btn("◀️ Передумал", callback_data="back")],
-                        ]
-                    )
-                    await send_menu(
-                        update.message.chat,
-                        uid,
-                        "Вам не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                        kb_topup,
-                        ctx,
-                        slot="pay",
-                    )
-                    ctx.user_data["stage"] = "main"
-                    return
-            wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-            try:
-                ans = clean_md(await ask_deepseek(text))
-            except PolicyError:
-                await wait.delete()
-                if not await ensure_subscription(update, ctx):
-                    return
-                msg = await update.message.reply_text(TEXT_BLOCKED, reply_markup=KB_MENU)
-                ctx.user_data["ans_msg_id"] = msg.message_id
-                ctx.user_data["stage"] = "answer"
-                ctx.user_data["last_kind"] = "text"
-                return
-            await wait.delete()
-            if not await ensure_subscription(update, ctx):
-                return
-            max_len = 1800
-            msg = await update.message.reply_text(
-                f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
-            )
-            if free:
-                await mark_daily_text(db, uid)
-            else:
-                if uid not in ADMINS:
-                    await dec_credits(db, uid, TEXT_COST)
-            await inc_text_cnt(db, uid)
-            await inc_funnel_done(db, "text")
-            ctx.user_data["ans_msg_id"] = msg.message_id
-            ctx.user_data["stage"] = "answer"
-            ctx.user_data["last_kind"] = "text"
-            await schedule_reminder(uid, ctx)
 
-        elif stage == "await_photo_text":
-            await clear_menu(update.message.chat, uid, ctx)
-            photo = ctx.user_data.get("photo")
-            if photo is None:
-                await update.message.reply_text("Сначала пришли фото")
-                return
-            free = await get_free_photo(db, uid)
-            use_free = free > 0
-            if not use_free and uid not in ADMINS:
-                credits = await get_credits(db, uid)
-                if credits < PHOTO_COST:
-                    kb_topup = Mk(
-                        [
-                            [Btn("Заключить сделку", callback_data="pay")],
-                            [Btn("◀️ Передумал", callback_data="back")],
-                        ]
-                    )
-                    await send_menu(
-                        update.message.chat,
-                        uid,
-                        "Сейчас не хватает баллов. Можем пополнить и закрыть вопрос за минуту.",
-                        kb_topup,
-                        ctx,
-                        slot="pay",
-                    )
-                    ctx.user_data["stage"] = "main"
-                    return
-            wait = await update.message.reply_text("Сейчас решим по твоему вопросу… ⏳")
-            try:
-                ans = clean_md(await analyze_photo(photo, text, uid=uid))
-            except PolicyError as exc:
-                logging.warning(
-                    "photo_policy_blocked uid=%s reason=%s", uid, str(exc) or "unknown"
-                )
-                await wait.delete()
-                if not await ensure_subscription(update, ctx):
-                    return
-                msg = await update.message.reply_text(
-                    str(exc) or PHOTO_BLOCKED, reply_markup=KB_MENU
-                )
-                await inc_photo_cnt(db, uid)
-                await inc_funnel_done(db, "photo")
-                ctx.user_data["ans_msg_id"] = msg.message_id
-                ctx.user_data["stage"] = "answer"
-                ctx.user_data["last_kind"] = "photo"
-                return
-            except (
-                httpx.TimeoutException,
-                httpx.ReadTimeout,
-                httpx.ConnectError,
-                APIError,
-                RateLimitError,
-            ):
-                raise
-            except Exception:
-                logging.exception("unexpected vision error")
-                raise
-            else:
-                await wait.delete()
-                if not await ensure_subscription(update, ctx):
-                    return
-                if use_free:
-                    await use_free_photo(db, uid)
-                elif uid not in ADMINS:
-                    await dec_credits(db, uid, PHOTO_COST)
-                max_len = 1800
-                msg = await update.message.reply_text(
-                    f"Вот что порешали\n{ans[:max_len]}", reply_markup=KB_ANS
-                )
-                await inc_photo_cnt(db, uid)
-                await inc_funnel_done(db, "photo")
-                ctx.user_data["ans_msg_id"] = msg.message_id
-                ctx.user_data["stage"] = "answer"
-                ctx.user_data["last_kind"] = "photo"
-                await schedule_reminder(uid, ctx)
-            finally:
-                ctx.user_data.pop("photo", None)
-                photo = None
-        else:  # stage == "await_photo"
-            await update.message.reply_text("Сейчас время скидывать фотографию\n(Скинь фото)")
+    if data == "main":
+        await show_main_menu(update, ctx)
+    elif data == "add_meal":
+        await show_add_meal_screen(update, ctx)
+    elif data == "stats":
+        await show_today_stats(update, ctx)
+    elif data == "settings":
+        await show_settings(update, ctx)
+    elif data == "set_goal":
+        await show_set_goal_screen(update, ctx)
+    elif data == "sub_stub":
+        await show_sub_stub(update, ctx)
+    elif data == "meal_skip_extra":
+        # Посчитать без описания
+        await _process_meal_calculation(update, ctx, extra_description=None)
 
-async def handle_photo(update: Update, ctx):
-    if ctx.user_data.get("stage") != "await_photo":
-        await update.message.reply_text("Сначала выбери режим фото в меню")
-        return
+
+# ── Каркас оплаты / рефералок / статистики ───────────-
+
+
+async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await delete_user_message(update)
     if not await ensure_subscription(update, ctx):
-        ctx.user_data["pending_update"] = update
-        ctx.user_data["pending_handler"] = "photo"
         return
-    uid = update.effective_user.id
-    await clear_menu(update.message.chat, uid, ctx, delete=True)
-    photo = update.message.photo[-1]
-    db = ctx.bot_data["db"]
-    f = await ctx.bot.get_file(photo.file_id)
-    bio = io.BytesIO()
-    await f.download_to_memory(out=bio)
-    bio.seek(0)
-    if bio.getbuffer().nbytes >= 18 * 1024 * 1024:
-        logging.warning("photo_rejected uid=%s reason=client_format", uid)
-        await update.message.reply_text("Сложно читаемый файл или слишком большой")
-        return
-    img = Image.open(bio)
-    if img.format not in {"JPEG", "PNG"}:
-        logging.warning("photo_rejected uid=%s reason=client_format", uid)
-        await update.message.reply_text("Сложно читаемый файл или слишком большой")
-        return
-    img.thumbnail((2048, 2048))
-    img = img.convert("RGB")
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=90)
-    ctx.user_data["photo"] = out.getvalue()
-    await send_menu(
-        update.message.chat,
-        uid,
-        "Фото принял. Теперь пару строк контекста: что за ситуация и какого результата хочешь. Сделаю выжимку и план действий.",
-        KB_BACK,
-        ctx,
+    text = (
+        "Здесь позже появится оплата и подписка.\n"
+        "Сейчас бот работает в тестовом режиме бесплатно.\n\n"
+        "Функцию оплаты мы добавим отдельным шагом."
     )
-    ctx.user_data["stage"] = "await_photo_text"
-    await inc_funnel_start(db, "photo")
-
-# ── Оплата ───────────────────────────────────────────
-async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_subscription(update, ctx):
-        await update.pre_checkout_query.answer(False)
-        return
-    await update.pre_checkout_query.answer(True)
+    await edit_menu_message(update, ctx, text, kb_main())
 
 
-async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_subscription(update, ctx):
-        return
-    sp = update.message.successful_payment
-    payload = sp.invoice_payload
-    uid = update.effective_user.id
-    parts = payload.split("_")
-    credits = int(parts[1])
-    method = parts[2]
-    charge_id = sp.provider_payment_charge_id
-    db = ctx.bot_data["db"]
-    await add_credits(db, uid, credits)
-    if method == "card":
-        rub = PRICE_PACKS_RUB[credits] // 100
-        stars = 0
-    else:
-        rub = 0
-        stars = PRICE_PACKS_STARS[credits]
-    await log_payment(
-        db,
-        uid,
-        rub=rub,
-        stars=stars,
-        method=method,
-        provider_charge_id=charge_id,
-    )
-    await clear_menu(update.message.chat, uid, ctx, delete=True)
-    total = "∞" if uid in ADMINS else await get_credits(db, uid)
-    kb = kb_main(
-        await can_use_daily_text(db, uid),
-        await get_free_photo(db, uid),
-    )
-    msg = f"Готово. Баллы на месте. Возвращаемся к делу?\n\nДОСТУПНО БАЛЛОВ: {total}"
-    await send_menu(update.message.chat, uid, msg, kb, ctx, slot="main")
-    ctx.user_data["stage"] = "main"
-
-# ── Error handler ────────────────────────────────────
-async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        raise ctx.error
-    except (
-        NetworkError,
-        httpx.TimeoutException,
-        httpx.ReadTimeout,
-        httpx.ConnectError,
-        APIError,
-        RateLimitError,
-    ):
-        logging.exception("network error")
-        if update and getattr(update, "effective_chat", None):
-            await update.effective_chat.send_message(
-                "Связь шалит. Дай пару минут — и продолжим. Если не продолжилось, начни с начала."
-            )
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        if update:
-            await ctx.application.process_update(update)
-    except Exception:
-        logging.exception("unknown error")
-        if update and getattr(update, "effective_chat", None):
-            await update.effective_chat.send_message("⚠️ Неизвестная ошибка")
-
-async def grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
+    await delete_user_message(update)
     if uid not in ADMINS:
         return
     try:
         target = int(ctx.args[0])
         qty = int(ctx.args[1])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /grant <id> <qty>")
+        await edit_menu_message(
+            update, ctx, "Usage: /grant <id> <qty>", kb_main()
+        )
         return
-    db = ctx.bot_data["db"]
+    db = get_db(ctx)
     await add_credits(db, target, qty)
     total = await get_credits(db, target)
-    await update.message.reply_text(f"OK. Now {target} has {total} credits")
+    await edit_menu_message(
+        update, ctx, f"OK. Now {target} has {total} credits", kb_main()
+    )
 
-async def decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def cmd_decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
+    await delete_user_message(update)
     if uid not in ADMINS:
         return
     try:
         target = int(ctx.args[0])
         qty = int(ctx.args[1])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /decredits <id> <qty>")
-        return
-    try:
-        db = ctx.bot_data["db"]
-        await dec_credits(db, target, qty)
-    except ValueError:
-        await update.message.reply_text("Not enough")
-        return
-    await update.message.reply_text("OK")
-
-async def cmd_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    try:
-        name = ctx.args[0]
-    except IndexError:
-        await update.message.reply_text("Usage: /alias <name>")
-        return
-    db = ctx.bot_data["db"]
-    ok = await set_alias(db, uid, name)
-    if ok:
-        bot_name = ctx.bot.username or (await ctx.bot.get_me()).username
-        link = f"https://t.me/{bot_name}?start={name}"
-        await update.message.reply_text(
-            "Нажми кнопку, чтобы скопировать ссылку",
-            reply_markup=kb_ref(link),
+        await edit_menu_message(
+            update, ctx, "Usage: /decredits <id> <qty>", kb_main()
         )
-    else:
-        await update.message.reply_text("Имя занято")
-
-async def stats_referrals(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    if uid not in ADMINS:
         return
-    db = ctx.bot_data["db"]
-    data = await get_referral_stats(db)
-    await update.message.reply_text(json.dumps(data, ensure_ascii=False))
-
-async def stats_alias(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    db = ctx.bot_data["db"]
-    alias = await get_alias(db, uid)
-    if not alias:
-        await update.message.reply_text("У вас нет alias")
-        return
-    stats = await get_alias_stats(db, uid)
-    lines = [
-        f"ID: {uid}",
-        f"Alias: {alias}",
-        "",
-        "|Показатель|Кол.|",
-        "|---|---:|",
-        f"|Пришло|{stats['count']}|",
-        f"|Заплатили ₽|{stats['rub']}|",
-        f"|Заплатили ⭐|{stats['stars']}⭐|",
-    ]
-    if stats["users"]:
-        lines += [
-            "",
-            "|ID|Alias|₽|⭐|",
-            "|---:|---|---:|---:|",
-        ]
-        for u in stats["users"]:
-            lines.append(
-                f"|{u['id']}|{u['alias'] or ''}|{u['rub']}|{u['stars']}⭐|"
-            )
-    await update.message.reply_text("\n".join(lines))
-
-
-async def my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    db = ctx.bot_data["db"]
-    stats = await get_alias_stats(db, uid)
-    if not stats["count"]:
-        await update.message.reply_text("По вашей ссылке ещё никто не приходил.")
-        return
-    lines = [
-        f"По вашей ссылке пришло {stats['count']} человек.",
-        f"Они заплатили {stats['rub']}₽ и {stats['stars']}⭐.",
-    ]
-    for u in stats["users"]:
-        alias = u["alias"] or str(u["id"])
-        lines.append(f"- {alias}: {u['rub']}₽ {u['stars']}⭐")
-    await update.message.reply_text("\n".join(lines))
-
-async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    if uid not in ADMINS:
-        return
-    db = ctx.bot_data["db"]
-    if ctx.args and ctx.args[0] == "pro":
-        users = len(await get_all_uids(db))
-        dau, wau = await get_active(db)
-        clicks, pays, avg = await get_pay_stats(db)
-        funnel = await get_funnel(db)
-        total_fb, good_fb = await get_feedback_stats(db)
-        tf = funnel.get("text", {"start": 0, "done": 0})
-        pf = funnel.get("photo", {"start": 0, "done": 0})
-        txt = (
-            f"U:{users} DAU:{dau} WAU:{wau}\n"
-            f"Pay {pays}/{clicks} avg:{avg:.1f}₽\n"
-            f"T {tf['done']}/{tf['start']} P {pf['done']}/{pf['start']}\n"
+    db = get_db(ctx)
+    ok = await dec_credits(db, target, qty)
+    if not ok:
+        await edit_menu_message(
+            update, ctx, "Недостаточно кредитов у пользователя.", kb_main()
         )
-        if total_fb:
-            txt += f"FB {good_fb/total_fb:.0%} полезно"
-        await update.message.reply_text(txt)
-    else:
-        data = await get_global_stats(db)
-        today = date.today()
-        week_ago = today.fromordinal(today.toordinal() - 6)
-        async with db.execute(
-            """
-            SELECT COUNT(DISTINCT pay.uid),
-                   IFNULL(SUM(pay.rub),0),
-                   IFNULL(SUM(pay.stars),0)
-            FROM payments AS pay
-            JOIN users AS u ON u.id = pay.uid
-            WHERE u.last_dt>=? AND u.text_cnt + u.photo_cnt <= 1
-            """,
-            (week_ago.isoformat(),),
-        ) as cur:
-            pay_users, rub_sum, stars_sum = await cur.fetchone()
-        month_ago = int(time.time()) - 30 * 86400
-        async with db.execute(
-            "SELECT IFNULL(SUM(rub),0), IFNULL(SUM(stars),0) FROM payments WHERE ts>=?",
-            (month_ago,),
-        ) as cur:
-            rub_30, stars_30 = await cur.fetchone()
-        lines = [
-            "|Показатель|Кол.|",
-            "|---|---:|",
-            f"|Новых за 7д|{data['users']['new_week']}|",
-            f"|Заплатило|{pay_users}|",
-            f"|В рублях|{rub_sum}|",
-            f"|В звёздах|{stars_sum}⭐|",
-            f"|Бесплатных проверок|{data['checks']['week_free']}|",
-            f"|Доход 30д ₽|{rub_30}|",
-            f"|Доход 30д ⭐|{stars_30}⭐|",
-        ]
-        await update.message.reply_text("\n".join(lines))
+        return
+    total = await get_credits(db, target)
+    await edit_menu_message(update, ctx, f"OK. Now {target} has {total} credits", kb_main())
 
 
-async def whereami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    logging.info("command %s from chat %s", update.message.text, chat_id)
-    await update.message.reply_text(str(chat_id))
-
-
-async def cache_banner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
+    await delete_user_message(update)
     if uid not in ADMINS:
         return
-    try:
-        slot = ctx.args[0]
-    except IndexError:
-        await update.message.reply_text("Usage: /cache_banner <slot>")
-        return
-    if slot not in SLOTS:
-        await update.message.reply_text("unknown slot")
-        return
-    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
-        await update.message.reply_text("Нужно ответить на фото")
-        return
-    src = update.message.reply_to_message
-    copied = await ctx.bot.copy_message(
-        chat_id=CACHE_CHAT_ID,
-        from_chat_id=src.chat_id,
-        message_id=src.message_id,
+    db = get_db(ctx)
+    users = await get_user_count(db)
+    meals = await get_meal_count(db)
+    pays = await get_total_payments(db)
+    text = (
+        f"Users: {users}\n"
+        f"Meals: {meals}\n"
+        f"Payments total (units): {pays}"
     )
-    file_id = src.photo[-1].file_id
-    ASSETS["cache_chat_id"] = CACHE_CHAT_ID
-    ASSETS["banners"][slot]["msg_id"] = copied.message_id
-    ASSETS["banners"][slot]["file_id"] = file_id
-    save_assets(ASSETS)
-    await update.message.reply_text("баннер сохранён")
+    await edit_menu_message(update, ctx, text, kb_main())
 
 
-async def banners_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     logging.info("command %s from %s", update.message.text, uid)
-    if uid not in ADMINS:
+    await delete_user_message(update)
+    if not await ensure_subscription(update, ctx):
         return
-    for slot in SLOTS:
-        msg_id = ASSETS.get("banners", {}).get(slot, {}).get("msg_id", 0)
-        if msg_id:
-            await ctx.bot.copy_message(
-                chat_id=uid,
-                from_chat_id=CACHE_CHAT_ID,
-                message_id=msg_id,
-                caption=slot,
-            )
+    db = get_db(ctx)
+    invites = await get_invite_stats(db, uid)
+    totals = await get_daily_totals(db, uid)
+    text = (
+        f"По вашей ссылке (когда она появится) пришло: {invites['count']} человек.\n\n"
+        "Сегодняшние КБЖУ:\n"
+        f"- Калории: {round(totals['kcal'])} ккал\n"
+        f"- Белки: {round(totals['protein'])} г\n"
+        f"- Жиры: {round(totals['fat'])} г\n"
+        f"- Углеводы: {round(totals['carbs'])} г\n"
+    )
+    await edit_menu_message(update, ctx, text, kb_main())
 
-async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
-    if uid not in ADMINS:
-        return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /broadcast <text>")
-        return
-    text = " ".join(ctx.args)
-    db = ctx.bot_data["db"]
-    for uid_ in await get_all_uids(db):
-        try:
-            await ctx.bot.send_message(uid_, text)
-        except Exception:
-            logging.exception("broadcast to %s failed", uid_)
 
-# ── Запуск ───────────────────────────────────────────
+# ── Точка входа ───────────────────────────────────────-
+
+
 def main() -> None:
-    """Запустить бота в единственном цикле событий.
-
-    Application.run_polling самостоятельно создаёт и управляет event loop.
-    Чтобы избежать ошибки "event loop is already running", не оборачиваем
-    вызов run_polling() в asyncio.run().
-    """
-
     logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=logging.INFO,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("bot.log", encoding="utf-8"),
-        ],
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram.ext._callbackqueryhandler").setLevel(logging.INFO)
 
-    app = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(64)
         .rate_limiter(AIORateLimiter())
-        .job_queue(JobQueue())
-        .request(HTTPXRequest(connection_pool_size=1024))
-        .post_init(init_db)
-        .post_shutdown(close_db)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("support", cmd_support))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("decredits", decredits))
-    app.add_handler(CommandHandler("alias", cmd_alias))
-    app.add_handler(CommandHandler(["mylinkstats", "mystats"], my_stats))
-    app.add_handler(CommandHandler("stats_referrals", stats_referrals))
-    app.add_handler(CommandHandler("stats_alias", stats_alias))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("whereami", whereami))
-    app.add_handler(CommandHandler("cache_banner", cache_banner))
-    app.add_handler(CommandHandler("banners_check", banners_check))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CallbackQueryHandler(router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
-    app.add_error_handler(on_error)
+    application.post_init = init_db
+    application.post_stop = close_db
 
-    # run_polling() блокирует поток, пока бот не будет остановлен.
-    app.run_polling()
+    # Команды
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("pay", cmd_pay))
+
+    # Админ-команды
+    application.add_handler(CommandHandler("grant", cmd_grant))
+    application.add_handler(CommandHandler("decredits", cmd_decredits))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("mystats", cmd_my_stats))
+
+    # Callback-кнопки (меню + шлагбаум + "без описания")
+    application.add_handler(CallbackQueryHandler(on_callback))
+
+    # Фото еды
+    application.add_handler(
+        MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo)
+    )
+
+    # Любой текст (цель, описание блюда, всё остальное)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
