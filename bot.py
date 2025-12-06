@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Food_bot — бот, который по фото тарелки оценивает КБЖУ и ведёт дневник питания.
-
-Философия:
-- Всегда одно "служебное" сообщение бота с inline-клавиатурой (кроме стадии "считаю").
-- Никаких reply-клавиатур.
-- Все переходы по меню — через callback-кнопки, меняем текст этого сообщения.
-- Пользовательские сообщения (команды, текст, фото) после обработки удаляются,
-  чтобы в чате визуально оставалось только одно сообщение бота + (временно) фото еды.
-"""
-
 import os
 import io
 import json
 import base64
 import logging
+import re
+from datetime import datetime, timedelta
 
 import httpx
 import aiosqlite
@@ -44,6 +35,7 @@ from db import (
     ensure_user,
     add_meal,
     get_daily_totals,
+    get_last_days_totals,
     get_goal,
     set_goal,
     add_invite,
@@ -57,13 +49,14 @@ from db import (
     get_invite_stats,
 )
 
-# ── Конфиг из .env ────────────────────────────────────
+# ── Конфиг ─────────────────────────────────────────────
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")      # на будущее: текст/голос
 
 ADMINS = {
     int(x)
@@ -83,14 +76,13 @@ if not CHANNEL_ID:
 if not JOIN_URL:
     logging.warning("JOIN_URL не задан — кнопка подписки будет без ссылки")
 
-# ── Клавиатуры ────────────────────────────────────────
 
+# ── Клавиатуры ────────────────────────────────────────
 
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📷 Добавить приём пищи", callback_data="add_meal")],
-            [InlineKeyboardButton("📊 Моя статистика", callback_data="stats")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
             [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
         ]
     )
@@ -105,27 +97,71 @@ def kb_back_to_main() -> InlineKeyboardMarkup:
 def kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎯 Задать цель", callback_data="set_goal")],
+            [InlineKeyboardButton("🎯 Цель КБЖУ", callback_data="set_goal")],
+            [InlineKeyboardButton("🧮 Опрос (скоро)", callback_data="survey_stub")],
             [InlineKeyboardButton("💳 Подписка (скоро)", callback_data="sub_stub")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
     )
 
 
-KB_SUB = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("✅ Подписаться", url=JOIN_URL or "https://t.me")],
-        [InlineKeyboardButton("🔁 Проверить подписку", callback_data="chk_sub")],
-    ]
-)
+def kb_sub() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Подписаться", url=JOIN_URL or "https://t.me")],
+            [InlineKeyboardButton("🔁 Проверить подписку", callback_data="chk_sub")],
+        ]
+    )
+
+
+def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
+    """
+    Меню уточнений после фото.
+    extras: dict с ключами 'portion', 'composition', 'plate'.
+    """
+    def label(base: str, key: str) -> str:
+        return f"{base} ✅" if extras.get(key) else base
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    label("📏 Граммовка / порция", "portion"),
+                    callback_data="meal_extra_portion",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    label("🍲 Что за блюдо / состав", "composition"),
+                    callback_data="meal_extra_composition",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    label("🍽 Размер тарелки", "plate"),
+                    callback_data="meal_extra_plate",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Считать как есть / отправить",
+                    callback_data="meal_extra_send",
+                )
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="meal_extra_cancel")],
+        ]
+    )
+
 
 # ── Промпт для GPT-Vision ─────────────────────────────
 
 FOOD_SYSTEM_PROMPT = (
-    "Ты — ассистент-нутрициолог. По фотографии еды ты примерно оцениваешь "
+    "Ты — аккуратный ассистент-нутрициолог. По фотографии еды ты примерно оцениваешь "
     "калорийность и количество белков, жиров и углеводов. "
-    "Оценивай реалистично. Если еда плохо различима, всё равно делай "
-    "осторожную оценку на основе типичных порций."
+    "Оценивай реалистично, не завышай и не занижай без причины. "
+    "Если еда частично скрыта, всё равно сделай осторожную оценку на основе типичных порций. "
+    "Если есть дополнительная информация от пользователя (описание блюда, примерная граммовка, "
+    "размер тарелки), считай её приоритетной и обязательно учитывай в расчётах."
 )
 
 FOOD_USER_INSTRUCTIONS = (
@@ -137,20 +173,37 @@ FOOD_USER_INSTRUCTIONS = (
     "   - kcal_total — примерные калории для этой порции;\n"
     "   - protein_g, fat_g, carbs_g — примерные граммы белков, жиров и углеводов.\n"
     "3. В конце посчитай суммарные калории и БЖУ по всей тарелке.\n\n"
-    "Верни строго JSON без пояснений и текста вокруг."
+    "Верни строго JSON в формате:\n"
+    "{\n"
+    "  \"items\": [\n"
+    "    {\n"
+    "      \"name\": \"...\",\n"
+    "      \"weight_g\": 0,\n"
+    "      \"kcal_total\": 0,\n"
+    "      \"protein_g\": 0,\n"
+    "      \"fat_g\": 0,\n"
+    "      \"carbs_g\": 0\n"
+    "    }\n"
+    "  ],\n"
+    "  \"totals\": {\n"
+    "    \"kcal\": 0,\n"
+    "    \"protein_g\": 0,\n"
+    "    \"fat_g\": 0,\n"
+    "    \"carbs_g\": 0\n"
+    "  }\n"
+    "}"
 )
 
-# ── Инициализация БД ─────────────────────────────────-
+# ── DB init ───────────────────────────────────────────
 
-
-async def init_db(app: Application) -> None:
+async def init_db(app):
     db = await aiosqlite.connect(DB_PATH, check_same_thread=False)
     await create_tables(db)
     app.bot_data["db"] = db
     logging.info("DB initialised at %s", DB_PATH)
 
 
-async def close_db(app: Application) -> None:
+async def close_db(app):
     db = app.bot_data.get("db")
     if db:
         await db.close()
@@ -161,8 +214,7 @@ def get_db(ctx: ContextTypes.DEFAULT_TYPE) -> aiosqlite.Connection:
     return ctx.bot_data["db"]
 
 
-# ── Вспомогательное: одно служебное сообщение ─────────
-
+# ── Сервисные хелперы сообщений ───────────────────────
 
 async def edit_menu_message(
     update: Update,
@@ -170,10 +222,6 @@ async def edit_menu_message(
     text: str,
     reply_markup=None,
 ) -> None:
-    """
-    Обновляет (или создаёт) главное служебное сообщение с меню/статусом.
-    Пытается редактировать предыдущее, если оно есть, иначе отправляет новое.
-    """
     chat = update.effective_chat
     if not chat:
         return
@@ -181,7 +229,6 @@ async def edit_menu_message(
     chat_data = ctx.chat_data
     msg_id = chat_data.get("menu_message_id")
 
-    # Пытаемся отредактировать
     if msg_id:
         try:
             await ctx.bot.edit_message_text(
@@ -193,10 +240,31 @@ async def edit_menu_message(
             )
             return
         except BadRequest:
-            # Например, сообщение слишком старое или уже удалено
             pass
 
-    # Если редактирование не удалось или сообщения нет — отправляем новое
+    msg = await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+    if msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except BadRequest:
+            pass
+    chat_data["menu_message_id"] = msg.message_id
+
+
+async def send_new_menu_message(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+) -> None:
+    chat_data = ctx.chat_data
+    old_id = chat_data.get("menu_message_id")
+
     msg = await ctx.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -204,10 +272,9 @@ async def edit_menu_message(
         parse_mode="Markdown",
     )
 
-    # Пытаемся удалить старое меню, если оно было
-    if msg_id:
+    if old_id:
         try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=old_id)
         except BadRequest:
             pass
 
@@ -215,7 +282,6 @@ async def edit_menu_message(
 
 
 async def delete_user_message(update: Update) -> None:
-    """Удалить сообщение пользователя, если оно есть (команда, текст, фото)."""
     if update.message:
         try:
             await update.message.delete()
@@ -223,16 +289,14 @@ async def delete_user_message(update: Update) -> None:
             pass
 
 
-# ── Проверка подписки на канал ───────────────────────-
-
+# ── Шлагбаум по подписке ─────────────────────────────
 
 async def _check_member(bot, user_id: int) -> bool:
     if user_id in ADMINS:
         return True
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-    except (BadRequest, Forbidden) as e:
-        logging.warning("check member failed for %s: %s", user_id, e)
+    except (BadRequest, Forbidden):
         return False
     except Exception:
         logging.exception("unexpected error while checking member %s", user_id)
@@ -252,7 +316,7 @@ async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         "2. Подпишись на канал.\n"
         "3. Вернись в бот и нажми «🔁 Проверить подписку»."
     )
-    await edit_menu_message(update, ctx, text, KB_SUB)
+    await edit_menu_message(update, ctx, text, kb_sub())
     return False
 
 
@@ -268,55 +332,40 @@ async def on_check_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         )
 
 
-# ── GPT-Vision: анализ фото еды ───────────────────────
+# ── GPT-Vision ───────────────────────────────────────
 
-
-def _truncate_description_to_5_sentences(text: str) -> str:
-    """Грубое ограничение до ~5 предложений, чтобы не раздувать токены."""
+def _truncate_description(text: str, max_sentences: int = 5, max_chars: int = 600) -> str:
     text = text.strip()
     if not text:
         return ""
-    # Наивно режем по точкам/воскл/вопрос
-    import re
-
     sentences = re.split(r"([.!?])", text)
     parts = []
-    sentence_count = 0
     buf = ""
+    count = 0
     for chunk in sentences:
         buf += chunk
         if chunk in {".", "!", "?"}:
             parts.append(buf.strip())
             buf = ""
-            sentence_count += 1
-            if sentence_count >= 5:
+            count += 1
+            if count >= max_sentences:
                 break
-    if not parts:
-        return text
-    result = " ".join(parts)
-    # Дополнительное ограничение по длине
-    if len(result) > 600:
-        result = result[:600]
+    result = " ".join(parts) if parts else text
+    if len(result) > max_chars:
+        result = result[:max_chars]
     return result
 
 
-async def analyze_food_photo(
-    image_bytes: bytes,
-    extra_description: str | None = None,
-) -> dict:
-    """
-    Отправить фото в GPT-Vision и получить JSON с КБЖУ.
-    extra_description — опциональное текстовое описание от пользователя.
-    """
+async def analyze_food_photo(image_bytes: bytes, extra_description: str | None = None) -> dict:
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     user_text = FOOD_USER_INSTRUCTIONS
     if extra_description:
-        extra_description = _truncate_description_to_5_sentences(extra_description)
+        extra_description = _truncate_description(extra_description)
         if extra_description:
             user_text += (
-                "\n\nДополнительное описание от человека "
-                "(учти его при оценке, если информация по фото неполная):\n"
+                "\n\nДополнительная информация от пользователя, "
+                "которую нужно обязательно учитывать при расчётах:\n"
                 f"{extra_description}"
             )
 
@@ -330,10 +379,7 @@ async def analyze_food_photo(
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                },
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
             ],
         },
     ]
@@ -354,29 +400,108 @@ async def analyze_food_photo(
         data = resp.json()
 
     content = data["choices"][0]["message"]["content"].strip()
-    return json.loads(content)
+    parsed = json.loads(content)
+    logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+    return parsed
 
 
-# ── Хендлеры команд ───────────────────────────────────
+def extract_totals(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {"kcal": 0.0, "protein_g": 0.0, "fat_g": 0.0, "carbs_g": 0.0}
+
+    candidate = None
+    for key in ("totals", "total", "summary", "overall"):
+        val = data.get(key)
+        if isinstance(val, dict):
+            candidate = val
+            break
+
+    if candidate is None and isinstance(data.get("items"), list):
+        kcal_sum = prot_sum = fat_sum = carb_sum = 0.0
+
+        def find_in_item(item: dict, keywords) -> float:
+            for k, v in item.items():
+                if not isinstance(k, str):
+                    continue
+                kl = k.lower()
+                if any(word in kl for word in keywords):
+                    try:
+                        return float(v)
+                    except Exception:
+                        continue
+            return 0.0
+
+        for it in data["items"]:
+            if not isinstance(it, dict):
+                continue
+            kcal_sum += find_in_item(it, ["kcal", "calor"])
+            prot_sum += find_in_item(it, ["protein"])
+            fat_sum += find_in_item(it, ["fat", "lipid"])
+            carb_sum += find_in_item(it, ["carb", "sugar"])
+        candidate = {
+            "kcal": kcal_sum,
+            "protein_g": prot_sum,
+            "fat_g": fat_sum,
+            "carbs_g": carb_sum,
+        }
+
+    if candidate is None:
+        candidate = data
+
+    def pick(keywords) -> float:
+        for k, v in candidate.items():
+            if not isinstance(k, str):
+                continue
+            kl = k.lower()
+            if any(word in kl for word in keywords):
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+        return 0.0
+
+    kcal = pick(["kcal", "calor"])
+    protein = pick(["protein"])
+    fat = pick(["fat", "lipid"])
+    carbs = pick(["carb", "sugar"])
+
+    totals = {
+        "kcal": float(kcal or 0.0),
+        "protein_g": float(protein or 0.0),
+        "fat_g": float(fat or 0.0),
+        "carbs_g": float(carbs or 0.0),
+    }
+
+    if all(v == 0.0 for v in totals.values()):
+        logging.warning("extract_totals got only zeros from data: %s", data)
+
+    return totals
+
+
+# ── Главные экраны ───────────────────────────────────
+
+async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("pending_meal", None)
+    text = (
+        "Я готов к работе 🍽\n\n"
+        "• Просто пришли *фото* еды — я посчитаю КБЖУ.\n"
+        "• В будущем можно будет описать приём пищи *голосом*.\n\n"
+        "Для тонких настроек и статистики — кнопки ниже."
+    )
+    await edit_menu_message(update, ctx, text, kb_main())
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
     await ensure_user(db, uid)
-
-    # Удаляем команду пользователя
     await delete_user_message(update)
 
     if not await ensure_subscription(update, ctx):
         return
 
-    text = (
-        "Привет! Я помогу считать КБЖУ по фото тарелки и вести дневник питания.\n\n"
-        "Выбери действие ниже:"
-    )
-    ctx.user_data["state"] = None
-    await edit_menu_message(update, ctx, text, kb_main())
+    await show_main_menu(update, ctx)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -384,269 +509,50 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscription(update, ctx):
         return
     text = (
-        "Как пользоваться ботом:\n\n"
-        "• Нажми «📷 Добавить приём пищи» и пришли фото еды сверху.\n"
-        "• Я оценю калории и БЖУ и сохраню это как приём пищи.\n"
-        "• В «📊 Моя статистика» ты увидишь суммарное КБЖУ за сегодня.\n"
-        "• В «⚙️ Настройки» можно задать дневную цель и позже — подписку.\n"
+        "Как пользоваться ботом 🍽\n\n"
+        "1. Пришли *фото* своей тарелки — я оценю калории и БЖУ.\n"
+        "2. После фото можно уточнить:\n"
+        "   • примерную граммовку;\n"
+        "   • что именно за блюда на тарелке;\n"
+        "   • размер тарелки.\n"
+        "3. Все приёмы пищи копятся в базе, статистику за день и неделю можно посмотреть через «📊 Статистика».\n"
+        "4. В «⚙️ Настройки» можно задать дневную цель по КБЖУ.\n\n"
+        "В будущем появится:\n"
+        "• голосовой ввод приёма пищи;\n"
+        "• WebApp с красивыми графиками за месяц."
     )
     await edit_menu_message(update, ctx, text, kb_main())
-
-
-# ── Основные экраны ───────────────────────────────────
-
-
-async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx.user_data["state"] = None
-    # очищаем возможные "висящие" данные по прошлой фотке
-    ctx.user_data.pop("meal_photo_file_id", None)
-    ctx.user_data.pop("meal_photo_msg_id", None)
-    ctx.user_data.pop("meal_chat_id", None)
-    text = "Главное меню. Выбери действие:"
-    await edit_menu_message(update, ctx, text, kb_main())
-
-
-async def show_add_meal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    ctx.user_data["state"] = "await_meal_photo"
-    text = (
-        "Пришли фотографию тарелки (желательно вид сверху, достаточно освещения).\n\n"
-        "После фото я спрошу, хочешь ли ты добавить короткое описание блюда, "
-        "чтобы посчитать точнее."
-    )
-    await edit_menu_message(update, ctx, text, kb_back_to_main())
-
-
-async def show_today_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    db = get_db(ctx)
-    uid = update.effective_user.id
-
-    totals = await get_daily_totals(db, uid)
-    goal = await get_goal(db, uid)
-
-    kcal = totals["kcal"]
-    p = totals["protein"]
-    f = totals["fat"]
-    c = totals["carbs"]
-
-    if kcal == 0:
-        text = "За сегодня ещё нет записанных приёмов пищи."
-    else:
-        text = (
-            "Сегодняшние суммарные КБЖУ:\n"
-            f"🍽 Калории: {round(kcal)} ккал\n"
-            f"🥩 Белки: {round(p)} г\n"
-            f"🧈 Жиры: {round(f)} г\n"
-            f"🍞 Углеводы: {round(c)} г\n"
-        )
-
-    if goal:
-        def perc(current, target):
-            if target <= 0:
-                return 0
-            return round(current / target * 100)
-
-        text += (
-            "\nЦель на день:\n"
-            f"🎯 Калории: {goal['kcal']} ккал ({perc(kcal, goal['kcal'])}% выполнено)\n"
-            f"🥩 Белки: {goal['protein']} г ({perc(p, goal['protein'])}% выполнено)\n"
-            f"🧈 Жиры: {goal['fat']} г ({perc(f, goal['fat'])}% выполнено)\n"
-            f"🍞 Углеводы: {goal['carbs']} г ({perc(c, goal['carbs'])}% выполнено)\n"
-        )
-
-    await edit_menu_message(update, ctx, text, kb_back_to_main())
 
 
 async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data["state"] = None
     text = (
-        "Настройки:\n\n"
-        "• 🎯 Задать цель по калориям и БЖУ.\n"
-        "• 💳 Подписка (скоро).\n"
+        "⚙️ Настройки\n\n"
+        "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
+        "• 🧮 Опрос — позже можно будет автоматически подобрать норму.\n"
+        "• 💳 Подписка — сюда добавим платные режимы и бонусы за друзей.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
+
+# ── Цель КБЖУ ─────────────────────────────────────────
 
 async def show_set_goal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data["state"] = "await_goal"
     example = (
-        "Напиши свою цель на день.\n\n"
+        "🎯 Задаём дневную цель по КБЖУ.\n\n"
+        "Напиши цель одним сообщением.\n"
         "Можно в одну строку:\n"
-        "`2300 150 70 250`\n\n"
-        "Или в столбик:\n"
-        "`2300\n150\n70\n250`\n\n"
-        "Порядок: калории, белки, жиры, углеводы."
+        "`2300 150 70 250`\n"
+        "или в столбик:\n"
+        "`2300\\n150\\n70\\n250`\n\n"
+        "Порядок значений:\n"
+        "1) калории (ккал)\n"
+        "2) белки (г)\n"
+        "3) жиры (г)\n"
+        "4) углеводы (г)"
     )
     await edit_menu_message(update, ctx, example, kb_settings())
-
-
-async def show_sub_stub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Подписка скоро появится здесь.\n\n"
-        "План: лимиты на бесплатные фото, безлимит для подписчиков "
-        "и бонусы за приглашённых друзей."
-    )
-    await edit_menu_message(update, ctx, text, kb_settings())
-
-
-# ── Обработка приёма пищи (общий helper) ──────────────
-
-
-async def _process_meal_calculation(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    extra_description: str | None,
-) -> None:
-    """
-    Общий код подсчёта КБЖУ:
-    - скачиваем фото по file_id;
-    - показываем статус "считаю";
-    - вызываем GPT-Vision;
-    - сохраняем в БД;
-    - удаляем фотку;
-    - показываем результат + главное меню.
-    """
-    db = get_db(ctx)
-    uid = update.effective_user.id
-
-    file_id = ctx.user_data.get("meal_photo_file_id")
-    photo_msg_id = ctx.user_data.get("meal_photo_msg_id")
-    chat_id = ctx.user_data.get("meal_chat_id")
-
-    if not file_id or not chat_id or not photo_msg_id:
-        # Что-то пошло не так, возвращаем в меню
-        logging.warning("No pending meal photo for user %s", uid)
-        ctx.user_data["state"] = None
-        await edit_menu_message(
-            update,
-            ctx,
-            "Что-то пошло не так с фото. Попробуй отправить его ещё раз.",
-            kb_main(),
-        )
-        return
-
-    # Сообщение-статус: считаем, без кнопок
-    await edit_menu_message(
-        update,
-        ctx,
-        "Мы приняли фото и считаем КБЖУ. Это может занять несколько секунд…",
-        reply_markup=None,
-    )
-
-    # Скачиваем фото по file_id
-    try:
-        file = await ctx.bot.get_file(file_id)
-        bio = io.BytesIO()
-        await file.download_to_memory(out=bio)
-        bio.seek(0)
-        image_bytes = bio.read()
-    except Exception:
-        logging.exception("failed to download photo for user %s", uid)
-        ctx.user_data["state"] = "await_meal_photo"
-        await edit_menu_message(
-            update,
-            ctx,
-            "Не смог скачать фото. Попробуй ещё раз отправить снимок.",
-            kb_back_to_main(),
-        )
-        return
-
-    # Считаем КБЖУ
-    try:
-        data = await analyze_food_photo(image_bytes, extra_description)
-    except Exception:
-        logging.exception("analyze_food_photo failed for %s", uid)
-        ctx.user_data["state"] = "await_meal_photo"
-        await edit_menu_message(
-            update,
-            ctx,
-            (
-                "Не смог оценить это фото. Попробуй ещё раз, по возможности — светлее "
-                "и сверху. Если блюдо сложно распознать, можно добавить короткое описание."
-            ),
-            kb_back_to_main(),
-        )
-        # Фото в этом случае оставляем, чтобы человек видел, что отправлял
-        return
-
-    totals = data.get("totals") or {}
-    kcal = round(float(totals.get("kcal", 0) or 0))
-    protein = round(float(totals.get("protein_g", 0) or 0))
-    fat = round(float(totals.get("fat_g", 0) or 0))
-    carbs = round(float(totals.get("carbs_g", 0) or 0))
-
-    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
-
-    # Удаляем фото
-    try:
-        await ctx.bot.delete_message(chat_id=chat_id, message_id=photo_msg_id)
-    except BadRequest:
-        pass
-
-    # Чистим состояние
-    ctx.user_data["state"] = None
-    ctx.user_data.pop("meal_photo_file_id", None)
-    ctx.user_data.pop("meal_photo_msg_id", None)
-    ctx.user_data.pop("meal_chat_id", None)
-
-    msg = (
-        "Оценка приёма пищи:\n"
-        f"🍽 Калории: ~{kcal} ккал\n"
-        f"🥩 Белки: ~{protein} г\n"
-        f"🧈 Жиры: ~{fat} г\n"
-        f"🍞 Углеводы: ~{carbs} г\n\n"
-        "Это приблизительная оценка по фото, не медицинская рекомендация."
-    )
-    await edit_menu_message(update, ctx, msg, kb_main())
-
-
-# ── Обработка фото ────────────────────────────────────
-
-
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    # Проверяем подписку
-    if not await ensure_subscription(update, ctx):
-        await delete_user_message(update)
-        return
-
-    state = ctx.user_data.get("state")
-
-    if state != "await_meal_photo":
-        # Фото не в том контексте — удаляем и возвращаем меню
-        await delete_user_message(update)
-        await show_main_menu(update, ctx)
-        return
-
-    message = update.message
-    chat = message.chat
-    photo = message.photo[-1]
-
-    # Сохраняем данные по фото
-    ctx.user_data["meal_photo_file_id"] = photo.file_id
-    ctx.user_data["meal_photo_msg_id"] = message.message_id
-    ctx.user_data["meal_chat_id"] = chat.id
-    ctx.user_data["state"] = "await_meal_extra"
-
-    # Показываем экран: хотим ли добавить описание
-    text = (
-        "Фото принято.\n\n"
-        "Если хочешь более точную оценку, одним сообщением опиши блюдо "
-        "(до 5 предложений): что за блюда, примерные порции, если знаешь — граммовки.\n\n"
-        "Или нажми «Посчитать без описания»."
-    )
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "➡️ Посчитать без описания", callback_data="meal_skip_extra"
-                )
-            ],
-            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")],
-        ]
-    )
-    await edit_menu_message(update, ctx, text, kb)
-
-
-# ── Обработка текста (цель / описание блюда / остальное) ──────
 
 
 async def handle_goal_input(
@@ -654,10 +560,8 @@ async def handle_goal_input(
     ctx: ContextTypes.DEFAULT_TYPE,
     text: str,
 ) -> None:
-    # Удаляем сообщение пользователя
     await delete_user_message(update)
 
-    # Поддерживаем формат "в одну строку" и "в столбик"
     cleaned = text.replace(",", " ")
     parts = [p for p in cleaned.split() if p.strip()]
 
@@ -667,7 +571,8 @@ async def handle_goal_input(
             "Пример одной строкой:\n"
             "`2300 150 70 250`\n\n"
             "Или в столбик:\n"
-            "`2300\\n150\\n70\\n250`"
+            "`2300\\n150\\n70\\n250`\n\n"
+            "Порядок: калории, белки, жиры, углеводы."
         )
         await edit_menu_message(update, ctx, example, kb_settings())
         return
@@ -697,32 +602,339 @@ async def handle_goal_input(
     await edit_menu_message(update, ctx, msg, kb_settings())
 
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
-    state = ctx.user_data.get("state")
+# ── Статистика за сегодня / вчера / 7 дней ────────────
 
+def _format_day(date: datetime) -> str:
+    return date.strftime("%d.%m")
+
+
+def _weekday_ru(date: datetime) -> str:
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    return names[date.weekday()]
+
+
+def _perc(current: float, target: float) -> int:
+    if target <= 0:
+        return 0
+    return int(round(current / target * 100))
+
+
+async def show_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+
+    totals_today = await get_daily_totals(db, uid, today.isoformat())
+    totals_yest = await get_daily_totals(db, uid, yesterday.isoformat())
+    last7 = await get_last_days_totals(db, uid, 7)
+    goal = await get_goal(db, uid)
+
+    kcal_today = totals_today["kcal"]
+    p_today = totals_today["protein"]
+    f_today = totals_today["fat"]
+    c_today = totals_today["carbs"]
+
+    kcal_y = totals_yest["kcal"]
+    p_y = totals_yest["protein"]
+    f_y = totals_yest["fat"]
+    c_y = totals_yest["carbs"]
+
+    kcal_week = sum(d["kcal"] for d in last7)
+    p_week = sum(d["protein"] for d in last7)
+    f_week = sum(d["fat"] for d in last7)
+    c_week = sum(d["carbs"] for d in last7)
+
+    text_lines = []
+    text_lines.append("Статистика питания 📊\n")
+
+    # Сегодня
+    text_lines.append(
+        f"*Сегодня* ({_format_day(today)} { _weekday_ru(today) })\n"
+        f"🍽 Калории: *{round(kcal_today)}* ккал\n"
+        f"🥩 Белки: *{round(p_today)}* г\n"
+        f"🧈 Жиры: *{round(f_today)}* г\n"
+        f"🍞 Углеводы: *{round(c_today)}* г\n"
+    )
+
+    # Вчера
+    text_lines.append(
+        f"\n*Вчера* ({_format_day(yesterday)} { _weekday_ru(yesterday) })\n"
+        f"🍽 Калории: *{round(kcal_y)}* ккал\n"
+        f"🥩 Белки: *{round(p_y)}* г\n"
+        f"🧈 Жиры: *{round(f_y)}* г\n"
+        f"🍞 Углеводы: *{round(c_y)}* г\n"
+    )
+
+    # Цель
+    if goal:
+        text_lines.append("\n🎯 *Дневная цель*:\n")
+        text_lines.append(
+            f"🍽 {goal['kcal']} ккал (*{_perc(kcal_today, goal['kcal'])}%* сегодня)\n"
+            f"🥩 {goal['protein']} г (*{_perc(p_today, goal['protein'])}%* сегодня)\n"
+            f"🧈 {goal['fat']} г (*{_perc(f_today, goal['fat'])}%* сегодня)\n"
+            f"🍞 {goal['carbs']} г (*{_perc(c_today, goal['carbs'])}%* сегодня)\n"
+        )
+
+        # Неделя против недельной цели
+        week_goal_kcal = goal["kcal"] * 7
+        week_goal_p = goal["protein"] * 7
+        week_goal_f = goal["fat"] * 7
+        week_goal_c = goal["carbs"] * 7
+
+        text_lines.append("\n📆 *Последние 7 дней (суммарно)*\n")
+        text_lines.append(
+            f"🍽 Калории: *{round(kcal_week)}* / {int(week_goal_kcal)} ккал "
+            f"(*{_perc(kcal_week, week_goal_kcal)}% от недельной цели*)\n"
+            f"🥩 Белки: *{round(p_week)}* / {int(week_goal_p)} г "
+            f"(*{_perc(p_week, week_goal_p)}%*)\n"
+            f"🧈 Жиры: *{round(f_week)}* / {int(week_goal_f)} г "
+            f"(*{_perc(f_week, week_goal_f)}%*)\n"
+            f"🍞 Углеводы: *{round(c_week)}* / {int(week_goal_c)} г "
+            f"(*{_perc(c_week, week_goal_c)}%*)\n"
+        )
+    else:
+        text_lines.append(
+            "\n🎯 Цель пока не задана.\n"
+            "Зайди в «⚙️ Настройки» → «🎯 Цель КБЖУ», чтобы я мог считать проценты."
+        )
+
+    await edit_menu_message(update, ctx, "\n".join(text_lines), kb_back_to_main())
+
+
+# ── Обработка приёма пищи (общий helper) ─────────────-
+
+async def _process_meal_calculation(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+
+    pending = ctx.user_data.get("pending_meal") or {}
+    photo_file_id = pending.get("photo_file_id")
+    photo_msg_id = pending.get("photo_msg_id")
+    chat_id = pending.get("chat_id")
+    extras = pending.get("extras") or {}
+
+    if not (photo_file_id and photo_msg_id and chat_id):
+        logging.warning("No pending meal for user %s", uid)
+        ctx.user_data["state"] = None
+        ctx.user_data["pending_meal"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            "Что-то пошло не так с фотографией. Попробуй отправить её ещё раз.",
+            kb_main(),
+        )
+        return
+
+    # Собираем текстовое описание из extras
+    parts = []
+    if extras.get("portion"):
+        parts.append(f"- Размер порции: {extras['portion']}")
+    if extras.get("composition"):
+        parts.append(f"- Описание блюда / состав: {extras['composition']}")
+    if extras.get("plate"):
+        parts.append(f"- Размер тарелки: {extras['plate']}")
+    extra_description = "\n".join(parts) if parts else None
+
+    # Статус "считаю"
+    await edit_menu_message(
+        update,
+        ctx,
+        "Считаю КБЖУ по этому приёму пищи… ⏱\n\n"
+        "Обычно это занимает несколько секунд.",
+        reply_markup=None,
+    )
+
+    # Скачиваем фото
+    try:
+        file = await ctx.bot.get_file(photo_file_id)
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+        image_bytes = bio.read()
+    except Exception:
+        logging.exception("failed to download photo for user %s", uid)
+        ctx.user_data["state"] = None
+        ctx.user_data["pending_meal"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог скачать фото. Попробуй ещё раз отправить снимок.",
+            kb_main(),
+        )
+        return
+
+    # Считаем КБЖУ
+    try:
+        data = await analyze_food_photo(image_bytes, extra_description=extra_description)
+        totals = extract_totals(data)
+    except Exception:
+        logging.exception("analyze_food_photo failed for %s", uid)
+        ctx.user_data["state"] = None
+        ctx.user_data["pending_meal"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            (
+                "Не смог корректно оценить это фото.\n\n"
+                "Попробуй ещё раз:\n"
+                "• сфотографируй тарелку сверху;\n"
+                "• постарайся, чтобы еда была хорошо видна;\n"
+                "• при необходимости добавь описание через меню уточнений."
+            ),
+            kb_main(),
+        )
+        return
+
+    kcal = round(float(totals.get("kcal", 0) or 0))
+    protein = round(float(totals.get("protein_g", 0) or 0))
+    fat = round(float(totals.get("fat_g", 0) or 0))
+    carbs = round(float(totals.get("carbs_g", 0) or 0))
+
+    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+
+    # Удаляем фото
+    try:
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=photo_msg_id)
+    except BadRequest:
+        pass
+
+    # Чистим состояние
+    ctx.user_data["state"] = None
+    ctx.user_data["pending_meal"] = None
+
+    msg = (
+        "Оценка приёма пищи 🍽\n\n"
+        f"🍽 Калории: ~*{kcal}* ккал\n"
+        f"🥩 Белки: ~*{protein}* г\n"
+        f"🧈 Жиры: ~*{fat}* г\n"
+        f"🍞 Углеводы: ~*{carbs}* г\n\n"
+        "_Это приблизительная оценка по фото и данным, которые ты указал._"
+    )
+    await edit_menu_message(update, ctx, msg, kb_main())
+
+
+# ── Фото еды ─────────────────────────────────────────
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscription(update, ctx):
         await delete_user_message(update)
         return
 
+    message = update.message
+    chat = message.chat
+    photo = message.photo[-1]
+
+    # Сохраняем новую pending_meal, затирая старую
+    ctx.user_data["pending_meal"] = {
+        "photo_file_id": photo.file_id,
+        "photo_msg_id": message.message_id,
+        "chat_id": chat.id,
+        "extras": {},
+    }
+    ctx.user_data["state"] = "await_meal_extras_menu"
+
+    # Текст меню уточнений
+    text = (
+        "Фото получено ✅\n\n"
+        "Чтобы расчёт был точнее, можно уточнить детали:\n"
+        "• примерную граммовку порции;\n"
+        "• что именно за блюдо и из чего оно состоит;\n"
+        "• размер тарелки.\n\n"
+        "Выбери, что хочешь уточнить, или сразу жми «✅ Считать как есть / отправить»."
+    )
+    extras = ctx.user_data["pending_meal"]["extras"]
+    await send_new_menu_message(ctx, chat.id, text, kb_meal_extras(extras))
+
+
+# ── Текст: цель / уточнения / остальное ──────────────
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscription(update, ctx):
+        await delete_user_message(update)
+        return
+
+    text = (update.message.text or "").strip()
+    state = ctx.user_data.get("state")
+
+    # Ввод цели
     if state == "await_goal":
         await handle_goal_input(update, ctx, text)
         return
 
-    if state == "await_meal_extra":
-        # Это описание блюда для текущего фото
-        # Стираем текст пользователя и запускаем подсчёт
+    # Уточнения после фото
+    pending = ctx.user_data.get("pending_meal") or {}
+    extras = pending.get("extras") or {}
+
+    if state in {"await_extra_portion", "await_extra_composition", "await_extra_plate"}:
         await delete_user_message(update)
-        await _process_meal_calculation(update, ctx, extra_description=text)
+
+        if state == "await_extra_portion":
+            extras["portion"] = text
+        elif state == "await_extra_composition":
+            extras["composition"] = text
+        elif state == "await_extra_plate":
+            extras["plate"] = text
+
+        pending["extras"] = extras
+        ctx.user_data["pending_meal"] = pending
+        ctx.user_data["state"] = "await_meal_extras_menu"
+
+        # Обновляем меню уточнений
+        chat_id = pending.get("chat_id") or update.effective_chat.id
+        info_lines = ["Фото получено ✅\n"]
+        if extras.get("portion"):
+            info_lines.append(f"📏 Граммовка: _{extras['portion']}_")
+        if extras.get("composition"):
+            info_lines.append(f"🍲 Состав: _{extras['composition']}_")
+        if extras.get("plate"):
+            info_lines.append(f"🍽 Тарелка: _{extras['plate']}_")
+        info_lines.append(
+            "\nМожно добавить ещё детали или сразу отправить на подсчёт."
+        )
+        await edit_menu_message(
+            update,
+            ctx,
+            "\n".join(info_lines),
+            kb_meal_extras(extras),
+        )
         return
 
-    # Любой другой текст — просто удаляем и показываем меню
+    # Любой другой текст — удаляем и возвращаем меню
     await delete_user_message(update)
     await show_main_menu(update, ctx)
 
 
-# ── Callback-кнопки ───────────────────────────────────
+# ── Голосовые (заглушка пока что) ─────────────────────
 
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Пока просто заглушка: удаляем голосовое и пишем, что функция будет добавлена.
+    Позже сюда добавим:
+    1) скачивание файла;
+    2) отправку в Whisper;
+    3) анализ текста через TEXT_MODEL;
+    4) add_meal(...) + вывод КБЖУ.
+    """
+    if not await ensure_subscription(update, ctx):
+        await delete_user_message(update)
+        return
+
+    await delete_user_message(update)
+    await edit_menu_message(
+        update,
+        ctx,
+        "Голосовой ввод приёма пищи скоро будет доступен 🎙\n\n"
+        "Пока что воспользуйся фото тарелки.",
+        kb_main(),
+    )
+
+
+# ── Callback-кнопки ───────────────────────────────────
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -738,39 +950,89 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "main":
         await show_main_menu(update, ctx)
-    elif data == "add_meal":
-        await show_add_meal_screen(update, ctx)
-    elif data == "stats":
-        await show_today_stats(update, ctx)
     elif data == "settings":
         await show_settings(update, ctx)
     elif data == "set_goal":
         await show_set_goal_screen(update, ctx)
+    elif data == "stats":
+        await show_stats(update, ctx)
+    elif data == "survey_stub":
+        await edit_menu_message(
+            update,
+            ctx,
+            "Опрос для подбора нормы КБЖУ появится чуть позже.\n\n"
+            "Пока что можно задать цель вручную.",
+            kb_settings(),
+        )
     elif data == "sub_stub":
-        await show_sub_stub(update, ctx)
-    elif data == "meal_skip_extra":
-        # Посчитать без описания
-        await _process_meal_calculation(update, ctx, extra_description=None)
+        await edit_menu_message(
+            update,
+            ctx,
+            "Здесь позже появится управление подпиской и бонусами.\n"
+            "Сейчас бот работает в тестовом режиме бесплатно.",
+            kb_settings(),
+        )
+    elif data == "meal_extra_portion":
+        ctx.user_data["state"] = "await_extra_portion"
+        await edit_menu_message(
+            update,
+            ctx,
+            "Напиши одним сообщением примерную граммовку / размер порции.\n\n"
+            "Например:\n"
+            "_«Около 300 г гарнира и 150 г мяса»_",
+            kb_back_to_main(),
+        )
+    elif data == "meal_extra_composition":
+        ctx.user_data["state"] = "await_extra_composition"
+        await edit_menu_message(
+            update,
+            ctx,
+            "Опиши, что именно на тарелке и из чего состоит блюдо.\n\n"
+            "Например:\n"
+            "_«Куриная грудка на гриле, гречка без масла, салат из огурцов и помидоров с ложкой оливкового масла»_",
+            kb_back_to_main(),
+        )
+    elif data == "meal_extra_plate":
+        ctx.user_data["state"] = "await_extra_plate"
+        await edit_menu_message(
+            update,
+            ctx,
+            "Опиши размер тарелки или её объём, если знаешь.\n\n"
+            "Например:\n"
+            "_«Глубокая тарелка ~500 мл, заполнена примерно на 2/3»_",
+            kb_back_to_main(),
+        )
+    elif data == "meal_extra_send":
+        await _process_meal_calculation(update, ctx)
+    elif data == "meal_extra_cancel":
+        pending = ctx.user_data.get("pending_meal") or {}
+        chat_id = pending.get("chat_id")
+        photo_msg_id = pending.get("photo_msg_id")
+        if chat_id and photo_msg_id:
+            try:
+                await ctx.bot.delete_message(chat_id=chat_id, message_id=photo_msg_id)
+            except BadRequest:
+                pass
+        ctx.user_data["pending_meal"] = None
+        ctx.user_data["state"] = None
+        await show_main_menu(update, ctx)
 
 
-# ── Каркас оплаты / рефералок / статистики ───────────-
-
+# ── Админ и прочее (минимальный каркас) ──────────────
 
 async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await delete_user_message(update)
     if not await ensure_subscription(update, ctx):
         return
     text = (
-        "Здесь позже появится оплата и подписка.\n"
-        "Сейчас бот работает в тестовом режиме бесплатно.\n\n"
-        "Функцию оплаты мы добавим отдельным шагом."
+        "Оплата и подписка появятся чуть позже.\n"
+        "Сейчас бот работает в тестовом режиме бесплатно."
     )
     await edit_menu_message(update, ctx, text, kb_main())
 
 
 async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
     await delete_user_message(update)
     if uid not in ADMINS:
         return
@@ -778,9 +1040,7 @@ async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target = int(ctx.args[0])
         qty = int(ctx.args[1])
     except (IndexError, ValueError):
-        await edit_menu_message(
-            update, ctx, "Usage: /grant <id> <qty>", kb_main()
-        )
+        await edit_menu_message(update, ctx, "Usage: /grant <id> <qty>", kb_main())
         return
     db = get_db(ctx)
     await add_credits(db, target, qty)
@@ -792,7 +1052,6 @@ async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
     await delete_user_message(update)
     if uid not in ADMINS:
         return
@@ -800,9 +1059,7 @@ async def cmd_decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target = int(ctx.args[0])
         qty = int(ctx.args[1])
     except (IndexError, ValueError):
-        await edit_menu_message(
-            update, ctx, "Usage: /decredits <id> <qty>", kb_main()
-        )
+        await edit_menu_message(update, ctx, "Usage: /decredits <id> <qty>", kb_main())
         return
     db = get_db(ctx)
     ok = await dec_credits(db, target, qty)
@@ -812,12 +1069,13 @@ async def cmd_decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     total = await get_credits(db, target)
-    await edit_menu_message(update, ctx, f"OK. Now {target} has {total} credits", kb_main())
+    await edit_menu_message(
+        update, ctx, f"OK. Now {target} has {total} credits", kb_main()
+    )
 
 
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_stats_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
     await delete_user_message(update)
     if uid not in ADMINS:
         return
@@ -835,7 +1093,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    logging.info("command %s from %s", update.message.text, uid)
     await delete_user_message(update)
     if not await ensure_subscription(update, ctx):
         return
@@ -853,8 +1110,7 @@ async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await edit_menu_message(update, ctx, text, kb_main())
 
 
-# ── Точка входа ───────────────────────────────────────-
-
+# ── main ─────────────────────────────────────────────
 
 def main() -> None:
     logging.basicConfig(
@@ -880,10 +1136,10 @@ def main() -> None:
     # Админ-команды
     application.add_handler(CommandHandler("grant", cmd_grant))
     application.add_handler(CommandHandler("decredits", cmd_decredits))
-    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("stats_admin", cmd_stats_admin))
     application.add_handler(CommandHandler("mystats", cmd_my_stats))
 
-    # Callback-кнопки (меню + шлагбаум + "без описания")
+    # Callback-кнопки
     application.add_handler(CallbackQueryHandler(on_callback))
 
     # Фото еды
@@ -891,7 +1147,12 @@ def main() -> None:
         MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo)
     )
 
-    # Любой текст (цель, описание блюда, всё остальное)
+    # Голосовые (заглушка)
+    application.add_handler(
+        MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice)
+    )
+
+    # Любой текст (цель, уточнения, всё остальное)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
