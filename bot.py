@@ -99,7 +99,11 @@ def kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🎯 Цель КБЖУ", callback_data="set_goal")],
-            [InlineKeyboardButton("🧮 Опрос (скоро)", callback_data="survey_stub")],
+            [
+                InlineKeyboardButton(
+                    "🧮 Подобрать норму по опросу", callback_data="survey_start"
+                )
+            ],
             [InlineKeyboardButton("💳 Подписка (скоро)", callback_data="sub_stub")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
@@ -225,6 +229,8 @@ TEXT_FOOD_USER_INSTRUCTIONS = (
     "}\n\n"
     "Если в описании явно указана граммовка или размер порции, обязательно учитывай это."
 )
+
+SURVEY_STEPS = ["age", "sex", "height", "weight", "activity", "goal", "extra"]
 
 # ── DB init ───────────────────────────────────────────
 
@@ -597,7 +603,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscription(update, ctx):
         return
 
-    await show_main_menu(update, ctx)
+    goal = await get_goal(db, uid)
+    if goal is None:
+        await show_survey_offer(update, ctx)
+    else:
+        await show_main_menu(update, ctx)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -625,8 +635,231 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "⚙️ Настройки\n\n"
         "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
-        "• 🧮 Опрос — позже можно будет автоматически подобрать норму.\n"
+        "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
         "• 💳 Подписка — сюда добавим платные режимы и бонусы за друзей.\n"
+    )
+    await edit_menu_message(update, ctx, text, kb_settings())
+
+
+# ── Опрос для подбора цели ─────────────────────────────
+
+async def show_survey_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показывает предложение пройти опрос при первом старте,
+    если цель ещё не задана.
+    """
+    ctx.user_data["state"] = None
+    text = (
+        "Хочешь, чтобы я помог прикинуть твою дневную норму калорий и БЖУ? 🧮\n\n"
+        "Короткий опрос на 5–7 вопросов, без медицины и морализаторства — "
+        "просто чтобы прикинуть комфортные цифры под твой режим."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Да, пройти опрос", callback_data="survey_start"),
+                InlineKeyboardButton("Позже", callback_data="main"),
+            ]
+        ]
+    )
+    await edit_menu_message(update, ctx, text, kb)
+
+
+async def start_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Инициализация опроса: обнуляем данные и задаём первый вопрос.
+    """
+    ctx.user_data["survey"] = {}
+    ctx.user_data["survey_step"] = 0
+    ctx.user_data["state"] = "survey_running"
+    await ask_current_survey_question(update, ctx)
+
+
+async def ask_current_survey_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показывает текущий вопрос опроса в зависимости от survey_step.
+    """
+    step = ctx.user_data.get("survey_step", 0)
+    if step < 0 or step >= len(SURVEY_STEPS):
+        ctx.user_data["state"] = None
+        await show_settings(update, ctx)
+        return
+
+    key = SURVEY_STEPS[step]
+
+    if key == "age":
+        text = (
+            "Давай подберём норму КБЖУ 🧮\n\n"
+            "1/7. *Сколько тебе полных лет?*\n\n"
+            "Напиши одним числом, например: `27`"
+        )
+    elif key == "sex":
+        text = (
+            "2/7. *Твой пол?*\n\n"
+            "Напиши удобно для себя, я пойму: `м`, `ж`, `мужчина`, `женщина`."
+        )
+    elif key == "height":
+        text = (
+            "3/7. *Какой у тебя рост в сантиметрах?*\n\n"
+            "Например: `178`"
+        )
+    elif key == "weight":
+        text = (
+            "4/7. *Какой у тебя вес в килограммах?*\n\n"
+            "Например: `72`"
+        )
+    elif key == "activity":
+        text = (
+            "5/7. *Как ты обычно двигаешься в течение недели?*\n\n"
+            "Выбери цифру и напиши её:\n"
+            "1 — почти не двигаюсь (офис/дом, без спорта)\n"
+            "2 — лёгкая активность (прогулки, редкий спорт)\n"
+            "3 — умеренная (3–4 тренировки в неделю)\n"
+            "4 — высокая (ежедневный спорт или физическая работа)\n"
+            "5 — очень высокая (тяжёлый физический труд, спорт 2 раза в день)"
+        )
+    elif key == "goal":
+        text = (
+            "6/7. *Что хочешь сделать с весом в ближайшие 3–6 месяцев?*\n\n"
+            "Тоже цифрой:\n"
+            "1 — плавно похудеть\n"
+            "2 — удерживать текущий вес\n"
+            "3 — набрать массу (мышцы / вес)"
+        )
+    elif key == "extra":
+        text = (
+            "7/7. *Есть ли важные детали, про которые стоит знать?*\n\n"
+            "Например: тип тренировок, вегетарианство, ОМАД, проблемы с ЖКТ и т.п.\n"
+            "Если ничего особенного — просто напиши `нет`."
+        )
+    else:
+        text = "Ответь на текущий вопрос опроса."
+
+    await edit_menu_message(update, ctx, text, kb_back_to_main())
+
+
+async def generate_goal_from_survey(answers: dict) -> dict:
+    """
+    На основе ответов опроса вызывает TEXT_MODEL и получает JSON с полями:
+    kcal, protein_g, fat_g, carbs_g.
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # Собираем описание пользователя
+    user_desc_lines = [
+        "Вот ответы пользователя на опрос для подбора дневной нормы КБЖУ:",
+        f"- Возраст: {answers.get('age', '').strip()}",
+        f"- Пол: {answers.get('sex', '').strip()}",
+        f"- Рост: {answers.get('height', '').strip()}",
+        f"- Вес: {answers.get('weight', '').strip()}",
+        f"- Активность (1–5): {answers.get('activity', '').strip()}",
+        f"- Цель (1–3): {answers.get('goal', '').strip()}",
+        f"- Дополнительные детали: {answers.get('extra', '').strip()}",
+    ]
+    user_desc = "\n".join(user_desc_lines)
+
+    system_prompt = (
+        "Ты — нутрициолог и тренер по образу жизни. "
+        "На основе описания человека тебе нужно прикинуть комфортную дневную норму "
+        "калорий и БЖУ для здорового темпа прогресса.\n\n"
+        "Опираться можно на усреднённые формулы (Mifflin-St Jeor и т.п.), "
+        "но главное — дать реалистичные цифры, подходящие под образ жизни и цель.\n\n"
+        "Выводи ТОЛЬКО JSON без пояснений, строго в формате:\n"
+        "{\n"
+        "  \"kcal\": 2300,\n"
+        "  \"protein_g\": 150,\n"
+        "  \"fat_g\": 70,\n"
+        "  \"carbs_g\": 250\n"
+        "}\n\n"
+        "Белки обычно 1.6–2.2 г на кг массы тела, жиры не опускай слишком низко, "
+        "углеводы подстраивай под оставшиеся калории."
+    )
+
+    user_prompt = (
+        user_desc
+        + "\n\nПодбери дневную норму так, чтобы она была комфортной и устойчивой "
+          "на дистанции, без экстремальных голодовок или переедания."
+    )
+
+    payload = {
+        "model": TEXT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data["choices"][0]["message"]["content"].strip()
+    parsed = json.loads(content)
+    logging.debug("Survey goal JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+    return parsed
+
+
+async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Завершает опрос: вызывает generate_goal_from_survey, записывает цель и показывает её пользователю.
+    """
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    answers = ctx.user_data.get("survey") or {}
+
+    try:
+        goal_data = await generate_goal_from_survey(answers)
+    except Exception:
+        logging.exception("generate_goal_from_survey failed for %s", uid)
+        ctx.user_data["state"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог подобрать норму по опросу 😕\n\n"
+            "Попробуй чуть позже или задай цель вручную в настройках.",
+            kb_settings(),
+        )
+        return
+
+    try:
+        kcal = int(float(goal_data.get("kcal", 0)))
+        protein = float(goal_data.get("protein_g", 0))
+        fat = float(goal_data.get("fat_g", 0))
+        carbs = float(goal_data.get("carbs_g", 0))
+    except Exception:
+        logging.exception("bad goal_data: %s", goal_data)
+        ctx.user_data["state"] = None
+        await edit_menu_message(
+            update,
+            ctx,
+            "Модель вернула странный ответ по норме КБЖУ.\n"
+            "Попробуй ещё раз или задай цель вручную.",
+            kb_settings(),
+        )
+        return
+
+    await set_goal(db, uid, kcal, protein, fat, carbs)
+    ctx.user_data["state"] = None
+
+    text = (
+        "Готово ✅\n\n"
+        "По твоим ответам я предлагаю такую дневную норму:\n\n"
+        f"🍽 Калории: *{kcal}* ккал\n"
+        f"🥩 Белки: *{protein:.0f}* г\n"
+        f"🧈 Жиры: *{fat:.0f}* г\n"
+        f"🍞 Углеводы: *{carbs:.0f}* г\n\n"
+        "_Это не медицинская рекомендация, а разумная оценка под твой режим жизни. "
+        "При желании ты всегда можешь скорректировать цель вручную._"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
@@ -999,6 +1232,30 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     state = ctx.user_data.get("state")
 
+    # Опрос для подбора цели
+    if state == "survey_running":
+        survey = ctx.user_data.get("survey") or {}
+        step = ctx.user_data.get("survey_step", 0)
+
+        if step < 0 or step >= len(SURVEY_STEPS):
+            ctx.user_data["state"] = None
+            await show_settings(update, ctx)
+            return
+
+        key = SURVEY_STEPS[step]
+        survey[key] = text.strip()
+        ctx.user_data["survey"] = survey
+        ctx.user_data["survey_step"] = step + 1
+
+        await delete_user_message(update)
+
+        # Если есть ещё вопросы — задаём следующий, иначе завершаем опрос
+        if ctx.user_data["survey_step"] < len(SURVEY_STEPS):
+            await ask_current_survey_question(update, ctx)
+        else:
+            await finish_survey(update, ctx)
+        return
+
     # Ввод цели
     if state == "await_goal":
         await handle_goal_input(update, ctx, text)
@@ -1218,14 +1475,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_set_goal_screen(update, ctx)
     elif data == "stats":
         await show_stats(update, ctx)
-    elif data == "survey_stub":
-        await edit_menu_message(
-            update,
-            ctx,
-            "Опрос для подбора нормы КБЖУ появится чуть позже.\n\n"
-            "Пока что можно задать цель вручную.",
-            kb_settings(),
-        )
+    elif data == "survey_start":
+        await start_survey(update, ctx)
     elif data == "sub_stub":
         await edit_menu_message(
             update,
