@@ -893,6 +893,15 @@ async def _process_meal_calculation(
 
     await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
 
+    # После добавления приёма пересчитываем статистику за сегодня
+    today_totals = await get_daily_totals(db, uid)
+    goal = await get_goal(db, uid)
+
+    today_kcal = round(today_totals["kcal"])
+    today_p = round(today_totals["protein"])
+    today_f = round(today_totals["fat"])
+    today_c = round(today_totals["carbs"])
+
     # Удаляем фото
     try:
         await ctx.bot.delete_message(chat_id=chat_id, message_id=photo_msg_id)
@@ -903,14 +912,47 @@ async def _process_meal_calculation(
     ctx.user_data["state"] = None
     ctx.user_data["pending_meal"] = None
 
-    msg = (
-        "Оценка приёма пищи 🍽\n\n"
-        f"🍽 Калории: ~*{kcal}* ккал\n"
-        f"🥩 Белки: ~*{protein}* г\n"
-        f"🧈 Жиры: ~*{fat}* г\n"
-        f"🍞 Углеводы: ~*{carbs}* г\n\n"
-        "_Это приблизительная оценка по фото и данным, которые ты указал._"
+    lines = []
+    lines.append("Оценка приёма пищи 🍽\n")
+    lines.append("Этот приём:\n")
+    lines.append(f"🍽 Калории: ~*{kcal}* ккал")
+    lines.append(f"🥩 Белки: ~*{protein}* г")
+    lines.append(f"🧈 Жиры: ~*{fat}* г")
+    lines.append(f"🍞 Углеводы: ~*{carbs}* г\n")
+
+    lines.append("За сегодняшний день:\n")
+    lines.append(f"🍽 Калории: *{today_kcal}* ккал")
+    if goal:
+        lines.append(
+            f"  из {int(goal['kcal'])} ккал (*{_perc(today_kcal, goal['kcal'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🥩 Белки: *{today_p}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['protein']} г (*{_perc(today_p, goal['protein'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🧈 Жиры: *{today_f}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['fat']} г (*{_perc(today_f, goal['fat'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🍞 Углеводы: *{today_c}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
+        )
+
+    lines.append(
+        "\n_Это приблизительная оценка по фото и данным, которые ты указал._"
     )
+
+    msg = "\n".join(lines)
     await edit_menu_message(update, ctx, msg, kb_main())
 
 
@@ -1101,15 +1143,56 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
 
-    # Итог
-    msg = (
-        "Голосовой приём пищи 🎙\n\n"
-        f"🍽 Калории: ~*{kcal}* ккал\n"
-        f"🥩 Белки: ~*{protein}* г\n"
-        f"🧈 Жиры: ~*{fat}* г\n"
-        f"🍞 Углеводы: ~*{carbs}* г\n\n"
-        "_Это приблизительная оценка по описанию, которое ты произнёс._"
+    # Пересчитываем статистику за сегодня
+    today_totals = await get_daily_totals(db, uid)
+    goal = await get_goal(db, uid)
+
+    today_kcal = round(today_totals["kcal"])
+    today_p = round(today_totals["protein"])
+    today_f = round(today_totals["fat"])
+    today_c = round(today_totals["carbs"])
+
+    lines = []
+    lines.append("Голосовой приём пищи 🎙\n")
+    lines.append("Этот приём:\n")
+    lines.append(f"🍽 Калории: ~*{kcal}* ккал")
+    lines.append(f"🥩 Белки: ~*{protein}* г")
+    lines.append(f"🧈 Жиры: ~*{fat}* г")
+    lines.append(f"🍞 Углеводы: ~*{carbs}* г\n")
+
+    lines.append("За сегодняшний день:\n")
+    lines.append(f"🍽 Калории: *{today_kcal}* ккал")
+    if goal:
+        lines.append(
+            f"  из {int(goal['kcal'])} ккал (*{_perc(today_kcal, goal['kcal'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🥩 Белки: *{today_p}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['protein']} г (*{_perc(today_p, goal['protein'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🧈 Жиры: *{today_f}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['fat']} г (*{_perc(today_f, goal['fat'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🍞 Углеводы: *{today_c}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
+        )
+
+    lines.append(
+        "\n_Это приблизительная оценка по описанию, которое ты произнёс._"
     )
+
+    msg = "\n".join(lines)
     await edit_menu_message(update, ctx, msg, kb_main())
 
 
