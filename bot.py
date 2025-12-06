@@ -57,6 +57,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")      # на будущее: текст/голос
+AUDIO_TRANSCRIBE_MODEL = os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
 ADMINS = {
     int(x)
@@ -192,6 +193,37 @@ FOOD_USER_INSTRUCTIONS = (
     "    \"carbs_g\": 0\n"
     "  }\n"
     "}"
+)
+
+TEXT_FOOD_SYSTEM_PROMPT = (
+    "Ты — аккуратный ассистент-нутрициолог. Человек описывает голосом или текстом один приём пищи. "
+    "По этому описанию ты примерно оцениваешь калории и количество белков, жиров и углеводов. "
+    "Учитывай размер порций, способ приготовления (жарка, варка, фритюр), соусы и масла. "
+    "Если чего-то не хватает в описании, делай осторожные предположения на основе типичных порций."
+)
+
+TEXT_FOOD_USER_INSTRUCTIONS = (
+    "Человек голосом описал один приём пищи. На основе только этого описания оцени КБЖУ.\n\n"
+    "Нужно вернуть строго JSON того же формата, что и для фото:\n"
+    "{\n"
+    "  \"items\": [\n"
+    "    {\n"
+    "      \"name\": \"...\",\n"
+    "      \"weight_g\": 0,\n"
+    "      \"kcal_total\": 0,\n"
+    "      \"protein_g\": 0,\n"
+    "      \"fat_g\": 0,\n"
+    "      \"carbs_g\": 0\n"
+    "    }\n"
+    "  ],\n"
+    "  \"totals\": {\n"
+    "    \"kcal\": 0,\n"
+    "    \"protein_g\": 0,\n"
+    "    \"fat_g\": 0,\n"
+    "    \"carbs_g\": 0\n"
+    "  }\n"
+    "}\n\n"
+    "Если в описании явно указана граммовка или размер порции, обязательно учитывай это."
 )
 
 # ── DB init ───────────────────────────────────────────
@@ -402,6 +434,70 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
     content = data["choices"][0]["message"]["content"].strip()
     parsed = json.loads(content)
     logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+    return parsed
+
+
+async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+    """
+    Отправляет аудио в OpenAI Audio API и возвращает расшифровку текста.
+    """
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    files = {"file": (filename, audio_bytes, "audio/ogg")}
+    data = {
+        "model": AUDIO_TRANSCRIBE_MODEL,
+        "response_format": "json",
+        "language": "ru",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers=headers,
+            data=data,
+            files=files,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+
+    text = payload.get("text", "").strip()
+    logging.debug("Voice transcript: %s", text[:500])
+    return text
+
+
+async def analyze_food_text(description: str) -> dict:
+    """
+    Анализирует текстовое описание приёма пищи и возвращает JSON с КБЖУ.
+    Формат JSON должен совпадать с тем, что возвращает analyze_food_photo.
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    user_text = TEXT_FOOD_USER_INSTRUCTIONS + "\n\nОписание пользователя:\n" + description
+
+    messages = [
+        {"role": "system", "content": TEXT_FOOD_SYSTEM_PROMPT},
+        {"role": "user", "content": user_text},
+    ]
+    payload = {
+        "model": TEXT_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    content = data["choices"][0]["message"]["content"].strip()
+    parsed = json.loads(content)
+    logging.debug("Food text JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
     return parsed
 
 
@@ -909,29 +1005,112 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await show_main_menu(update, ctx)
 
 
-# ── Голосовые (заглушка пока что) ─────────────────────
+# ── Голосовые ─────────────────────────────────────────
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Пока просто заглушка: удаляем голосовое и пишем, что функция будет добавлена.
-    Позже сюда добавим:
-    1) скачивание файла;
-    2) отправку в Whisper;
-    3) анализ текста через TEXT_MODEL;
-    4) add_meal(...) + вывод КБЖУ.
+    Принимает голосовое с описанием приёма пищи, расшифровывает его и
+    считает КБЖУ так же, как для фото.
     """
     if not await ensure_subscription(update, ctx):
         await delete_user_message(update)
         return
 
-    await delete_user_message(update)
+    message = update.message
+    chat = message.chat
+    uid = update.effective_user.id
+
+    # Удаляем голосовое из чата, чтобы не захламлять
+    try:
+        await message.delete()
+    except BadRequest:
+        pass
+
+    # Показываем статус
     await edit_menu_message(
         update,
         ctx,
-        "Голосовой ввод приёма пищи скоро будет доступен 🎙\n\n"
-        "Пока что воспользуйся фото тарелки.",
+        "Слушаю и расшифровываю приём пищи… 🎧\n\n"
+        "Потом оценю калории и БЖУ.",
         kb_main(),
     )
+
+    # Скачиваем аудио
+    try:
+        voice = message.voice
+        file = await ctx.bot.get_file(voice.file_id)
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+        audio_bytes = bio.read()
+    except Exception:
+        logging.exception("failed to download voice for user %s", uid)
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог скачать голосовое сообщение. Попробуй записать ещё раз.",
+            kb_main(),
+        )
+        return
+
+    # Транскрибируем
+    try:
+        transcript = await transcribe_voice_audio(audio_bytes)
+    except Exception:
+        logging.exception("voice transcription failed for %s", uid)
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог расшифровать голос. Попробуй говорить чуть чётче "
+            "и без лишнего шума на фоне.",
+            kb_main(),
+        )
+        return
+
+    if not transcript:
+        await edit_menu_message(
+            update,
+            ctx,
+            "В расшифровке не получилось распознать текст. "
+            "Попробуй перезаписать сообщение, описав, что и сколько ты съел.",
+            kb_main(),
+        )
+        return
+
+    # Анализируем текст как приём пищи
+    db = get_db(ctx)
+    try:
+        data = await analyze_food_text(transcript)
+        totals = extract_totals(data)
+    except Exception:
+        logging.exception("analyze_food_text failed for %s", uid)
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог оценить этот приём пищи по тексту.\n\n"
+            "Попробуй описать его чуть подробнее: что именно, как приготовлено "
+            "и какие примерные порции.",
+            kb_main(),
+        )
+        return
+
+    kcal = round(float(totals.get("kcal", 0) or 0))
+    protein = round(float(totals.get("protein_g", 0) or 0))
+    fat = round(float(totals.get("fat_g", 0) or 0))
+    carbs = round(float(totals.get("carbs_g", 0) or 0))
+
+    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+
+    # Итог
+    msg = (
+        "Голосовой приём пищи 🎙\n\n"
+        f"🍽 Калории: ~*{kcal}* ккал\n"
+        f"🥩 Белки: ~*{protein}* г\n"
+        f"🧈 Жиры: ~*{fat}* г\n"
+        f"🍞 Углеводы: ~*{carbs}* г\n\n"
+        "_Это приблизительная оценка по описанию, которое ты произнёс._"
+    )
+    await edit_menu_message(update, ctx, msg, kb_main())
 
 
 # ── Callback-кнопки ───────────────────────────────────
