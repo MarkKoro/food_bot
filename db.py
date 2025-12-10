@@ -67,6 +67,16 @@ async def create_tables(db: aiosqlite.Connection) -> None:
     )
     await db.commit()
 
+    # Миграция: добавляем last_menu_message_id, если его ещё нет
+    cur = await db.execute("PRAGMA table_info(users)")
+    cols = [row[1] for row in await cur.fetchall()]
+    await cur.close()
+    if "last_menu_message_id" not in cols:
+        await db.execute(
+            "ALTER TABLE users ADD COLUMN last_menu_message_id INTEGER"
+        )
+        await db.commit()
+
 
 # ── Пользователи / кредиты ─────────────────────────────
 
@@ -366,3 +376,30 @@ async def get_total_payments(db: aiosqlite.Connection) -> float:
     row = await cur.fetchone()
     await cur.close()
     return float(row[0] or 0.0)
+
+
+# ── Последнее меню ─────────────────────────────────────
+
+async def get_last_menu_message_id(
+    db: aiosqlite.Connection, user_id: int
+) -> int | None:
+    cur = await db.execute(
+        "SELECT last_menu_message_id FROM users WHERE telegram_id = ?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return None
+    return row[0]
+
+
+async def set_last_menu_message_id(
+    db: aiosqlite.Connection, user_id: int, message_id: int | None
+) -> None:
+    await ensure_user(db, user_id)
+    await db.execute(
+        "UPDATE users SET last_menu_message_id = ? WHERE telegram_id = ?",
+        (message_id, user_id),
+    )
+    await db.commit()

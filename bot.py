@@ -47,6 +47,8 @@ from db import (
     get_meal_count,
     get_total_payments,
     get_invite_stats,
+    get_last_menu_message_id,
+    set_last_menu_message_id,
 )
 
 # ── Конфиг ─────────────────────────────────────────────
@@ -264,8 +266,16 @@ async def edit_menu_message(
     if not chat:
         return
     chat_id = chat.id
+    db = get_db(ctx)
+    user = update.effective_user
+    uid = user.id if user else None
     chat_data = ctx.chat_data
     msg_id = chat_data.get("menu_message_id")
+
+    if uid and not msg_id:
+        msg_id = await get_last_menu_message_id(db, uid)
+        if msg_id:
+            chat_data["menu_message_id"] = msg_id
 
     if msg_id:
         try:
@@ -292,6 +302,8 @@ async def edit_menu_message(
         except BadRequest:
             pass
     chat_data["menu_message_id"] = msg.message_id
+    if uid:
+        await set_last_menu_message_id(db, uid, msg.message_id)
 
 
 async def send_new_menu_message(
@@ -299,9 +311,14 @@ async def send_new_menu_message(
     chat_id: int,
     text: str,
     reply_markup=None,
+    user_id: int | None = None,
 ) -> None:
+    db = get_db(ctx)
+    uid = user_id or chat_id
     chat_data = ctx.chat_data
     old_id = chat_data.get("menu_message_id")
+    if uid and not old_id:
+        old_id = await get_last_menu_message_id(db, uid)
 
     msg = await ctx.bot.send_message(
         chat_id=chat_id,
@@ -317,6 +334,8 @@ async def send_new_menu_message(
             pass
 
     chat_data["menu_message_id"] = msg.message_id
+    if uid:
+        await set_last_menu_message_id(db, uid, msg.message_id)
 
 
 async def delete_user_message(update: Update) -> None:
@@ -1219,7 +1238,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Выбери, что хочешь уточнить, или сразу жми «✅ Считать как есть / отправить»."
     )
     extras = ctx.user_data["pending_meal"]["extras"]
-    await send_new_menu_message(ctx, chat.id, text, kb_meal_extras(extras))
+    uid = update.effective_user.id
+    await send_new_menu_message(
+        ctx, chat.id, text, kb_meal_extras(extras), user_id=uid
+    )
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
