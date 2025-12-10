@@ -129,10 +129,6 @@
     </div>
 
     <script>
-      // Получаем user_id из query-параметров
-      const params = new URLSearchParams(window.location.search);
-      const userId = params.get("user_id");
-
       const todaySummaryEl = document.getElementById("today-summary");
       const todayMacrosEl = document.getElementById("today-macros");
       const todayHintEl = document.getElementById("today-hint");
@@ -141,6 +137,26 @@
       const weekSummaryEl = document.getElementById("week-summary");
       const weekErrorEl = document.getElementById("week-error");
       const monthErrorEl = document.getElementById("month-error");
+
+      const tg = window.Telegram && window.Telegram.WebApp
+        ? window.Telegram.WebApp
+        : null;
+
+      let userId = null;
+      if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
+        userId = String(tg.initDataUnsafe.user.id);
+        try {
+          tg.ready();
+        } catch (e) {
+          console.log("Telegram WebApp ready error:", e);
+        }
+      } else {
+        const params = new URLSearchParams(window.location.search);
+        const fromQuery = params.get("user_id");
+        if (fromQuery) {
+          userId = fromQuery;
+        }
+      }
 
       let weekChart = null;
       let monthChart = null;
@@ -331,7 +347,7 @@
       async function init() {
         if (!userId) {
           todayErrorEl.textContent =
-            "Не передан user_id. Добавьте ?user_id=ВАШ_ID к адресу страницы.";
+            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
           weekErrorEl.textContent = "";
           monthErrorEl.textContent = "";
           return;

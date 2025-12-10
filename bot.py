@@ -17,6 +17,7 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    WebAppInfo,
 )
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -69,6 +70,9 @@ ADMINS = {
 
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 JOIN_URL = os.getenv("JOIN_URL", "")
+FOOD_WEBAPP_URL = os.getenv(
+    "FOOD_WEBAPP_URL", "https://example.com/foodbot/webapp/"
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -83,12 +87,17 @@ if not JOIN_URL:
 # ── Клавиатуры ────────────────────────────────────────
 
 def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
         [
-            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        ]
-    )
+            InlineKeyboardButton(
+                "📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL)
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
 
 
 def kb_back_to_main() -> InlineKeyboardMarkup:
