@@ -98,6 +98,7 @@
         <h2>Сегодня</h2>
         <div id="today-summary"></div>
         <div class="macro-grid" id="today-macros"></div>
+        <canvas id="today-pie"></canvas>
         <div class="hint" id="today-hint"></div>
         <div class="error" id="today-error"></div>
       </div>
@@ -143,9 +144,17 @@
 
       let weekChart = null;
       let monthChart = null;
+      let todayPie = null;
 
       function fmt(value, digits = 0) {
         return Number(value || 0).toFixed(digits);
+      }
+
+      function formatDayLabel(dayStr) {
+        // Ожидаем формат YYYY-MM-DD
+        if (!dayStr || dayStr.length < 10) return dayStr || "";
+        const [y, m, d] = dayStr.split("-");
+        return `${d}.${m}`;
       }
 
       function buildTodayBlock(data) {
@@ -182,16 +191,57 @@
           </div>
         `;
 
-        if (!goal) {
+        // Круговой график распределения Б/Ж/У за сегодня
+        const todayPieEl = document.getElementById("today-pie");
+        if (todayPie) {
+          todayPie.destroy();
+        }
+
+        const p = totals.protein || 0;
+        const f = totals.fat || 0;
+        const c = totals.carbs || 0;
+        const sumMacros = p + f + c;
+
+        if (sumMacros > 0 && todayPieEl) {
+          todayPie = new Chart(todayPieEl.getContext("2d"), {
+            type: "doughnut",
+            data: {
+              labels: ["Белки", "Жиры", "Углеводы"],
+              datasets: [
+                {
+                  data: [p, f, c],
+                },
+              ],
+            },
+            options: {
+              plugins: {
+                legend: {
+                  display: true,
+                  labels: {
+                    color: "#e5e7eb",
+                    font: { size: 11 },
+                  },
+                },
+              },
+            },
+          });
           todayHintEl.textContent =
-            "Цель по КБЖУ пока не задана. Задайте её в настройках бота, чтобы видеть проценты.";
+            todayHintEl.textContent ||
+            "Круг показывает долю белков, жиров и углеводов за сегодня.";
         } else {
-          todayHintEl.textContent = "";
+          // Если приёмов ещё не было — просто подсказка
+          if (!goal) {
+            todayHintEl.textContent =
+              "Цель по КБЖУ пока не задана. Задайте её в настройках бота, чтобы видеть проценты.";
+          } else if (!todayHintEl.textContent) {
+            todayHintEl.textContent =
+              "Сегодня ещё не было сохранённых приёмов пищи.";
+          }
         }
       }
 
       function buildWeekChart(history) {
-        const labels = history.map((d) => d.day.slice(5)); // MM-DD
+        const labels = history.map((d) => formatDayLabel(d.day));
         const kcalData = history.map((d) => d.kcal || 0);
 
         const ctx = document.getElementById("week-chart").getContext("2d");
@@ -235,7 +285,7 @@
       }
 
       function buildMonthChart(history) {
-        const labels = history.map((d) => d.day.slice(5)); // MM-DD
+        const labels = history.map((d) => formatDayLabel(d.day));
         const kcalData = history.map((d) => d.kcal || 0);
 
         const ctx = document.getElementById("month-chart").getContext("2d");
