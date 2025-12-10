@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 DB_PATH = os.getenv("DB_PATH", "data/food_bot.sqlite3")
 
@@ -16,6 +17,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+app.mount(
+    "/webapp",
+    StaticFiles(directory="static/webapp", html=True),
+    name="webapp",
 )
 
 
