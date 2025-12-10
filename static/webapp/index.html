@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>FoodBot — статистика</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #050816;
+        color: #f5f5f5;
+      }
+      .app {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 16px;
+      }
+      header {
+        margin-bottom: 16px;
+      }
+      header h1 {
+        margin: 0 0 4px;
+        font-size: 22px;
+      }
+      header p {
+        margin: 0;
+        font-size: 14px;
+        opacity: 0.8;
+      }
+      .card {
+        background: rgba(15, 23, 42, 0.85);
+        border-radius: 16px;
+        padding: 14px 16px;
+        margin-bottom: 12px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(148, 163, 184, 0.2);
+      }
+      .card h2 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 4px;
+      }
+      .pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: rgba(30, 64, 175, 0.6);
+      }
+      .macro-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+        margin-top: 8px;
+        font-size: 13px;
+      }
+      .macro-item span.label {
+        opacity: 0.8;
+      }
+      .macro-item span.value {
+        font-weight: 600;
+      }
+      canvas {
+        width: 100% !important;
+        max-height: 220px;
+        margin-top: 8px;
+      }
+      .error {
+        color: #fecaca;
+        font-size: 13px;
+        margin-top: 6px;
+      }
+      .hint {
+        font-size: 12px;
+        opacity: 0.65;
+        margin-top: 4px;
+      }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>🍽 FoodBot — ваша статистика</h1>
+        <p>Быстрый взгляд: сегодня, неделя и месяц по КБЖУ.</p>
+      </header>
+
+      <div class="card" id="card-today">
+        <h2>Сегодня</h2>
+        <div id="today-summary"></div>
+        <div class="macro-grid" id="today-macros"></div>
+        <div class="hint" id="today-hint"></div>
+        <div class="error" id="today-error"></div>
+      </div>
+
+      <div class="card" id="card-week">
+        <h2>Последние 7 дней</h2>
+        <div id="week-summary"></div>
+        <canvas id="week-chart"></canvas>
+        <div class="hint">Линия показывает калории по дням.</div>
+        <div class="error" id="week-error"></div>
+      </div>
+
+      <div class="card" id="card-month">
+        <h2>Последние 30 дней</h2>
+        <canvas id="month-chart"></canvas>
+        <div class="hint">Помогает увидеть тренд за месяц.</div>
+        <div class="error" id="month-error"></div>
+      </div>
+
+      <div class="card">
+        <h2>Как меня вызвать</h2>
+        <p class="hint">
+          Для теста в браузере добавьте к адресу параметр <code>?user_id=ВАШ_ID</code>,
+          например: <code>/webapp/?user_id=590582222</code>.
+          Внутри Telegram WebApp мы позже подставим ID автоматически.
+        </p>
+      </div>
+    </div>
+
+    <script>
+      // Получаем user_id из query-параметров
+      const params = new URLSearchParams(window.location.search);
+      const userId = params.get("user_id");
+
+      const todaySummaryEl = document.getElementById("today-summary");
+      const todayMacrosEl = document.getElementById("today-macros");
+      const todayHintEl = document.getElementById("today-hint");
+      const todayErrorEl = document.getElementById("today-error");
+
+      const weekSummaryEl = document.getElementById("week-summary");
+      const weekErrorEl = document.getElementById("week-error");
+      const monthErrorEl = document.getElementById("month-error");
+
+      let weekChart = null;
+      let monthChart = null;
+
+      function fmt(value, digits = 0) {
+        return Number(value || 0).toFixed(digits);
+      }
+
+      function buildTodayBlock(data) {
+        const totals = data.totals || {};
+        const goal = data.goal || null;
+        const percent = data.percent || {};
+
+        const kcal = fmt(totals.kcal);
+        const kcalGoal = goal ? fmt(goal.kcal) : "—";
+        const kcalPercent =
+          percent.kcal !== null && percent.kcal !== undefined
+            ? percent.kcal + "%"
+            : "—";
+
+        todaySummaryEl.innerHTML = `
+          <div class="row">
+            <div class="pill">Сегодня: ${kcal} / ${kcalGoal} ккал</div>
+            <div class="pill">Выполнено: ${kcalPercent}</div>
+          </div>
+        `;
+
+        todayMacrosEl.innerHTML = `
+          <div class="macro-item">
+            <span class="label">Белки:</span>
+            <span class="value"> ${fmt(totals.protein, 1)} г ${goal ? "/ " + fmt(goal.protein, 1) + " г" : ""}</span>
+          </div>
+          <div class="macro-item">
+            <span class="label">Жиры:</span>
+            <span class="value"> ${fmt(totals.fat, 1)} г ${goal ? "/ " + fmt(goal.fat, 1) + " г" : ""}</span>
+          </div>
+          <div class="macro-item">
+            <span class="label">Углеводы:</span>
+            <span class="value"> ${fmt(totals.carbs, 1)} г ${goal ? "/ " + fmt(goal.carbs, 1) + " г" : ""}</span>
+          </div>
+        `;
+
+        if (!goal) {
+          todayHintEl.textContent =
+            "Цель по КБЖУ пока не задана. Задайте её в настройках бота, чтобы видеть проценты.";
+        } else {
+          todayHintEl.textContent = "";
+        }
+      }
+
+      function buildWeekChart(history) {
+        const labels = history.map((d) => d.day.slice(5)); // MM-DD
+        const kcalData = history.map((d) => d.kcal || 0);
+
+        const ctx = document.getElementById("week-chart").getContext("2d");
+        if (weekChart) {
+          weekChart.destroy();
+        }
+        weekChart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              {
+                label: "Калории",
+                data: kcalData,
+                tension: 0.3,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: false },
+            },
+            scales: {
+              x: {
+                ticks: { color: "#cbd5f5", font: { size: 10 } },
+              },
+              y: {
+                ticks: { color: "#cbd5f5", font: { size: 10 } },
+              },
+            },
+          },
+        });
+
+        const sum = kcalData.reduce((a, b) => a + b, 0);
+        weekSummaryEl.innerHTML = `
+          <div class="row">
+            <div class="pill">Итого за 7 дней: ${fmt(sum)} ккал</div>
+          </div>
+        `;
+      }
+
+      function buildMonthChart(history) {
+        const labels = history.map((d) => d.day.slice(5)); // MM-DD
+        const kcalData = history.map((d) => d.kcal || 0);
+
+        const ctx = document.getElementById("month-chart").getContext("2d");
+        if (monthChart) {
+          monthChart.destroy();
+        }
+        monthChart = new Chart(ctx, {
+          type: "bar",
+          data: {
+            labels,
+            datasets: [
+              {
+                label: "Калории",
+                data: kcalData,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: false },
+            },
+            scales: {
+              x: {
+                ticks: { color: "#cbd5f5", font: { size: 9 } },
+              },
+              y: {
+                ticks: { color: "#cbd5f5", font: { size: 10 } },
+              },
+            },
+          },
+        });
+      }
+
+      async function fetchJson(url) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+      }
+
+      async function init() {
+        if (!userId) {
+          todayErrorEl.textContent =
+            "Не передан user_id. Добавьте ?user_id=ВАШ_ID к адресу страницы.";
+          weekErrorEl.textContent = "";
+          monthErrorEl.textContent = "";
+          return;
+        }
+
+        try {
+          const [today, week, month] = await Promise.all([
+            fetchJson(`/api/stats/today?user_id=${userId}`),
+            fetchJson(`/api/stats/history?user_id=${userId}&days=7`),
+            fetchJson(`/api/stats/history?user_id=${userId}&days=30`),
+          ]);
+
+          buildTodayBlock(today);
+          buildWeekChart(week.items || []);
+          buildMonthChart(month.items || []);
+        } catch (err) {
+          console.error(err);
+          todayErrorEl.textContent = "Ошибка загрузки данных.";
+          weekErrorEl.textContent = "Ошибка загрузки данных.";
+          monthErrorEl.textContent = "Ошибка загрузки данных.";
+        }
+      }
+
+      init();
+    </script>
+  </body>
+</html>
