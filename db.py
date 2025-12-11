@@ -1,5 +1,6 @@
 # db.py
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 import aiosqlite
@@ -45,16 +46,6 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             updated_at TEXT    DEFAULT (datetime('now','localtime'))
         );
 
-        CREATE TABLE IF NOT EXISTS payments (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id   INTEGER NOT NULL,
-            provider  TEXT,
-            amount    REAL,
-            currency  TEXT,
-            payload   TEXT,
-            created_at TEXT   DEFAULT (datetime('now','localtime'))
-        );
-
         CREATE TABLE IF NOT EXISTS invites (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             referrer_id INTEGER NOT NULL,
@@ -63,6 +54,25 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_pair
             ON invites(referrer_id, invited_id);
+
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id     INTEGER PRIMARY KEY,
+            active_until INTEGER NOT NULL,
+            plan        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            ts          INTEGER NOT NULL,
+            provider    TEXT NOT NULL,
+            payload     TEXT NOT NULL,
+            amount_rub  INTEGER NOT NULL DEFAULT 0,
+            amount_stars INTEGER NOT NULL DEFAULT 0,
+            raw         TEXT
+        );
         """
     )
     await db.commit()
@@ -338,6 +348,53 @@ async def get_invite_stats(
     return {"count": int(row[0] or 0)}
 
 
+async def get_subscription(db, user_id: int) -> tuple[int | None, str | None]:
+    """Вернуть (active_until, plan) для пользователя или (None, None), если подписки нет."""
+    cursor = await db.execute(
+        "SELECT active_until, plan FROM subscriptions WHERE user_id=?",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
+async def set_subscription(db, user_id: int, active_until: int, plan: str) -> None:
+    """Создать или обновить подписку пользователя."""
+    now = int(time.time())
+    await db.execute(
+        "INSERT INTO subscriptions (user_id, active_until, plan, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "active_until=excluded.active_until, "
+        "plan=excluded.plan, "
+        "updated_at=excluded.updated_at",
+        (user_id, active_until, plan, now, now),
+    )
+    await db.commit()
+
+
+async def log_payment(
+    db,
+    user_id: int,
+    provider: str,
+    payload: str,
+    amount_rub: int = 0,
+    amount_stars: int = 0,
+    raw: str | None = None,
+) -> None:
+    """Записать факт платежа в таблицу payments."""
+    ts = int(time.time())
+    await db.execute(
+        "INSERT INTO payments (user_id, ts, provider, payload, amount_rub, amount_stars, raw) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, ts, provider, payload, amount_rub, amount_stars, raw),
+    )
+    await db.commit()
+
+
 async def save_payment(
     db: aiosqlite.Connection,
     telegram_id: int,
@@ -347,14 +404,16 @@ async def save_payment(
     payload: str,
 ) -> None:
     await ensure_user(db, telegram_id)
-    await db.execute(
-        """
-        INSERT INTO payments (user_id, provider, amount, currency, payload)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (telegram_id, provider, amount, currency, payload),
+    amount_rub = int(amount) if currency.upper() == "RUB" else 0
+    await log_payment(
+        db,
+        user_id=telegram_id,
+        provider=provider,
+        payload=payload,
+        amount_rub=amount_rub,
+        amount_stars=0,
+        raw=None,
     )
-    await db.commit()
 
 
 async def get_user_count(db: aiosqlite.Connection) -> int:
@@ -372,7 +431,7 @@ async def get_meal_count(db: aiosqlite.Connection) -> int:
 
 
 async def get_total_payments(db: aiosqlite.Connection) -> float:
-    cur = await db.execute("SELECT COALESCE(SUM(amount), 0) FROM payments")
+    cur = await db.execute("SELECT COALESCE(SUM(amount_rub), 0) FROM payments")
     row = await cur.fetchone()
     await cur.close()
     return float(row[0] or 0.0)
