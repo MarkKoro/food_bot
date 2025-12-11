@@ -3,6 +3,7 @@ import os
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Optional
 import aiosqlite
 
 # Путь к базе: ./data/food_bot.sqlite3
@@ -20,7 +21,10 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             telegram_id INTEGER PRIMARY KEY,
             created_at  TEXT DEFAULT (datetime('now','localtime')),
             referrer_id INTEGER,
-            credits     INTEGER DEFAULT 0
+            credits     INTEGER DEFAULT 0,
+            is_premium  INTEGER DEFAULT 0,
+            premium_until TEXT,
+            last_menu_message_id INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS meals (
@@ -77,10 +81,16 @@ async def create_tables(db: aiosqlite.Connection) -> None:
     )
     await db.commit()
 
-    # Миграция: добавляем last_menu_message_id, если его ещё нет
+    # Миграции: добавляем новые столбцы в users, если их ещё нет
     cur = await db.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in await cur.fetchall()]
     await cur.close()
+    if "is_premium" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0")
+        await db.commit()
+    if "premium_until" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
+        await db.commit()
     if "last_menu_message_id" not in cols:
         await db.execute(
             "ALTER TABLE users ADD COLUMN last_menu_message_id INTEGER"
@@ -96,6 +106,51 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> None:
         (telegram_id,),
     )
     await db.commit()
+
+
+async def set_premium_until(
+    db: aiosqlite.Connection, user_id: int, premium_until: datetime
+) -> None:
+    await db.execute(
+        "UPDATE users SET is_premium = 1, premium_until = ? WHERE telegram_id = ?",
+        (premium_until.isoformat(), user_id),
+    )
+    await db.commit()
+
+
+async def get_premium_until(
+    db: aiosqlite.Connection, user_id: int
+) -> Optional[datetime]:
+    async with db.execute(
+        "SELECT premium_until FROM users WHERE telegram_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(row[0])
+    except Exception:
+        return None
+
+
+async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
+    async with db.execute(
+        "SELECT is_premium, premium_until FROM users WHERE telegram_id = ?",
+        (user_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return False
+    is_premium, premium_until = row
+    if not is_premium:
+        return False
+    if not premium_until:
+        return False
+    try:
+        dt = datetime.fromisoformat(premium_until)
+    except Exception:
+        return False
+    return dt >= datetime.utcnow()
 
 
 async def get_credits(db: aiosqlite.Connection, telegram_id: int) -> int:
@@ -404,14 +459,16 @@ async def save_payment(
     payload: str,
 ) -> None:
     await ensure_user(db, telegram_id)
-    amount_rub = int(amount) if currency.upper() == "RUB" else 0
+    currency_code = currency.upper()
+    amount_rub = int(amount) if currency_code == "RUB" else 0
+    amount_stars = int(amount) if currency_code == "XTR" else 0
     await log_payment(
         db,
         user_id=telegram_id,
         provider=provider,
         payload=payload,
         amount_rub=amount_rub,
-        amount_stars=0,
+        amount_stars=amount_stars,
         raw=None,
     )
 
