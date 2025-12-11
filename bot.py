@@ -8,6 +8,7 @@ import base64
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import httpx
@@ -53,24 +54,28 @@ from db import (
     get_invite_stats,
     get_last_menu_message_id,
     set_last_menu_message_id,
-    get_subscription,
-    set_subscription,
-    log_payment,
+    set_premium_until,
+    is_premium_user,
 )
 
-# ── Подписка и оплата ─────────────────────────────
-SUB_PLANS_STARS = {
-    # план: (дней, цена в звёздах)
-    "week_1": (7, 80),
-    "month_1": (30, 300),
-    "month_3": (90, 750),
+# ── Модель тарифов ─────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SubscriptionPlan:
+    id: str  # 'm1', 'm3', ...
+    title: str  # '1 месяц', '3 месяца', ...
+    months: int
+    price_rub: int  # в рублях, целое число
+    price_stars: int  # количество Stars
+
+
+SUB_PLANS: dict[str, SubscriptionPlan] = {
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349, 200),
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899, 500),
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490, 850),
+    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490, 1400),
 }
-
-SUB_TEXT = (
-    "Подписка на Gram даёт неограниченное число анализов еды "
-    "по фото и голосу в разумных пределах.\n\n"
-    "Выбери срок подписки:"
-)
 
 # ── Конфиг ─────────────────────────────────────────────
 
@@ -93,6 +98,7 @@ JOIN_URL = os.getenv("JOIN_URL", "")
 FOOD_WEBAPP_URL = os.getenv(
     "FOOD_WEBAPP_URL", "https://example.com/foodbot/webapp/"
 )
+YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -110,7 +116,7 @@ def kb_main() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton("💳 Подписка", callback_data="sub")],
+        [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")],
         [
             InlineKeyboardButton(
                 "📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL)
@@ -136,8 +142,41 @@ def kb_settings() -> InlineKeyboardMarkup:
                     "🧮 Подобрать норму по опросу", callback_data="survey_start"
                 )
             ],
-            [InlineKeyboardButton("💳 Подписка (скоро)", callback_data="sub_stub")],
+            [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+        ]
+    )
+
+
+def kb_premium_plans() -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for plan in SUB_PLANS.values():
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{plan.title} • {plan.price_stars}⭐ или {plan.price_rub}₽",
+                    callback_data=f"buy_plan:{plan.id}",
+                )
+            ]
+        )
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⭐ Оплатить звёздами", callback_data=f"buy_stars:{plan_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💳 Оплатить картой", callback_data=f"buy_card:{plan_id}"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="premium_menu")],
         ]
     )
 
@@ -404,6 +443,23 @@ async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         "3. Вернись в бот и нажми «🔁 Проверить подписку»."
     )
     await edit_menu_message(update, ctx, text, kb_sub())
+    return False
+
+
+async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    db = ctx.application.bot_data["db"]
+    user_id = update.effective_user.id
+
+    if await is_premium_user(db, user_id):
+        return True
+
+    text = (
+        "Пока что у тебя нет активной премиум-подписки.\n\n"
+        "С премиумом можно без ограничений отправлять фото и голосовые "
+        "для подсчёта КБЖУ и анализа питания.\n\n"
+        "Хочешь оформить подписку?"
+    )
+    await edit_menu_message(update, ctx, text, kb_premium_plans())
     return False
 
 
@@ -923,7 +979,7 @@ async def show_set_goal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
         "Можно в одну строку:\n"
         "`2300 150 70 250`\n"
         "или в столбик:\n"
-        "`2300\\n150\\n70\\n250`\n\n"
+        "`2300\n150\n70\n250`\n\n"
         "Порядок значений:\n"
         "1) калории (ккал)\n"
         "2) белки (г)\n"
@@ -949,7 +1005,7 @@ async def handle_goal_input(
             "Пример одной строкой:\n"
             "`2300 150 70 250`\n\n"
             "Или в столбик:\n"
-            "`2300\\n150\\n70\\n250`\n\n"
+            "`2300\n150\n70\n250`\n\n"
             "Порядок: калории, белки, жиры, углеводы."
         )
         await edit_menu_message(update, ctx, example, kb_settings())
@@ -1523,66 +1579,32 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_main_menu(update, ctx)
     elif data == "settings":
         await show_settings(update, ctx)
-    elif data == "sub":
-        text = SUB_TEXT
-        kb_rows = []
-        for plan_id, (days, stars) in SUB_PLANS_STARS.items():
-            label = {
-                "week_1": "1 неделя",
-                "month_1": "1 месяц",
-                "month_3": "3 месяца",
-            }.get(plan_id, plan_id)
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        f"{label} — {stars}⭐", callback_data=f"buy_sub_{plan_id}"
-                    )
-                ]
-            )
-        kb_rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back")])
-        reply_markup = InlineKeyboardMarkup(kb_rows)
-        await edit_menu_message(update, ctx, text, reply_markup)
+    elif data == "premium_menu":
+        await on_premium_menu(update, ctx)
+    elif data.startswith("buy_plan:"):
+        _, plan_id = data.split(":", 1)
+        plan = SUB_PLANS.get(plan_id)
+        if not plan:
+            await query.edit_message_text("Неизвестный план подписки. Попробуй ещё раз.")
+            return
+        await edit_menu_message(
+            update,
+            ctx,
+            f"План: {plan.title}. Выбери способ оплаты:",
+            kb_payment_methods(plan_id),
+        )
+    elif data.startswith("buy_stars:"):
+        await on_buy_with_stars(update, ctx)
+    elif data.startswith("buy_card:"):
+        await on_buy_with_card(update, ctx)
     elif data == "set_goal":
         await show_set_goal_screen(update, ctx)
     elif data == "stats":
         await show_stats(update, ctx)
     elif data == "survey_start":
         await start_survey(update, ctx)
-    elif data == "back":
+    elif data in {"back", "back_to_main"}:
         await show_main_menu(update, ctx)
-    elif data.startswith("buy_sub_"):
-        plan_id = data.removeprefix("buy_sub_")
-        if plan_id not in SUB_PLANS_STARS:
-            await query.answer("Неизвестный план", show_alert=True)
-            return
-        days, stars = SUB_PLANS_STARS[plan_id]
-        uid = query.from_user.id
-
-        title = "Подписка на Gram"
-        description = f"План: {plan_id}, срок: {days} дней."
-        payload = f"sub_{plan_id}"
-        currency = "XTR"
-        prices = [LabeledPrice(f"Подписка {plan_id}", stars)]
-
-        await ctx.bot.send_invoice(
-            chat_id=query.message.chat_id,
-            title=title,
-            description=description,
-            payload=payload,
-            provider_token="",
-            currency=currency,
-            prices=prices,
-        )
-
-        await query.answer()
-    elif data == "sub_stub":
-        await edit_menu_message(
-            update,
-            ctx,
-            "Здесь позже появится управление подпиской и бонусами.\n"
-            "Сейчас бот работает в тестовом режиме бесплатно.",
-            kb_settings(),
-        )
     elif data == "meal_extra_portion":
         ctx.user_data["state"] = "await_extra_portion"
         await edit_menu_message(
@@ -1628,57 +1650,122 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["state"] = None
         await show_main_menu(update, ctx)
 
-
 # ── Оплата ───────────────────────────────────────────
 
-async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await edit_menu_message(
+        update,
+        ctx,
+        "Выбери, на какой срок оформить подписку:",
+        kb_premium_plans(),
+    )
 
 
-async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    sp = update.message.successful_payment
-    payload = sp.invoice_payload
-    uid = update.effective_user.id
-
-    if not payload.startswith("sub_"):
+async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    _, plan_id = data.split(":", 1)
+    plan = SUB_PLANS.get(plan_id)
+    if not plan:
+        await query.edit_message_text("Неизвестный план подписки. Попробуй ещё раз.")
         return
 
-    plan_id = payload.removeprefix("sub_")
-    if plan_id not in SUB_PLANS_STARS:
-        await update.message.reply_text("Неизвестный тариф, напиши в поддержку.")
-        return
+    user = update.effective_user
+    payload = f"sub:{plan.id}:stars"
 
-    days, stars = SUB_PLANS_STARS[plan_id]
-    now = int(time.time())
+    # currency XTR uses the smallest units of Stars (see Bot API currencies.json)
+    prices = [LabeledPrice(plan.title, plan.price_stars * 100000)]
 
-    db = get_db(ctx)
-
-    active_until, _ = await get_subscription(db, uid)
-    if active_until and active_until > now:
-        new_until = active_until + days * 86400
-    else:
-        new_until = now + days * 86400
-
-    await set_subscription(db, uid, new_until, plan_id)
-
-    raw = json.dumps(sp.to_dict(), ensure_ascii=False)
-    await log_payment(
-        db,
-        uid,
-        provider="stars",
+    await ctx.bot.send_invoice(
+        chat_id=user.id,
+        title=f"Подписка на {plan.title}",
+        description="Подписка на умный дневник питания с фото и голосом.",
         payload=payload,
-        amount_rub=0,
-        amount_stars=stars,
-        raw=raw,
+        provider_token="",
+        currency="XTR",
+        prices=prices,
     )
 
-    dt = datetime.fromtimestamp(new_until)
-    until_str = dt.strftime("%d.%m.%Y")
+
+async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    _, plan_id = data.split(":", 1)
+    plan = SUB_PLANS.get(plan_id)
+    if not plan:
+        await query.edit_message_text("Неизвестный план подписки.")
+        return
+
+    if not YOOKASSA_PROVIDER_TOKEN:
+        await query.edit_message_text(
+            "Оплата картой появится чуть позже. Сейчас можно оформить подписку за Stars."
+        )
+        return
+
+    user = update.effective_user
+    payload = f"sub:{plan.id}:card"
+
+    prices = [LabeledPrice(plan.title, plan.price_rub * 100)]
+
+    await ctx.bot.send_invoice(
+        chat_id=user.id,
+        title=f"Подписка на {plan.title}",
+        description="Подписка на умный дневник питания с фото и голосом.",
+        payload=payload,
+        provider_token=YOOKASSA_PROVIDER_TOKEN,
+        currency="RUB",
+        prices=prices,
+    )
+
+
+async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    payload = query.invoice_payload or ""
+    if payload.startswith("sub:"):
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Неизвестный тип оплаты.")
+
+
+async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sp = update.message.successful_payment
+    payload = sp.invoice_payload or ""
+    user_id = update.effective_user.id
+    db = ctx.application.bot_data["db"]
+
+    parts = payload.split(":", 2)
+    if len(parts) != 3 or parts[0] != "sub":
+        await update.message.reply_text("Неизвестный тип платежа.")
+        return
+
+    _, plan_id, provider = parts
+    plan = SUB_PLANS.get(plan_id)
+    if not plan:
+        await update.message.reply_text(
+            "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
+        )
+        return
+
+    await save_payment(
+        db,
+        telegram_id=user_id,
+        provider=provider,
+        amount=sp.total_amount,
+        currency=sp.currency,
+        payload=payload,
+    )
+
+    now = datetime.utcnow()
+    new_until = now + timedelta(days=plan.months * 30)
+    await set_premium_until(db, user_id, new_until)
+
+    until_str = new_until.strftime("%d.%m.%Y")
     await update.message.reply_text(
-        f"Готово. Подписка активна до {until_str}. Можно продолжать присылать еду."
+        f"Спасибо! Подписка активна до {until_str}.\n"
+        f"Теперь ты можешь без ограничений отправлять фото и голосовые для анализа."
     )
-
 
 # ── Админ и прочее (минимальный каркас) ──────────────
 
@@ -1686,11 +1773,7 @@ async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await delete_user_message(update)
     if not await ensure_subscription(update, ctx):
         return
-    text = (
-        "Оплата и подписка появятся чуть позже.\n"
-        "Сейчас бот работает в тестовом режиме бесплатно."
-    )
-    await edit_menu_message(update, ctx, text, kb_main())
+    await on_premium_menu(update, ctx)
 
 
 async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1803,9 +1886,9 @@ def main() -> None:
 
     # Callback-кнопки
     application.add_handler(CallbackQueryHandler(on_callback))
-    application.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    application.add_handler(PreCheckoutQueryHandler(on_precheckout_query))
     application.add_handler(
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment)
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment)
     )
 
     # Фото еды
