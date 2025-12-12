@@ -67,14 +67,47 @@ class SubscriptionPlan:
     title: str  # '1 месяц', '3 месяца', ...
     months: int
     price_rub: int  # в рублях, целое число
-    price_stars: int  # количество Stars
 
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349, 200),
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899, 500),
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490, 850),
-    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490, 1400),
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349),
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899),
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490),
+    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490),
+}
+
+SUBSCRIPTION_PLANS_STARS = {
+    "sub_1m_stars": {
+        "days": 30,
+        "stars": 200,
+        "title": "Подписка Gram на 1 месяц",
+        "description": "Доступ ко всем функциям бота на 30 дней.",
+    },
+    "sub_3m_stars": {
+        "days": 90,
+        "stars": 500,
+        "title": "Подписка Gram на 3 месяца",
+        "description": "3 месяца с удобным подсчётом КБЖУ и статистикой.",
+    },
+    "sub_6m_stars": {
+        "days": 180,
+        "stars": 850,
+        "title": "Подписка Gram на полгода",
+        "description": "Полгода подробной статистики и умного подсчёта.",
+    },
+    "sub_12m_stars": {
+        "days": 365,
+        "stars": 1400,
+        "title": "Подписка Gram на год",
+        "description": "Самый выгодный тариф — год подписки.",
+    },
+}
+
+PLAN_ID_TO_STARS_KEY: dict[str, str] = {
+    "m1": "sub_1m_stars",
+    "m3": "sub_3m_stars",
+    "m6": "sub_6m_stars",
+    "m12": "sub_12m_stars",
 }
 
 # ── Конфиг ─────────────────────────────────────────────
@@ -116,7 +149,6 @@ def kb_main() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")],
         [
             InlineKeyboardButton(
                 "📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL)
@@ -150,25 +182,39 @@ def kb_settings() -> InlineKeyboardMarkup:
 
 def kb_premium_plans() -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
-    for plan in SUB_PLANS.values():
-        buttons.append(
-            [
+    for plan_id, plan in SUB_PLANS.items():
+        star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
+        star_plan = SUBSCRIPTION_PLANS_STARS.get(star_key) if star_key else None
+        row = [
+            InlineKeyboardButton(
+                f"{plan.title} • {plan.price_rub}₽",
+                callback_data=f"buy_card:{plan_id}",
+            )
+        ]
+        if star_plan:
+            row.append(
                 InlineKeyboardButton(
-                    f"{plan.title} • {plan.price_stars}⭐ или {plan.price_rub}₽",
-                    callback_data=f"buy_plan:{plan.id}",
+                    f"{plan.title} • {star_plan['stars']}⭐",
+                    callback_data=star_key,
                 )
-            ]
-        )
+            )
+        buttons.append(row)
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
     return InlineKeyboardMarkup(buttons)
 
 
 def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
+    star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
+    star_plan = SUBSCRIPTION_PLANS_STARS.get(star_key) if star_key else None
+    star_label = "⭐ Оплатить звёздами"
+    if star_plan:
+        star_label = f"⭐ Оплатить {star_plan['stars']}⭐"
+
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "⭐ Оплатить звёздами", callback_data=f"buy_stars:{plan_id}"
+                    star_label, callback_data=star_key or f"buy_stars:{plan_id}"
                 )
             ],
             [
@@ -1593,8 +1639,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"План: {plan.title}. Выбери способ оплаты:",
             kb_payment_methods(plan_id),
         )
-    elif data.startswith("buy_stars:"):
+    elif data in SUBSCRIPTION_PLANS_STARS:
         await on_buy_with_stars(update, ctx)
+    elif data.startswith("buy_stars:"):
+        _, plan_id = data.split(":", 1)
+        star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
+        if star_key:
+            update.callback_query.data = star_key
+            await on_buy_with_stars(update, ctx)
+        else:
+            await query.edit_message_text(
+                "Не удалось найти тариф для оплаты звёздами. Попробуйте ещё раз."
+            )
     elif data.startswith("buy_card:"):
         await on_buy_with_card(update, ctx)
     elif data == "set_goal":
@@ -1656,35 +1712,57 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await edit_menu_message(
         update,
         ctx,
-        "Выбери, на какой срок оформить подписку:",
+        "Выберите способ оплаты:",
         kb_premium_plans(),
     )
 
 
 async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопок 'оплатить звёздами'."""
     query = update.callback_query
     await query.answer()
-    data = query.data
-    _, plan_id = data.split(":", 1)
-    plan = SUB_PLANS.get(plan_id)
+
+    data = query.data  # callback_data кнопки
+    plan = SUBSCRIPTION_PLANS_STARS.get(data)
+
     if not plan:
-        await query.edit_message_text("Неизвестный план подписки. Попробуй ещё раз.")
+        # На всякий случай — если callback не распознан
+        await query.edit_message_text(
+            "Не удалось определить тариф для оплаты звёздами. Попробуйте ещё раз."
+        )
         return
 
-    user = update.effective_user
-    payload = f"sub:{plan.id}:stars"
+    title = plan["title"]
+    description = plan["description"]
+    stars_amount = int(plan["stars"])
+    days = int(plan["days"])
 
-    # currency XTR uses the smallest units of Stars (see Bot API currencies.json)
-    prices = [LabeledPrice(plan.title, plan.price_stars * 100000)]
+    # Обязательно положительное количество звёзд
+    if stars_amount <= 0:
+        await query.edit_message_text(
+            "Некорректная стоимость подписки в звёздах. Сообщите, пожалуйста, разработчику."
+        )
+        return
+
+    prices = [
+        LabeledPrice(
+            label=title,
+            amount=stars_amount,  # для XTR amount = количество звёзд (целое число)
+        )
+    ]
+
+    payload = f"stars:{data}:{days}"
 
     await ctx.bot.send_invoice(
-        chat_id=user.id,
-        title=f"Подписка на {plan.title}",
-        description="Подписка на умный дневник питания с фото и голосом.",
+        chat_id=query.from_user.id,
+        title=title,
+        description=description,
         payload=payload,
-        provider_token="",
-        currency="XTR",
+        provider_token="",  # ДЛЯ Stars provider_token ДОЛЖЕН быть пустым
+        currency="XTR",     # ВАЛЮТА ДЛЯ ЗВЁЗД — XTR
         prices=prices,
+        max_tip_amount=None,
+        suggested_tip_amounts=None,
     )
 
 
@@ -1723,7 +1801,7 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     payload = query.invoice_payload or ""
-    if payload.startswith("sub:"):
+    if payload.startswith("sub:") or payload.startswith("stars:"):
         await query.answer(ok=True)
     else:
         await query.answer(ok=False, error_message="Неизвестный тип оплаты.")
@@ -1735,30 +1813,69 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db = ctx.application.bot_data["db"]
 
+    now = datetime.utcnow()
+
     parts = payload.split(":", 2)
-    if len(parts) != 3 or parts[0] != "sub":
+
+    if payload.startswith("sub:"):
+        if len(parts) != 3:
+            await update.message.reply_text("Неизвестный тип платежа.")
+            return
+
+        _, plan_id, provider = parts
+        plan = SUB_PLANS.get(plan_id)
+        if not plan:
+            await update.message.reply_text(
+                "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
+            )
+            return
+
+        await save_payment(
+            db,
+            telegram_id=user_id,
+            provider=provider,
+            amount=sp.total_amount,
+            currency=sp.currency,
+            payload=payload,
+        )
+
+        new_until = now + timedelta(days=plan.months * 30)
+
+    elif payload.startswith("stars:"):
+        if len(parts) != 3:
+            await update.message.reply_text("Неизвестный тип платежа.")
+            return
+
+        _, star_key, days_str = parts
+        plan = SUBSCRIPTION_PLANS_STARS.get(star_key)
+        if not plan:
+            await update.message.reply_text(
+                "Платёж прошёл, но тариф не найден. Напиши, пожалуйста, в поддержку."
+            )
+            return
+
+        try:
+            days = int(days_str)
+        except ValueError:
+            days = int(plan.get("days", 0))
+
+        if days <= 0:
+            days = int(plan["days"])
+
+        await save_payment(
+            db,
+            telegram_id=user_id,
+            provider="stars",
+            amount=sp.total_amount,
+            currency=sp.currency,
+            payload=payload,
+        )
+
+        new_until = now + timedelta(days=days)
+
+    else:
         await update.message.reply_text("Неизвестный тип платежа.")
         return
-
-    _, plan_id, provider = parts
-    plan = SUB_PLANS.get(plan_id)
-    if not plan:
-        await update.message.reply_text(
-            "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
-        )
-        return
-
-    await save_payment(
-        db,
-        telegram_id=user_id,
-        provider=provider,
-        amount=sp.total_amount,
-        currency=sp.currency,
-        payload=payload,
-    )
-
-    now = datetime.utcnow()
-    new_until = now + timedelta(days=plan.months * 30)
     await set_premium_until(db, user_id, new_until)
 
     until_str = new_until.strftime("%d.%m.%Y")
