@@ -79,25 +79,25 @@ SUB_PLANS: dict[str, SubscriptionPlan] = {
 SUBSCRIPTION_PLANS_STARS = {
     "sub_1m_stars": {
         "days": 30,
-        "stars": 500,
+        "stars": 200,
         "title": "Подписка Gram на 1 месяц",
         "description": "Доступ ко всем функциям бота на 30 дней.",
     },
     "sub_3m_stars": {
         "days": 90,
-        "stars": 1300,
+        "stars": 500,
         "title": "Подписка Gram на 3 месяца",
         "description": "3 месяца с удобным подсчётом КБЖУ и статистикой.",
     },
     "sub_6m_stars": {
         "days": 180,
-        "stars": 2400,
+        "stars": 850,
         "title": "Подписка Gram на полгода",
         "description": "Полгода подробной статистики и умного подсчёта.",
     },
     "sub_12m_stars": {
         "days": 365,
-        "stars": 4300,
+        "stars": 1400,
         "title": "Подписка Gram на год",
         "description": "Самый выгодный тариф — год подписки.",
     },
@@ -1712,7 +1712,7 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await edit_menu_message(
         update,
         ctx,
-        "Выбери, на какой срок оформить подписку:",
+        "Выберите способ оплаты:",
         kb_premium_plans(),
     )
 
