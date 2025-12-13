@@ -10,13 +10,27 @@
       }
       :root {
         --accent-color: #2563eb; /* базовый синий */
+        --ambient-hue: 215; /* базовый оттенок (синий) */
+        --ambient-intensity: 0.18;
       }
 
       body {
         margin: 0;
         padding: 0;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: radial-gradient(circle at 0 0, #020617 0, #020617 40%);
+        background:
+          radial-gradient(
+            circle at 0 0,
+            rgba(15, 23, 42, 1) 0,
+            rgba(15, 23, 42, 1) 30%,
+            rgba(15, 23, 42, 0.9) 60%,
+            rgba(15, 23, 42, 1) 100%
+          ),
+          radial-gradient(
+            circle at 50% -20%,
+            hsla(var(--ambient-hue), 75%, 45%, var(--ambient-intensity)),
+            #020617 70%
+          );
         color: #f5f5f5;
         transition: background 0.35s ease;
       }
@@ -74,55 +88,70 @@
         opacity: 0.85;
       }
 
+      .day-switch {
+        display: flex;
+        gap: 8px;
+        margin-top: 6px;
+      }
+
       .pill {
         border-radius: 999px;
-        padding: 6px 14px;
-        font-size: 0.9rem;
-        border: none;
+        padding: 4px 12px;
+        font-size: 13px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(15, 23, 42, 0.95);
+        color: #e5e7eb;
         cursor: pointer;
-        transition: background 0.15s ease, transform 0.05s ease;
+        transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s;
       }
 
       .pill-primary {
-        background: var(--accent-color, #2563eb);
-        color: #ffffff;
-        box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+        background: #22c55e;
+        color: #020617;
+        border-color: #22c55e;
+        box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
       }
 
       .pill-secondary {
-        background: #020617;
-        color: #e5e7eb;
-        border: 1px solid #374151;
+        background: rgba(15, 23, 42, 0.95);
       }
 
-      .pill:hover {
-        transform: translateY(-1px);
+      .pill-muted {
+        opacity: 0.7;
       }
 
-      .pill-small {
-        padding: 4px 10px;
-        font-size: 11px;
-        background: rgba(255, 255, 255, 0.05);
+      .date-picker-wrapper {
+        position: relative;
       }
 
-      .pill-outline {
-        background: transparent;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        color: #e2e8f0;
+      .date-input-hidden {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        cursor: pointer;
       }
 
-      .date-input {
-        border-radius: 999px;
+      .balance-pill {
+        display: inline-flex;
+        flex-direction: column;
+        gap: 2px;
         padding: 6px 10px;
-        border: 1px solid #374151;
-        background: transparent;
-        color: #e5e7eb;
-        cursor: pointer;
-        font-size: 0.9rem;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.95);
+        font-size: 12px;
       }
 
-      .date-input::-webkit-calendar-picker-indicator {
-        cursor: pointer;
+      .balance-pill__label {
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        font-size: 10px;
+        color: #9ca3af;
+      }
+
+      .balance-pill__value {
+        font-weight: 500;
+        color: #e5e7eb;
       }
       .macro-grid {
         display: grid;
@@ -167,6 +196,41 @@
         opacity: 0.7;
       }
 
+      .today-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .today-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 6px;
+      }
+
+      .today-date-caption {
+        color: #cbd5e1;
+        font-size: 13px;
+      }
+
+      .today-date-picker {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 6px;
+        min-width: 180px;
+      }
+
+      .muted {
+        color: #94a3b8;
+        font-size: 12px;
+      }
+
       .grid-2 {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -181,31 +245,11 @@
         font-size: 13px;
       }
 
-      .today-header-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 12px;
-        flex-wrap: wrap;
-        margin-bottom: 12px;
-      }
-
-      .today-title-side h2 {
-        margin: 0 0 6px;
-        font-size: 20px;
-      }
-
-      .today-date-label {
-        opacity: 0.8;
-        font-size: 13px;
-        margin: 0;
-      }
-
       .today-summary-row {
         display: flex;
-        gap: 8px;
+        gap: 10px;
         flex-wrap: wrap;
-        margin-bottom: 8px;
+        margin: 10px 0;
       }
 
       .ring-wrapper {
@@ -229,30 +273,41 @@
       </header>
 
       <div class="card" id="card-today">
-        <div class="today-header-row">
-          <div class="today-title-side">
-            <h2>Сегодня</h2>
-            <p class="today-date-label">Данные за <span id="selected-date-label">—</span></p>
-            <div class="date-controls">
+        <div class="today-header">
+          <div>
+            <div class="today-header-row">
+              <h2 id="today-title">Сегодня</h2>
+              <span class="today-date-caption" id="today-date-caption"></span>
+            </div>
+            <div class="day-switch">
               <button id="btn-today" class="pill pill-primary">Сегодня</button>
               <button id="btn-yesterday" class="pill pill-secondary">Вчера</button>
+            </div>
+          </div>
 
-              <span class="date-label">или выбрать дату:</span>
-              <input id="date-picker" type="date" class="date-input" />
+          <div class="today-date-picker">
+            <span class="muted">или выбрать дату:</span>
+            <div class="date-picker-wrapper">
+              <button id="btn-date" class="pill pill-secondary pill-muted" type="button">
+                <span id="selected-date-label">Выбрать</span>
+              </button>
+              <input type="date" id="date-input" class="date-input-hidden" />
             </div>
           </div>
         </div>
 
-        <div class="grid-2">
-          <div>
-            <div id="today-summary" class="summary-grid"></div>
-            <p class="hint" id="today-hint"></p>
-            <p class="error" id="today-error"></p>
-          </div>
-          <div class="ring-wrapper">
-            <canvas id="today-ring"></canvas>
+        <div class="today-summary-row">
+          <div id="balance-pill" class="balance-pill">
+            <span class="balance-pill__label">Баланс дня</span>
+            <span class="balance-pill__value">—</span>
           </div>
         </div>
+
+        <div id="today-summary"></div>
+        <div id="today-macros"></div>
+        <p class="hint" id="today-hint"></p>
+        <p class="error" id="today-error"></p>
+        <canvas id="today-ring"></canvas>
       </div>
 
       <div class="card" id="card-week">
@@ -271,130 +326,167 @@
     </div>
 
     <script>
+      const tg = window.Telegram?.WebApp;
+      const userId = tg?.initDataUnsafe?.user?.id
+        || new URLSearchParams(window.location.search).get("user_id");
+
       const todaySummaryEl = document.getElementById("today-summary");
+      const todayMacrosEl = document.getElementById("today-macros");
       const todayHintEl = document.getElementById("today-hint");
       const todayErrorEl = document.getElementById("today-error");
-      const weekSummaryEl = document.getElementById("week-summary");
       const weekErrorEl = document.getElementById("week-error");
       const monthErrorEl = document.getElementById("month-error");
+      const todayTitleEl = document.getElementById("today-title");
+      const todayCaptionEl = document.getElementById("today-date-caption");
+      const balancePill = document.getElementById("balance-pill");
 
-      const selectedDateLabelEl = document.getElementById("selected-date-label");
       const btnToday = document.getElementById("btn-today");
       const btnYesterday = document.getElementById("btn-yesterday");
-      const dateInput = document.getElementById("date-picker");
-
-      const tg = window.Telegram && window.Telegram.WebApp
-        ? window.Telegram.WebApp
-        : null;
-
-      let userId = null;
-      if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
-        userId = String(tg.initDataUnsafe.user.id);
-        try {
-          tg.ready();
-        } catch (e) {
-          console.log("Telegram WebApp ready error:", e);
-        }
-      } else {
-        const params = new URLSearchParams(window.location.search);
-        const fromQuery = params.get("user_id");
-        if (fromQuery) {
-          userId = fromQuery;
-        }
-      }
+      const btnDate = document.getElementById("btn-date");
+      const dateInput = document.getElementById("date-input");
+      const selectedDateLabel = document.getElementById("selected-date-label");
 
       let weekChart = null;
       let monthChart = null;
       let todayRing = null;
 
-      let currentMode = "today";
-      let currentDate = null;
+      let currentMode = "today"; // "today" | "yesterday" | "date"
+      let currentDateIso = null; // YYYY-MM-DD
+
+      if (tg && tg.ready) {
+        try {
+          tg.ready();
+        } catch (err) {
+          console.warn("Telegram WebApp ready error", err);
+        }
+      }
+
+      function setActiveMode(mode) {
+        currentMode = mode;
+
+        btnToday.classList.toggle("pill-primary", mode === "today");
+        btnToday.classList.toggle("pill-secondary", mode !== "today");
+
+        btnYesterday.classList.toggle("pill-primary", mode === "yesterday");
+        btnYesterday.classList.toggle("pill-secondary", mode !== "yesterday");
+
+        btnDate.classList.toggle("pill-primary", mode === "date");
+        btnDate.classList.toggle("pill-secondary", mode !== "date");
+        btnDate.classList.toggle("pill-muted", mode !== "date");
+      }
+
+      function isoToday() {
+        const d = new Date();
+        return d.toISOString().slice(0, 10);
+      }
+
+      function isoYesterday() {
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        return d.toISOString().slice(0, 10);
+      }
+
+      function formatHuman(iso) {
+        const [y, m, d] = iso.split("-");
+        return `${d}.${m}.${y}`;
+      }
 
       function fmt(value, digits = 0) {
         return Number(value || 0).toFixed(digits);
       }
 
       function formatDayLabel(dayStr) {
-        // Ожидаем формат YYYY-MM-DD
         if (!dayStr || dayStr.length < 10) return dayStr || "";
         const [y, m, d] = dayStr.split("-");
         return `${d}.${m}`;
       }
 
-      function formatIsoDate(dateIso) {
-        if (!dateIso) return "—";
-        return dateIso.split("-").reverse().join(".");
+      function updateAmbient(kcalPercent) {
+        const clamped = Math.max(0, Math.min(100, Math.round(kcalPercent || 0)));
+        const band = Math.round(clamped / 10) * 10;
+
+        let hue;
+        if (band <= 50) {
+          hue = 215 - (170 * band) / 50;
+        } else {
+          hue = 45 + (85 * (band - 50)) / 50;
+        }
+
+        document.documentElement.style.setProperty("--ambient-hue", hue.toString());
+        document.documentElement.style.setProperty(
+          "--ambient-intensity",
+          (0.15 + band * 0.002).toFixed(3)
+        );
       }
 
-      function formatDate(d) {
-        return d.toISOString().slice(0, 10);
+      async function fetchJson(url) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
       }
 
-      function updateThemeByProgress(percent) {
-        // допускаем чуть больше 100%, чтобы "перекорм" тоже загорался
-        const clamped = Math.max(0, Math.min(percent, 130)) / 100;
+      function renderToday(day, title, caption) {
+        const totals = day.totals || {};
+        const goal = day.goal || {};
+        const percent = day.percent || {};
 
-        // 0%  -> оранжево-жёлтый
-        // 50% -> мягкий жёлто-зелёный
-        // 100%+ -> зелёный
-        const hueStart = 38; // ~оранжевый
-        const hueEnd = 135; // ~зелёный
-
-        const hue = hueStart + (hueEnd - hueStart) * clamped;
-        const accent = `hsl(${hue} 90% 55%)`;
-
-        document.documentElement.style.setProperty("--accent-color", accent);
-
-        // фон страницы – лёгкий градиент с оттенком прогресса
-        document.body.style.background =
-          `radial-gradient(circle at 0 0, ${accent}22 0, #020617 45%, #020617 100%)`;
-      }
-
-      function updateAmbientByFill(percent) {
-        updateThemeByProgress(percent);
-      }
-
-      function renderTodayBlock(stats) {
-        const totals = stats.totals || {};
-        const goal = stats.goal || {};
         const kcal = totals.kcal ?? 0;
         const kcalGoal = goal.kcal ?? 0;
-        const kcalPercent = stats.percent?.kcal ?? 0;
-        const dayIso = stats.day || currentDate;
+        const kcalPercent = Math.round(percent.kcal ?? 0);
 
-        if (dayIso) {
-          currentDate = dayIso;
-          if (selectedDateLabelEl) {
-            selectedDateLabelEl.textContent = formatIsoDate(dayIso);
-          }
+        updateAmbient(kcalPercent);
+
+        todayTitleEl.textContent = title;
+        todayCaptionEl.textContent = caption;
+
+        const balance = kcalGoal ? kcalGoal - kcal : -kcal;
+        const balanceText = balance > 0
+          ? `Можно ещё примерно ${balance.toFixed(0)} ккал`
+          : balance < 0
+            ? `Перебор примерно на ${Math.abs(balance).toFixed(0)} ккал`
+            : "Цель ровно достигнута";
+
+        if (balancePill) {
+          balancePill.querySelector(".balance-pill__value").textContent = balanceText;
+          const borderHue = getComputedStyle(document.documentElement)
+            .getPropertyValue("--ambient-hue")
+            .trim();
+          balancePill.style.borderColor = `hsla(${borderHue}, 72%, 60%, 0.8)`;
         }
 
         todaySummaryEl.innerHTML = `
-          <div class="today-summary-row">
-            <div class="pill pill-primary">
-              Баланс дня: ${kcal.toFixed(0)} / ${kcalGoal.toFixed(0)} ккал
-            </div>
-            <div class="pill pill-outline">
-              Выполнено: ${kcalPercent.toFixed(0)}%
-            </div>
-          </div>
           <div class="summary-grid">
             <div class="macro-item">
-              <span class="label">Белки:</span>
-              <span class="value"> ${fmt(totals.protein, 1)} г ${goal.protein ? "/ " + fmt(goal.protein, 1) + " г" : ""}</span>
+              <span class="label">Калории</span>
+              <span class="value">${fmt(kcal, 0)} / ${fmt(kcalGoal, 0)} ккал</span>
             </div>
             <div class="macro-item">
-              <span class="label">Жиры:</span>
-              <span class="value"> ${fmt(totals.fat, 1)} г ${goal.fat ? "/ " + fmt(goal.fat, 1) + " г" : ""}</span>
-            </div>
-            <div class="macro-item">
-              <span class="label">Углеводы:</span>
-              <span class="value"> ${fmt(totals.carbs, 1)} г ${goal.carbs ? "/ " + fmt(goal.carbs, 1) + " г" : ""}</span>
+              <span class="label">Выполнено</span>
+              <span class="value">${fmt(kcalPercent, 0)}%</span>
             </div>
           </div>
         `;
 
-        updateAmbientByFill(kcalPercent);
+        todayMacrosEl.innerHTML = `
+          <div class="macro-grid">
+            <div class="macro-item">
+              <span class="label">Белки:</span>
+              <span class="value">${fmt(totals.protein, 1)} г ${goal.protein ? `/ ${fmt(goal.protein, 1)} г` : ""}</span>
+            </div>
+            <div class="macro-item">
+              <span class="label">Жиры:</span>
+              <span class="value">${fmt(totals.fat, 1)} г ${goal.fat ? `/ ${fmt(goal.fat, 1)} г` : ""}</span>
+            </div>
+            <div class="macro-item">
+              <span class="label">Углеводы:</span>
+              <span class="value">${fmt(totals.carbs, 1)} г ${goal.carbs ? `/ ${fmt(goal.carbs, 1)} г` : ""}</span>
+            </div>
+          </div>
+        `;
+
+        todayErrorEl.textContent = "";
 
         const todayRingEl = document.getElementById("today-ring");
         if (todayRing) {
@@ -437,6 +529,50 @@
           } else {
             todayHintEl.textContent = "За выбранную дату ещё нет записей.";
           }
+        }
+      }
+
+      async function loadDay(mode, dateIso) {
+        if (!userId) {
+          todayErrorEl.textContent =
+            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
+          return;
+        }
+
+        let url;
+        let title;
+        let caption;
+        let effectiveDate = dateIso;
+
+        if (mode === "today") {
+          effectiveDate = isoToday();
+          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          title = "Сегодня";
+          caption = `Данные за ${formatHuman(effectiveDate)}`;
+        } else if (mode === "yesterday") {
+          effectiveDate = isoYesterday();
+          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          title = "Вчера";
+          caption = `Данные за ${formatHuman(effectiveDate)}`;
+        } else {
+          effectiveDate = dateIso || isoToday();
+          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          title = formatHuman(effectiveDate);
+          caption = `Данные за ${formatHuman(effectiveDate)}`;
+        }
+
+        currentDateIso = effectiveDate;
+        selectedDateLabel.textContent = formatHuman(effectiveDate);
+        if (dateInput) {
+          dateInput.value = effectiveDate;
+        }
+
+        try {
+          const stats = await fetchJson(url);
+          renderToday(stats, title, caption);
+        } catch (err) {
+          console.error(err);
+          todayErrorEl.textContent = "Ошибка загрузки данных.";
         }
       }
 
@@ -516,80 +652,9 @@
         });
       }
 
-      async function fetchJson(url) {
-        const res = await fetch(url);
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        return res.json();
-      }
-
-      async function loadDayStats(mode, explicitDate) {
-        currentMode = mode;
-
-        let url;
-        const userIdParam = userId;
-
-        if (!userIdParam) {
-          todayErrorEl.textContent = "Не передан user_id.";
-          throw new Error("user_id is required");
-        }
-
-        if (mode === "today") {
-          url = `/api/stats/today?user_id=${userIdParam}`;
-          currentDate = formatDate(new Date());
-        } else {
-          let dateStr = explicitDate;
-          if (!dateStr) {
-            const base = new Date();
-            if (mode === "yesterday") {
-              base.setDate(base.getDate() - 1);
-            }
-            dateStr = formatDate(base);
-          }
-          currentDate = dateStr;
-          url = `/api/stats/day?user_id=${userIdParam}&date=${encodeURIComponent(
-            dateStr
-          )}`;
-        }
-
-        if (dateInput && currentDate) {
-          dateInput.value = currentDate;
-        }
-
+      async function loadHistory() {
+        if (!userId) return;
         try {
-          const stats = await fetchJson(url);
-          todayErrorEl.textContent = "";
-          renderTodayBlock(stats);
-
-          return stats;
-        } catch (err) {
-          console.error(err);
-          todayErrorEl.textContent = "Ошибка загрузки данных.";
-          throw err;
-        }
-      }
-
-      btnToday?.addEventListener("click", () => loadDayStats("today"));
-      btnYesterday?.addEventListener("click", () => loadDayStats("yesterday"));
-
-      dateInput?.addEventListener("change", (e) => {
-        if (!e.target.value) return;
-        loadDayStats("custom", e.target.value);
-      });
-
-      async function init() {
-        if (!userId) {
-          todayErrorEl.textContent =
-            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
-          weekErrorEl.textContent = "";
-          monthErrorEl.textContent = "";
-          return;
-        }
-
-        try {
-          await loadDayStats("today");
-
           const [week, month] = await Promise.all([
             fetchJson(`/api/stats/history?user_id=${userId}&days=7`),
             fetchJson(`/api/stats/history?user_id=${userId}&days=30`),
@@ -597,15 +662,50 @@
 
           buildWeekChart(week.items || []);
           buildMonthChart(month.items || []);
+          weekErrorEl.textContent = "";
+          monthErrorEl.textContent = "";
         } catch (err) {
           console.error(err);
-          todayErrorEl.textContent = "Ошибка загрузки данных.";
           weekErrorEl.textContent = "Ошибка загрузки данных.";
           monthErrorEl.textContent = "Ошибка загрузки данных.";
         }
       }
 
-      init();
+      btnToday?.addEventListener("click", () => {
+        setActiveMode("today");
+        loadDay("today");
+      });
+
+      btnYesterday?.addEventListener("click", () => {
+        setActiveMode("yesterday");
+        loadDay("yesterday");
+      });
+
+      btnDate?.addEventListener("click", () => {
+        if (dateInput.showPicker) {
+          dateInput.showPicker();
+        } else {
+          dateInput.click();
+        }
+      });
+
+      dateInput?.addEventListener("change", () => {
+        if (!dateInput.value) return;
+        setActiveMode("date");
+        loadDay("date", dateInput.value);
+      });
+
+      (async function init() {
+        if (!userId) {
+          todayErrorEl.textContent =
+            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
+          return;
+        }
+
+        setActiveMode("today");
+        await loadDay("today");
+        await loadHistory();
+      })();
     </script>
   </body>
 </html>
