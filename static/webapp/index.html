@@ -641,11 +641,39 @@
       });
 
       btnDate?.addEventListener("click", () => {
-        if (dateInput.showPicker) {
+        if (!dateInput) return;
+
+        // Нормальный путь: нативный date-picker
+        if (typeof dateInput.showPicker === "function") {
           dateInput.showPicker();
-        } else {
-          dateInput.click();
+          dateInput.focus();
+          return;
         }
+
+        // Fallback для окружений без showPicker (часть десктопных Telegram WebView)
+        dateInput.focus();
+
+        const currentIso = currentDateIso || isoToday();
+        const currentHuman = formatHuman(currentIso);
+
+        const raw = prompt("Введите дату в формате ДД.ММ.ГГГГ", currentHuman);
+        if (!raw) return;
+
+        const match = raw.trim().match(/^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$/);
+        if (!match) {
+          alert("Не понял дату. Пример: 15.12.2025");
+          return;
+        }
+
+        const [, d, m, y] = match;
+        const iso = `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+        dateInput.value = iso;
+        setActiveMode("date");
+        loadDay("date", iso);
+      });
+
+      selectedDateLabel?.addEventListener("click", () => {
+        btnDate?.click();
       });
 
       dateInput?.addEventListener("change", () => {

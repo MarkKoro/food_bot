@@ -491,57 +491,6 @@ async def delete_menu_message(
     ctx.chat_data["menu_message_id"] = None
 
 
-async def cleanup_payment_messages(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    extra_message_ids: list[int] | None = None,
-    purge_from_message_id: int | None = None,
-    purge_limit: int = 50,
-) -> None:
-    """Удалить все связанные с оплатой сообщения, чтобы оставить одно меню."""
-
-    message_ids: list[int] = []
-
-    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
-    if invoice_msg_id:
-        message_ids.append(invoice_msg_id)
-
-    if extra_message_ids:
-        message_ids.extend(mid for mid in extra_message_ids if mid)
-
-    for mid in message_ids:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            # Игнорируем любые ошибки: сообщение могло быть уже удалено
-            pass
-
-    await delete_menu_message(ctx, chat_id)
-
-    if purge_from_message_id:
-        await purge_recent_messages(
-            ctx, chat_id, purge_from_message_id, max_messages=purge_limit
-        )
-
-
-async def purge_recent_messages(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    from_message_id: int,
-    max_messages: int = 50,
-) -> None:
-    """Попробовать подчистить историю, удалив последние сообщения бота."""
-
-    end_id = max(1, from_message_id - max_messages + 1)
-    for mid in range(from_message_id, end_id - 1, -1):
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=mid)
-        except (BadRequest, Forbidden):
-            continue
-        except Exception:
-            logger.exception("Unexpected error while purging messages", exc_info=True)
-
-
 async def delete_user_message(update: Update) -> None:
     if update.message:
         try:
@@ -1704,49 +1653,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
     if data == "sub:invoice_back":
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        if not chat_id:
-            return
-
-        await cleanup_payment_messages(
-            ctx,
-            chat_id,
-            [query.message.message_id if query.message else None],
-            purge_from_message_id=query.message.message_id if query.message else None,
-            purge_limit=200,
-        )
-
-        plan_id = ctx.chat_data.get("selected_plan_id")
-        plan = SUB_PLANS.get(plan_id)
-
-        if not plan:
-            # Если по какой-то причине план потеряли — просто открываем меню подписки
-            await on_premium_menu(update, ctx)
-            return
-
-        star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
-        stars_amount = STARS_PLANS.get(star_key)
-        plan_description = (
-            STARS_PLAN_META.get(star_key, {}).get("description")
-            or getattr(plan, "description", f"Подписка на {plan.title}")
-        )
-
-        # Возвращаем меню выбора способа оплаты для того же плана
-        text = (
-            f"План: {plan.title}\n"
-            f"{plan_description}\n\n"
-            f"Стоимость:\n"
-            f"• Звёзды: {stars_amount if stars_amount is not None else '—'}\n"
-            f"• Карта: {plan.price_rub} ₽"
-        )
-
-        await send_new_menu_message(
-            ctx,
-            chat_id=chat_id,
-            text=text,
-            reply_markup=kb_payment_methods(plan_id),
-            user_id=update.effective_user.id if update.effective_user else None,
-        )
+        # Назад из инвойса к способам оплаты выбранного плана
+        await show_payment_menu_for_selected_plan(update, ctx)
         return
 
     if data == "chk_sub":
@@ -1762,23 +1670,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
     elif data == "premium_plans":
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        if chat_id:
-            await cleanup_payment_messages(
-                ctx,
-                chat_id,
-                [query.message.message_id if query.message else None],
-                purge_from_message_id=query.message.message_id if query.message else None,
-                purge_limit=200,
-            )
+        # Назад к списку всех тарифов (из любого места)
+        if query and query.message:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
         await on_premium_menu(update, ctx)
+        return
     elif data == "sub_back":
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        if chat_id:
-            await cleanup_payment_messages(
-                ctx, chat_id, [query.message.message_id if query.message else None]
-            )
+        # Назад от выбора способа оплаты к списку тарифов
+        if query and query.message:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
         await on_premium_menu(update, ctx)
+        return
     elif data.startswith("buy_plan:"):
         _, plan_id = data.split(":", 1)
         plan = SUB_PLANS.get(plan_id)
@@ -1866,6 +1774,62 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx,
         "Выберите способ оплаты:",
         kb_premium_plans(),
+    )
+
+
+# ── Вспомогательный хелпер для возврата из инвойса ─────────────────────────────
+
+async def show_payment_menu_for_selected_plan(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Вернуть пользователя к выбору способа оплаты для ранее выбранного плана."""
+    query = update.callback_query
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
+    # 1) Пытаемся удалить текущее сообщение (инвойс или что там сейчас висит)
+    if query and query.message:
+        try:
+            await query.message.delete()
+        except BadRequest:
+            # Если удалить не получилось — не критично, просто идём дальше
+            pass
+
+    # 2) Пытаемся восстановить план из контекста
+    plan_id = ctx.chat_data.get("selected_plan_id")
+    plan = SUB_PLANS.get(plan_id)
+
+    if not plan:
+        # Если по какой-то причине план потеряли — просто открываем главное меню подписки
+        await on_premium_menu(update, ctx)
+        return
+
+    # Если у тебя есть словари для звёздных планов — используем их для текста
+    star_plan_key = PLAN_ID_TO_STARS_KEY.get(plan_id) if "PLAN_ID_TO_STARS_KEY" in globals() else None
+    star_plan = (
+        SUBSCRIPTION_PLANS_STARS.get(star_plan_key)
+        if star_plan_key and "SUBSCRIPTION_PLANS_STARS" in globals()
+        else None
+    )
+    star_price = star_plan.get("stars") if star_plan else "—"
+    plan_description = (
+        star_plan.get("description")
+        if star_plan
+        else getattr(plan, "description", f"Подписка на {plan.title}")
+    )
+
+    text = (
+        f"План: {plan.title}\n"
+        f"{plan_description}\n\n"
+        f"Стоимость:\n"
+        f"• Звёзды: {star_price}\n"
+        f"• Карта: {plan.price_rub} ₽"
+    )
+
+    await edit_menu_message(
+        update,
+        ctx,
+        text,
+        kb_payment_methods(plan_id),
     )
 
 
@@ -2184,11 +2148,13 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await set_premium_until(db, user_id, new_until)
 
     chat_id = message.chat_id
-    await cleanup_payment_messages(
-        ctx,
-        chat_id,
-        extra_message_ids=[message.message_id if message else None],
-    )
+
+    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
+    if invoice_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
+        except Exception:
+            pass
 
     # Платёжное сервисное сообщение тоже убираем, если оно осталось
     try:
