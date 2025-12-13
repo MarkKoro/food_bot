@@ -122,13 +122,17 @@
 
       .date-picker-wrapper {
         position: relative;
+        display: inline-flex;
       }
 
       .date-input-hidden {
         position: absolute;
         inset: 0;
+        width: 100%;
+        height: 100%;
         opacity: 0;
         cursor: pointer;
+        z-index: 2;
       }
 
       .macro-grid {
@@ -180,6 +184,7 @@
         align-items: flex-start;
         gap: 12px;
         flex-wrap: wrap;
+        margin-bottom: 10px;
       }
 
       .today-header-row {
