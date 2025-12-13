@@ -453,6 +453,24 @@ async def send_new_menu_message(
         await set_last_menu_message_id(db, uid, msg.message_id)
 
 
+async def delete_menu_message(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    """Аккуратно удалить текущее меню, если его id известен."""
+    msg_id = ctx.chat_data.get("menu_message_id")
+    if not msg_id:
+        return
+
+    try:
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        # Сообщение уже удалено / слишком старое — просто игнорируем
+        pass
+
+    ctx.chat_data["menu_message_id"] = None
+
+
 async def delete_user_message(update: Update) -> None:
     if update.message:
         try:
@@ -1611,8 +1629,49 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    data = query.data
+    data = query.data or ""
     await query.answer()
+
+    if data == "sub:invoice_back":
+        # Удаляем инвойсное сообщение
+        try:
+            if query.message:
+                await query.message.delete()
+        except Exception:
+            pass
+
+        plan_id = ctx.chat_data.get("selected_plan_id")
+        plan = SUB_PLANS.get(plan_id)
+
+        if not plan:
+            # Если по какой-то причине план потеряли — просто открываем меню подписки
+            await on_premium_menu(update, ctx)
+            return
+
+        star_plan = SUBSCRIPTION_PLANS_STARS.get(PLAN_ID_TO_STARS_KEY.get(plan_id))
+        star_price = star_plan.get("stars") if star_plan else "—"
+        plan_description = (
+            star_plan.get("description")
+            if star_plan
+            else getattr(plan, "description", f"Подписка на {plan.title}")
+        )
+
+        # Возвращаем меню выбора способа оплаты для того же плана
+        text = (
+            f"План: {plan.title}\n"
+            f"{plan_description}\n\n"
+            f"Стоимость:\n"
+            f"• Звёзды: {star_price}\n"
+            f"• Карта: {plan.price_rub} ₽"
+        )
+
+        await edit_menu_message(
+            update,
+            ctx,
+            text,
+            kb_payment_methods(plan_id),
+        )
+        return
 
     if data == "chk_sub":
         await on_check_sub_callback(update, ctx)
@@ -1633,6 +1692,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not plan:
             await query.edit_message_text("Неизвестный план подписки. Попробуй ещё раз.")
             return
+        ctx.chat_data["selected_plan_id"] = plan_id
         await edit_menu_message(
             update,
             ctx,
@@ -1640,11 +1700,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             kb_payment_methods(plan_id),
         )
     elif data in SUBSCRIPTION_PLANS_STARS:
+        plan_id = next(
+            (pid for pid, key in PLAN_ID_TO_STARS_KEY.items() if key == data), None
+        )
+        if plan_id:
+            ctx.chat_data["selected_plan_id"] = plan_id
         await on_buy_with_stars(update, ctx)
     elif data.startswith("buy_stars:"):
         _, plan_id = data.split(":", 1)
         star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
         if star_key:
+            ctx.chat_data["selected_plan_id"] = plan_id
             update.callback_query.data = star_key
             await on_buy_with_stars(update, ctx)
         else:
@@ -1652,6 +1718,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "Не удалось найти тариф для оплаты звёздами. Попробуйте ещё раз."
             )
     elif data.startswith("buy_card:"):
+        _, plan_id = data.split(":", 1)
+        ctx.chat_data["selected_plan_id"] = plan_id
         await on_buy_with_card(update, ctx)
     elif data == "set_goal":
         await show_set_goal_screen(update, ctx)
@@ -1720,9 +1788,13 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработка кнопок 'оплатить звёздами'."""
     query = update.callback_query
+    chat_id = update.effective_chat.id
     await query.answer()
 
     data = query.data  # callback_data кнопки
+    plan_id = next((pid for pid, key in PLAN_ID_TO_STARS_KEY.items() if key == data), None)
+    if plan_id:
+        ctx.chat_data["selected_plan_id"] = plan_id
     plan = SUBSCRIPTION_PLANS_STARS.get(data)
 
     if not plan:
@@ -1744,33 +1816,47 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    prices = [
-        LabeledPrice(
-            label=title,
-            amount=stars_amount,  # для XTR amount = количество звёзд (целое число)
-        )
-    ]
+    await delete_menu_message(ctx, chat_id)
 
     payload = f"stars:{data}:{days}"
 
-    await ctx.bot.send_invoice(
-        chat_id=query.from_user.id,
+    invoice_message = await ctx.bot.send_invoice(
+        chat_id=chat_id,
         title=title,
         description=description,
         payload=payload,
         provider_token="",  # ДЛЯ Stars provider_token ДОЛЖЕН быть пустым
-        currency="XTR",     # ВАЛЮТА ДЛЯ ЗВЁЗД — XTR
-        prices=prices,
-        max_tip_amount=None,
-        suggested_tip_amounts=None,
+        currency="XTR",  # ВАЛЮТА ДЛЯ ЗВЁЗД — XTR
+        prices=[
+            LabeledPrice(
+                label=title,
+                amount=stars_amount * 1000,  # XTR = "миллисекунды" звёзд
+            )
+        ],
+        max_tip_amount=0,
+        is_flexible=False,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="🔙 Назад",
+                        callback_data="sub:invoice_back",
+                    )
+                ]
+            ]
+        ),
     )
+
+    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
 
 
 async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    chat_id = update.effective_chat.id
     await query.answer()
     data = query.data
     _, plan_id = data.split(":", 1)
+    ctx.chat_data["selected_plan_id"] = plan_id
     plan = SUB_PLANS.get(plan_id)
     if not plan:
         await query.edit_message_text("Неизвестный план подписки.")
@@ -1785,17 +1871,36 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     payload = f"sub:{plan.id}:card"
 
-    prices = [LabeledPrice(plan.title, plan.price_rub * 100)]
+    await delete_menu_message(ctx, chat_id)
 
-    await ctx.bot.send_invoice(
-        chat_id=user.id,
+    invoice_message = await ctx.bot.send_invoice(
+        chat_id=chat_id,
         title=f"Подписка на {plan.title}",
         description="Подписка на умный дневник питания с фото и голосом.",
         payload=payload,
         provider_token=YOOKASSA_PROVIDER_TOKEN,
         currency="RUB",
-        prices=prices,
+        prices=[
+            LabeledPrice(
+                label=plan.title,
+                amount=plan.price_rub * 100,  # рубли в копейках
+            )
+        ],
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="🔙 Назад",
+                        callback_data="sub:invoice_back",
+                    )
+                ]
+            ]
+        ),
+        is_flexible=False,
+        max_tip_amount=0,
     )
+
+    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
 
 
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1808,9 +1913,11 @@ async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sp = update.message.successful_payment
+    message = update.message
+    user = update.effective_user
+    sp = message.successful_payment
     payload = sp.invoice_payload or ""
-    user_id = update.effective_user.id
+    user_id = user.id
     db = ctx.application.bot_data["db"]
 
     now = datetime.utcnow()
@@ -1878,10 +1985,31 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await set_premium_until(db, user_id, new_until)
 
-    until_str = new_until.strftime("%d.%m.%Y")
-    await update.message.reply_text(
-        f"Спасибо! Подписка активна до {until_str}.\n"
-        f"Теперь ты можешь без ограничений отправлять фото и голосовые для анализа."
+    # Удаляем инвойс, если его id был сохранён
+    chat_id = message.chat_id
+    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
+    if invoice_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
+        except Exception:
+            pass
+
+    # На всякий случай чистим старое меню (если ещё не удалили)
+    await delete_menu_message(ctx, chat_id)
+
+    # Шлём единое сообщение: подтверждение + главное меню
+    success_text = (
+        f"✅ Оплата прошла успешно!\n"
+        f"Ваша подписка активна до: {new_until.strftime('%d.%m.%Y')}.\n\n"
+        "Можно продолжать пользоваться ботом ❤️"
+    )
+
+    await send_new_menu_message(
+        ctx,
+        chat_id=chat_id,
+        text=success_text,
+        reply_markup=kb_main(),
+        user_id=user_id,
     )
 
 # ── Админ и прочее (минимальный каркас) ──────────────
