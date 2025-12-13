@@ -1834,7 +1834,6 @@ async def send_stars_invoice(
         max_tip_amount=0,
         provider_token=None,
         reply_markup=back_markup,
-        allow_paying_without_shipping_address=True,
     )
 
     if update.callback_query:
