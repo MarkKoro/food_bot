@@ -36,6 +36,30 @@ def _today_str() -> str:
     return dt.date.today().isoformat()
 
 
+def _build_stats_for_day(user_id: int, day: str) -> Dict[str, Any]:
+    totals = get_daily_totals_for_user(user_id, day)
+    goal = get_goal_for_user(user_id)
+
+    def perc(value: float, target: float) -> Optional[int]:
+        if not target or target <= 0:
+            return None
+        return int(round(value / target * 100))
+
+    percent = {
+        "kcal": perc(totals["kcal"], goal["kcal"]) if goal else None,
+        "protein": perc(totals["protein"], goal["protein"]) if goal else None,
+        "fat": perc(totals["fat"], goal["fat"]) if goal else None,
+        "carbs": perc(totals["carbs"], goal["carbs"]) if goal else None,
+    }
+
+    return {
+        "day": day,
+        "totals": totals,
+        "goal": goal,
+        "percent": percent,
+    }
+
+
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -194,27 +218,21 @@ def stats_today(user_id: int = Query(..., description="Telegram user id")) -> Di
     - percent: проценты от цели по каждому макронутриенту
     """
     day = _today_str()
-    totals = get_daily_totals_for_user(user_id, day)
-    goal = get_goal_for_user(user_id)
+    return _build_stats_for_day(user_id, day)
 
-    def perc(value: float, target: float) -> Optional[int]:
-        if not target or target <= 0:
-            return None
-        return int(round(value / target * 100))
 
-    percent = {
-        "kcal": perc(totals["kcal"], goal["kcal"]) if goal else None,
-        "protein": perc(totals["protein"], goal["protein"]) if goal else None,
-        "fat": perc(totals["fat"], goal["fat"]) if goal else None,
-        "carbs": perc(totals["carbs"], goal["carbs"]) if goal else None,
-    }
+@app.get("/api/stats/day")
+def stats_day(
+    user_id: int = Query(..., description="Telegram user id"),
+    date: Optional[str] = Query(None, description="Day in YYYY-MM-DD"),
+) -> Dict[str, Any]:
+    """
+    Статистика за конкретный день. Формат ответа совпадает с /api/stats/today.
+    Если дата не передана — используется сегодня.
+    """
 
-    return {
-        "day": day,
-        "totals": totals,
-        "goal": goal,
-        "percent": percent,
-    }
+    day = date or _today_str()
+    return _build_stats_for_day(user_id, day)
 
 
 @app.get("/api/stats/history")
