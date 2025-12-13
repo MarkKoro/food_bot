@@ -75,11 +75,6 @@
         align-items: center;
       }
 
-      .date-label {
-        font-size: 0.9rem;
-        opacity: 0.85;
-      }
-
       .day-switch {
         display: flex;
         gap: 8px;
@@ -115,6 +110,17 @@
       .date-picker-wrapper {
         position: relative;
         display: inline-flex;
+      }
+
+      .date-input-hidden{
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        opacity:0;           /* можно оставить 0 */
+        z-index:0;           /* важно: input НЕ должен быть выше кнопки */
+        pointer-events:none; /* важно: чтобы клик всегда попадал в кнопку */
+        cursor:pointer;
       }
 
       .macro-grid {
@@ -160,13 +166,16 @@
         opacity: 0.7;
       }
 
-      .today-header {
-        display: flex;
+      .today-header{
+        display:flex;
         justify-content: space-between;
-        align-items: flex-start;
-        gap: 12px;
-        flex-wrap: wrap;
-        margin-bottom: 10px;
+        align-items:center;
+        gap:12px;
+        flex-wrap: nowrap; /* важно: не даём “выбрать дату” уезжать вниз на телефоне */
+      }
+      .today-header > div:first-child{
+        flex: 1 1 auto;
+        min-width: 0;
       }
 
       .today-header-row {
@@ -183,12 +192,17 @@
         font-size: 13px;
       }
 
-      .today-date-picker {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-end;
-        gap: 6px;
-        min-width: 180px;
+      .today-date-picker{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        min-width: 0;
+        flex: 0 0 auto;
+      }
+      .date-label{
+        white-space: nowrap;
+        opacity: 0.85;
+        font-size: 0.9rem;
       }
 
       .muted {
@@ -244,6 +258,12 @@
         }
       }
 
+      @media (max-width: 520px){
+        .today-date-picker{ gap:8px; }
+        .date-label{ font-size:0.85rem; }
+        #btn-date.pill{ padding: 6px 10px; }
+      }
+
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -268,15 +288,12 @@
           </div>
 
           <div class="today-date-picker">
-            <span class="muted">или выбрать дату:</span>
+            <span class="date-label">Выбрать дату</span>
             <div class="date-picker-wrapper">
-              <div id="datePill" class="pill pill-secondary pill-muted date-pill">Выбрать</div>
-
-              <input
-                id="dateInput"
-                type="date"
-                style="position:absolute; left:-9999px; opacity:0; width:1px; height:1px;"
-              />
+              <button id="btn-date" class="pill pill-secondary pill-muted" type="button">
+                <span id="selected-date-label">Выбрать</span>
+              </button>
+              <input type="date" id="date-input" class="date-input-hidden" />
             </div>
           </div>
         </div>
@@ -318,8 +335,9 @@
       const todayCaptionEl = document.getElementById("today-date-caption");
       const btnToday = document.getElementById("btnToday");
       const btnYesterday = document.getElementById("btnYesterday");
-      const datePill = document.getElementById("datePill");
-      const dateInput = document.getElementById("dateInput");
+      const btnDate = document.getElementById("btn-date");
+      const dateInput = document.getElementById("date-input");
+      const selectedDateLabel = document.getElementById("selected-date-label");
 
       let weekChart = null;
       let monthChart = null;
@@ -353,17 +371,17 @@
           btnYesterday.classList.toggle("is-active", mode === "yesterday");
         }
 
-        if (datePill) {
-          datePill.classList.toggle("pill-primary", mode === "date");
-          datePill.classList.toggle("pill-secondary", mode !== "date");
-          datePill.classList.toggle("pill-muted", mode !== "date");
-          datePill.classList.toggle("is-active", mode === "date");
+        if (btnDate) {
+          btnDate.classList.toggle("pill-primary", mode === "date");
+          btnDate.classList.toggle("pill-secondary", mode !== "date");
+          btnDate.classList.toggle("pill-muted", mode !== "date");
+          btnDate.classList.toggle("is-active", mode === "date");
         }
       }
 
       // --- открытие календаря (ПК/телефон) ---
       function openDatePicker() {
-        const inp = document.getElementById("dateInput");
+        const inp = document.getElementById("date-input");
         if (!inp) return;
 
         try {
@@ -378,11 +396,11 @@
       }
 
       (function initDateUi() {
-        const datePill = document.getElementById("datePill");
-        const inp = document.getElementById("dateInput");
-        if (!datePill || !inp) return;
+        const dateButton = document.getElementById("btn-date");
+        const inp = document.getElementById("date-input");
+        if (!dateButton || !inp) return;
 
-        datePill.addEventListener("click", (e) => {
+        dateButton.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
           openDatePicker();
@@ -583,8 +601,11 @@
           selectedISO = effectiveDate;
         }
         lastLoadedDateIso = effectiveDate;
-        if (datePill) {
-          datePill.textContent = formatHuman(effectiveDate);
+        if (selectedDateLabel) {
+          selectedDateLabel.textContent = formatHuman(effectiveDate);
+        }
+        if (btnDate) {
+          btnDate.setAttribute("aria-label", `Выбрать дату ${formatHuman(effectiveDate)}`);
         }
         if (dateInput) {
           dateInput.value = effectiveDate;
