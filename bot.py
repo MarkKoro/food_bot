@@ -491,6 +491,32 @@ async def delete_menu_message(
     ctx.chat_data["menu_message_id"] = None
 
 
+async def cleanup_payment_messages(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    extra_message_ids: list[int] | None = None,
+) -> None:
+    """Удалить все связанные с оплатой сообщения, чтобы оставить одно меню."""
+
+    message_ids: list[int] = []
+
+    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
+    if invoice_msg_id:
+        message_ids.append(invoice_msg_id)
+
+    if extra_message_ids:
+        message_ids.extend(mid for mid in extra_message_ids if mid)
+
+    for mid in message_ids:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            # Игнорируем любые ошибки: сообщение могло быть уже удалено
+            pass
+
+    await delete_menu_message(ctx, chat_id)
+
+
 async def delete_user_message(update: Update) -> None:
     if update.message:
         try:
@@ -1653,12 +1679,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
     if data == "sub:invoice_back":
-        # Удаляем инвойсное сообщение
-        try:
-            if query.message:
-                await query.message.delete()
-        except Exception:
-            pass
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if not chat_id:
+            return
+
+        await cleanup_payment_messages(
+            ctx, chat_id, [query.message.message_id if query.message else None]
+        )
 
         plan_id = ctx.chat_data.get("selected_plan_id")
         plan = SUB_PLANS.get(plan_id)
@@ -1684,11 +1711,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"• Карта: {plan.price_rub} ₽"
         )
 
-        await edit_menu_message(
-            update,
+        await send_new_menu_message(
             ctx,
-            text,
-            kb_payment_methods(plan_id),
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb_payment_methods(plan_id),
+            user_id=update.effective_user.id if update.effective_user else None,
         )
         return
 
@@ -1707,11 +1735,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "premium_plans":
         await on_premium_menu(update, ctx)
     elif data == "sub_back":
-        try:
-            if query.message:
-                await query.message.delete()
-        except Exception:
-            pass
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if chat_id:
+            await cleanup_payment_messages(
+                ctx, chat_id, [query.message.message_id if query.message else None]
+            )
         await on_premium_menu(update, ctx)
     elif data.startswith("buy_plan:"):
         _, plan_id = data.split(":", 1)
@@ -2116,17 +2144,19 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await set_premium_until(db, user_id, new_until)
 
-    # Удаляем инвойс, если его id был сохранён
     chat_id = message.chat_id
-    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
-    if invoice_msg_id:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
-        except Exception:
-            pass
+    await cleanup_payment_messages(
+        ctx,
+        chat_id,
+        extra_message_ids=[message.message_id if message else None],
+    )
 
-    # На всякий случай чистим старое меню (если ещё не удалили)
-    await delete_menu_message(ctx, chat_id)
+    # Платёжное сервисное сообщение тоже убираем, если оно осталось
+    try:
+        if message:
+            await message.delete()
+    except Exception:
+        pass
 
     # Шлём единое сообщение: подтверждение + главное меню
     success_text = (
