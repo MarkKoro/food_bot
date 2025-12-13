@@ -8,12 +8,17 @@
       * {
         box-sizing: border-box;
       }
+      :root {
+        --accent-color: #2563eb; /* базовый синий */
+      }
+
       body {
         margin: 0;
         padding: 0;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #050816;
+        background: radial-gradient(circle at 0 0, #020617 0, #020617 40%);
         color: #f5f5f5;
+        transition: background 0.35s ease;
       }
       .app {
         max-width: 900px;
@@ -32,6 +37,12 @@
         font-size: 14px;
         opacity: 0.8;
       }
+      .app,
+      .card,
+      .pill-primary {
+        transition: background-color 0.3s ease, box-shadow 0.3s ease;
+      }
+
       .card {
         background: rgba(15, 23, 42, 0.85);
         border-radius: 16px;
@@ -51,10 +62,33 @@
         margin-top: 4px;
       }
       .pill {
-        padding: 4px 10px;
+        padding: 6px 12px;
         border-radius: 999px;
         font-size: 12px;
         background: rgba(30, 64, 175, 0.6);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        color: #e5e7eb;
+        cursor: pointer;
+      }
+
+      .pill-small {
+        padding: 4px 10px;
+        font-size: 11px;
+        background: rgba(255, 255, 255, 0.05);
+      }
+
+      .pill-date {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(59, 130, 246, 0.18);
+        border: 1px solid rgba(59, 130, 246, 0.35);
+        color: #e5e7eb;
+      }
+
+      .pill-date-icon {
+        font-size: 13px;
+        opacity: 0.85;
       }
       .macro-grid {
         display: grid;
@@ -113,17 +147,75 @@
         font-size: 13px;
       }
 
+      .today-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+
+      .today-title-side h2 {
+        margin: 0 0 6px;
+        font-size: 20px;
+      }
+
+      .today-quick-buttons {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .today-date-side {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .today-date-label {
+        opacity: 0.8;
+        font-size: 13px;
+      }
+
+      .today-summary-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }
+
+      .pill-outline {
+        background: transparent;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        color: #e2e8f0;
+      }
+
+      .hidden-date-input {
+        position: absolute;
+        left: -9999px;
+        opacity: 0;
+        pointer-events: none;
+      }
+
       .ring-wrapper {
         display: flex;
         justify-content: center;
         align-items: center;
       }
 
+      .progress-ring circle.progress-value {
+        stroke: var(--accent-color);
+      }
+
       .pill-primary {
-        background: rgba(59, 130, 246, 0.8);
+        background-color: var(--accent-color);
         color: #e5e7eb;
         border: none;
         cursor: pointer;
+        box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
       }
 
       .date-row {
@@ -164,16 +256,22 @@
       </header>
 
       <div class="card" id="card-today">
-        <div class="card-header">
-          <h2>Сегодня</h2>
-          <p class="card-subtitle" id="today-date-label">...</p>
-        </div>
+        <div class="today-header-row">
+          <div class="today-title-side">
+            <h2>Сегодня</h2>
+            <div class="today-quick-buttons">
+              <button class="pill pill-small" data-day="today" id="btn-today">Сегодня</button>
+              <button class="pill pill-small" data-day="yesterday" id="btn-yesterday">Вчера</button>
+            </div>
+          </div>
 
-        <div class="date-row">
-          <button class="pill pill-primary" id="day-today-btn">Сегодня</button>
-          <div class="date-picker">
-            <span>или выбрать дату:</span>
-            <input type="date" id="day-date-input" />
+          <div class="today-date-side">
+            <span class="today-date-label">Данные за</span>
+            <button class="pill pill-date" id="btn-date-picker">
+              <span id="selected-date-label">—</span>
+              <span class="pill-date-icon">📅</span>
+            </button>
+            <input type="date" id="date-input" class="hidden-date-input" />
           </div>
         </div>
 
@@ -212,8 +310,11 @@
       const weekErrorEl = document.getElementById("week-error");
       const monthErrorEl = document.getElementById("month-error");
 
-      const dateInputEl = document.getElementById("day-date-input");
-      const dateTodayBtn = document.getElementById("day-today-btn");
+      const selectedDateLabelEl = document.getElementById("selected-date-label");
+      const dateInputEl = document.getElementById("date-input");
+      const dateTodayBtn = document.getElementById("btn-today");
+      const dateYesterdayBtn = document.getElementById("btn-yesterday");
+      const datePickerBtn = document.getElementById("btn-date-picker");
 
       const tg = window.Telegram && window.Telegram.WebApp
         ? window.Telegram.WebApp
@@ -239,9 +340,10 @@
       let monthChart = null;
       let todayRing = null;
 
-      // Состояние: текущий "сегодня" и история за 30 дней
       let todaySummary = null;
       let monthHistory = [];
+      let currentDate = null;
+      let todayIso = null;
 
       function fmt(value, digits = 0) {
         return Number(value || 0).toFixed(digits);
@@ -254,54 +356,65 @@
         return `${d}.${m}`;
       }
 
-      function setDateInputToToday() {
-        if (!dateInputEl) return;
-        const now = new Date();
-        const iso = now.toISOString().slice(0, 10); // YYYY-MM-DD
-        dateInputEl.value = iso;
+      function formatIsoDate(dateIso) {
+        if (!dateIso) return "—";
+        return dateIso.split("-").reverse().join(".");
       }
 
-      function buildTodayBlock(data) {
-        const totals = data.totals || {};
-        const goal = data.goal || null;
-        const percent = data.percent || {};
+      function updateThemeByProgress(percent) {
+        // допускаем чуть больше 100%, чтобы "перекорм" тоже загорался
+        const clamped = Math.max(0, Math.min(percent, 130)) / 100;
 
-        const dateLabelEl = document.getElementById("today-date-label");
-        const dateValue = data.date || data.day || null;
-        if (dateLabelEl) {
-          const dateLabel = dateValue ? `Данные за ${formatDayLabel(dateValue)}` : "Данные за сегодня";
-          dateLabelEl.textContent = dateLabel;
-        }
+        // 0%  -> оранжево-жёлтый
+        // 50% -> мягкий жёлто-зелёный
+        // 100%+ -> зелёный
+        const hueStart = 38; // ~оранжевый
+        const hueEnd = 135; // ~зелёный
 
-        const kcal = fmt(totals.kcal);
-        const kcalGoal = goal ? fmt(goal.kcal) : "—";
-        const kcalPercent =
-          percent.kcal !== null && percent.kcal !== undefined
-            ? percent.kcal + "%"
-            : "—";
+        const hue = hueStart + (hueEnd - hueStart) * clamped;
+        const accent = `hsl(${hue} 90% 55%)`;
+
+        document.documentElement.style.setProperty("--accent-color", accent);
+
+        // фон страницы – лёгкий градиент с оттенком прогресса
+        document.body.style.background =
+          `radial-gradient(circle at 0 0, ${accent}22 0, #020617 45%, #020617 100%)`;
+      }
+
+      function buildTodaySummary(today) {
+        const totals = today.totals || {};
+        const goal = today.goal || {};
+        const kcal = totals.kcal ?? 0;
+        const kcalGoal = goal.kcal ?? 0;
+        const kcalPercent = today.percent?.kcal ?? 0;
 
         todaySummaryEl.innerHTML = `
-          <div class="row">
-            <div class="pill">Сегодня: ${kcal} / ${kcalGoal} ккал</div>
-            <div class="pill">Выполнено: ${kcalPercent}</div>
+          <div class="today-summary-row">
+            <div class="pill pill-primary">
+              Баланс дня: ${kcal.toFixed(0)} / ${kcalGoal.toFixed(0)} ккал
+            </div>
+            <div class="pill pill-outline">
+              Выполнено: ${kcalPercent.toFixed(0)}%
+            </div>
           </div>
           <div class="summary-grid">
             <div class="macro-item">
               <span class="label">Белки:</span>
-              <span class="value"> ${fmt(totals.protein, 1)} г ${goal ? "/ " + fmt(goal.protein, 1) + " г" : ""}</span>
+              <span class="value"> ${fmt(totals.protein, 1)} г ${goal.protein ? "/ " + fmt(goal.protein, 1) + " г" : ""}</span>
             </div>
             <div class="macro-item">
               <span class="label">Жиры:</span>
-              <span class="value"> ${fmt(totals.fat, 1)} г ${goal ? "/ " + fmt(goal.fat, 1) + " г" : ""}</span>
+              <span class="value"> ${fmt(totals.fat, 1)} г ${goal.fat ? "/ " + fmt(goal.fat, 1) + " г" : ""}</span>
             </div>
             <div class="macro-item">
               <span class="label">Углеводы:</span>
-              <span class="value"> ${fmt(totals.carbs, 1)} г ${goal ? "/ " + fmt(goal.carbs, 1) + " г" : ""}</span>
+              <span class="value"> ${fmt(totals.carbs, 1)} г ${goal.carbs ? "/ " + fmt(goal.carbs, 1) + " г" : ""}</span>
             </div>
           </div>
         `;
 
-        // Круговой график распределения Б/Ж/У за сегодня
+        updateThemeByProgress(kcalPercent);
+
         const todayRingEl = document.getElementById("today-ring");
         if (todayRing) {
           todayRing.destroy();
@@ -335,20 +448,13 @@
               },
             },
           });
-          if (goal) {
-            // Подсказку под кругом не показываем, просто оставляем пусто
-            if (todayHintEl) {
-              todayHintEl.textContent = "";
-            }
-          }
+          todayHintEl.textContent = "";
         } else {
-          // Если приёмов ещё не было — просто подсказка
-          if (!goal) {
+          if (!goal.kcal) {
             todayHintEl.textContent =
               "Цель по КБЖУ пока не задана. Задайте её в настройках бота, чтобы видеть проценты.";
-          } else if (!todayHintEl.textContent) {
-            todayHintEl.textContent =
-              "Сегодня ещё не было сохранённых приёмов пищи.";
+          } else {
+            todayHintEl.textContent = "За выбранную дату ещё нет записей.";
           }
         }
       }
@@ -361,6 +467,7 @@
         if (weekChart) {
           weekChart.destroy();
         }
+
         weekChart = new Chart(ctx, {
           type: "line",
           data: {
@@ -369,7 +476,9 @@
               {
                 label: "Калории",
                 data: kcalData,
-                tension: 0.3,
+                borderColor: "rgba(59, 130, 246, 0.9)",
+                backgroundColor: "rgba(59, 130, 246, 0.2)",
+                fill: true,
               },
             ],
           },
@@ -388,13 +497,6 @@
             },
           },
         });
-
-        const sum = kcalData.reduce((a, b) => a + b, 0);
-        weekSummaryEl.innerHTML = `
-          <div class="row">
-            <div class="pill">Итого за 7 дней: ${fmt(sum)} ккал</div>
-          </div>
-        `;
       }
 
       function buildMonthChart(history) {
@@ -441,6 +543,29 @@
         return res.json();
       }
 
+      async function loadStatsFor(dateIso) {
+        const params = new URLSearchParams(window.location.search);
+        const userIdFromQuery = params.get("user_id") || userId;
+
+        const resp = await fetch(
+          `/api/stats/day?user_id=${userIdFromQuery}&date=${dateIso}`
+        );
+        if (!resp.ok) throw new Error("Не удалось загрузить данные за день");
+        const dayStats = await resp.json();
+
+        todayErrorEl.textContent = "";
+        buildTodaySummary(dayStats);
+        return dayStats;
+      }
+
+      function setSelectedDate(dateIso) {
+        currentDate = dateIso;
+        if (selectedDateLabelEl) {
+          selectedDateLabelEl.textContent = formatIsoDate(dateIso);
+        }
+        return loadStatsFor(dateIso);
+      }
+
       async function init() {
         if (!userId) {
           todayErrorEl.textContent =
@@ -451,60 +576,45 @@
         }
 
         try {
-          const [today, week, month] = await Promise.all([
-            fetchJson(`/api/stats/today?user_id=${userId}`),
+          const todayResp = await fetchJson(`/api/stats/today?user_id=${userId}`);
+          todaySummary = todayResp;
+          todayIso = todayResp.day;
+
+          await setSelectedDate(todayIso);
+
+          const [week, month] = await Promise.all([
             fetchJson(`/api/stats/history?user_id=${userId}&days=7`),
             fetchJson(`/api/stats/history?user_id=${userId}&days=30`),
           ]);
 
-          // Сохраняем данные в состояние
-          todaySummary = today;
           monthHistory = Array.isArray(month.items) ? month.items : [];
-
-          // По умолчанию — сегодня
-          setDateInputToToday();
-          buildTodayBlock(today);
           buildWeekChart(week.items || []);
           buildMonthChart(month.items || []);
 
-          // Навешиваем обработчики выбора даты
-          if (dateTodayBtn && dateInputEl) {
-            dateTodayBtn.addEventListener("click", () => {
-              setDateInputToToday();
-              if (todaySummary) {
-                todayErrorEl.textContent = "";
-                buildTodayBlock(todaySummary);
+          if (dateTodayBtn) {
+            dateTodayBtn.onclick = () => setSelectedDate(todayIso);
+          }
+
+          if (dateYesterdayBtn) {
+            dateYesterdayBtn.onclick = () => {
+              const d = new Date(todayIso);
+              d.setDate(d.getDate() - 1);
+              const iso = d.toISOString().slice(0, 10);
+              setSelectedDate(iso);
+            };
+          }
+
+          if (datePickerBtn && dateInputEl) {
+            datePickerBtn.onclick = () => {
+              if (dateInputEl.showPicker) {
+                dateInputEl.showPicker();
+              } else {
+                dateInputEl.click();
               }
-            });
-
-            dateInputEl.addEventListener("change", () => {
-              const value = dateInputEl.value;
-              if (!value || !monthHistory.length) {
-                return;
-              }
-
-              // Здесь пока просто показываем выбранную дату в заголовке и,
-              // если данных нет, сообщение об этом. Логику полного пересчёта
-              // по конкретному дню сделаем отдельным шагом.
-              const dayData = monthHistory.find((d) => d.day === value);
-
-              if (!dayData) {
-                // Нет записей за этот день — показываем пустой день
-                todayErrorEl.textContent = "За этот день ещё нет записей.";
-                // Пока оставляем метрики как у todaySummary, но дата в заголовке меняется.
-                if (todaySummary) {
-                  const clone = { ...todaySummary, date: value };
-                  buildTodayBlock(clone);
-                }
-                return;
-              }
-
-              // TODO: следующими шагами:
-              // 1) собрать daySummary из dayData (ккал, Б/Ж/У),
-              // 2) передать в buildTodayBlock(daySummary).
-              // Сейчас просто убираем ошибку и оставляем отображение "сегодня".
-              todayErrorEl.textContent = "";
-            });
+            };
+            dateInputEl.onchange = () => {
+              if (dateInputEl.value) setSelectedDate(dateInputEl.value);
+            };
           }
         } catch (err) {
           console.error(err);

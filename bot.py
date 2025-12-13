@@ -76,38 +76,49 @@ SUB_PLANS: dict[str, SubscriptionPlan] = {
     "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490),
 }
 
-SUBSCRIPTION_PLANS_STARS = {
-    "sub_1m_stars": {
+STARS_PLANS: dict[str, int] = {
+    "sub_1m": 200,
+    "sub_3m": 500,
+    "sub_6m": 850,
+    "sub_12m": 1400,
+}
+
+STARS_PLAN_META: dict[str, dict] = {
+    "sub_1m": {
+        "months": 1,
         "days": 30,
-        "stars": 200,
         "title": "Подписка Gram на 1 месяц",
         "description": "Доступ ко всем функциям бота на 30 дней.",
     },
-    "sub_3m_stars": {
+    "sub_3m": {
+        "months": 3,
         "days": 90,
-        "stars": 500,
         "title": "Подписка Gram на 3 месяца",
         "description": "3 месяца с удобным подсчётом КБЖУ и статистикой.",
     },
-    "sub_6m_stars": {
+    "sub_6m": {
+        "months": 6,
         "days": 180,
-        "stars": 850,
         "title": "Подписка Gram на полгода",
         "description": "Полгода подробной статистики и умного подсчёта.",
     },
-    "sub_12m_stars": {
+    "sub_12m": {
+        "months": 12,
         "days": 365,
-        "stars": 1400,
         "title": "Подписка Gram на год",
         "description": "Самый выгодный тариф — год подписки.",
     },
 }
 
-PLAN_ID_TO_STARS_KEY: dict[str, str] = {
-    "m1": "sub_1m_stars",
-    "m3": "sub_3m_stars",
-    "m6": "sub_6m_stars",
-    "m12": "sub_12m_stars",
+PLAN_ID_TO_STARS_PLAN: dict[str, str] = {
+    "m1": "sub_1m",
+    "m3": "sub_3m",
+    "m6": "sub_6m",
+    "m12": "sub_12m",
+}
+
+STARS_PLAN_TO_PLAN_ID: dict[str, str] = {
+    stars_key: plan_id for plan_id, stars_key in PLAN_ID_TO_STARS_PLAN.items()
 }
 
 # ── Конфиг ─────────────────────────────────────────────
@@ -183,19 +194,19 @@ def kb_settings() -> InlineKeyboardMarkup:
 def kb_premium_plans() -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     for plan_id, plan in SUB_PLANS.items():
-        star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
-        star_plan = SUBSCRIPTION_PLANS_STARS.get(star_key) if star_key else None
+        star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
+        stars_amount = STARS_PLANS.get(star_key)
         row = [
             InlineKeyboardButton(
                 f"{plan.title} • {plan.price_rub}₽",
                 callback_data=f"buy_card:{plan_id}",
             )
         ]
-        if star_plan:
+        if star_key and stars_amount:
             row.append(
                 InlineKeyboardButton(
-                    f"{plan.title} • {star_plan['stars']}⭐",
-                    callback_data=star_key,
+                    f"{plan.title} • {stars_amount}⭐",
+                    callback_data=f"sub_stars:{star_key}",
                 )
             )
         buttons.append(row)
@@ -204,17 +215,20 @@ def kb_premium_plans() -> InlineKeyboardMarkup:
 
 
 def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
-    star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
-    star_plan = SUBSCRIPTION_PLANS_STARS.get(star_key) if star_key else None
+    star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
+    stars_amount = STARS_PLANS.get(star_key)
     star_label = "⭐ Оплатить звёздами"
-    if star_plan:
-        star_label = f"⭐ Оплатить {star_plan['stars']}⭐"
+    if stars_amount:
+        star_label = f"⭐ Оплатить {stars_amount}⭐"
 
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    star_label, callback_data=star_key or f"buy_stars:{plan_id}"
+                    star_label,
+                    callback_data=(
+                        f"sub_stars:{star_key}" if star_key else "premium_menu"
+                    ),
                 )
             ],
             [
@@ -1648,12 +1662,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await on_premium_menu(update, ctx)
             return
 
-        star_plan = SUBSCRIPTION_PLANS_STARS.get(PLAN_ID_TO_STARS_KEY.get(plan_id))
-        star_price = star_plan.get("stars") if star_plan else "—"
+        star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
+        stars_amount = STARS_PLANS.get(star_key)
         plan_description = (
-            star_plan.get("description")
-            if star_plan
-            else getattr(plan, "description", f"Подписка на {plan.title}")
+            STARS_PLAN_META.get(star_key, {}).get("description")
+            or getattr(plan, "description", f"Подписка на {plan.title}")
         )
 
         # Возвращаем меню выбора способа оплаты для того же плана
@@ -1661,7 +1674,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"План: {plan.title}\n"
             f"{plan_description}\n\n"
             f"Стоимость:\n"
-            f"• Звёзды: {star_price}\n"
+            f"• Звёзды: {stars_amount if stars_amount is not None else '—'}\n"
             f"• Карта: {plan.price_rub} ₽"
         )
 
@@ -1679,12 +1692,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not await ensure_subscription(update, ctx):
         return
-
     if data == "main":
         await show_main_menu(update, ctx)
     elif data == "settings":
         await show_settings(update, ctx)
     elif data == "premium_menu":
+        await on_premium_menu(update, ctx)
+    elif data == "sub_back":
+        try:
+            if query.message:
+                await query.message.delete()
+        except Exception:
+            pass
         await on_premium_menu(update, ctx)
     elif data.startswith("buy_plan:"):
         _, plan_id = data.split(":", 1)
@@ -1699,24 +1718,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"План: {plan.title}. Выбери способ оплаты:",
             kb_payment_methods(plan_id),
         )
-    elif data in SUBSCRIPTION_PLANS_STARS:
-        plan_id = next(
-            (pid for pid, key in PLAN_ID_TO_STARS_KEY.items() if key == data), None
-        )
+    elif data.startswith("sub_stars:"):
+        plan_key = data.split(":", 1)[1]
+        plan_id = STARS_PLAN_TO_PLAN_ID.get(plan_key)
         if plan_id:
             ctx.chat_data["selected_plan_id"] = plan_id
-        await on_buy_with_stars(update, ctx)
-    elif data.startswith("buy_stars:"):
-        _, plan_id = data.split(":", 1)
-        star_key = PLAN_ID_TO_STARS_KEY.get(plan_id)
-        if star_key:
-            ctx.chat_data["selected_plan_id"] = plan_id
-            update.callback_query.data = star_key
-            await on_buy_with_stars(update, ctx)
-        else:
-            await query.edit_message_text(
-                "Не удалось найти тариф для оплаты звёздами. Попробуйте ещё раз."
-            )
+        months = STARS_PLAN_META.get(plan_key, {}).get("months", 1)
+        await send_stars_invoice(update, ctx, plan_key, months)
     elif data.startswith("buy_card:"):
         _, plan_id = data.split(":", 1)
         ctx.chat_data["selected_plan_id"] = plan_id
@@ -1785,67 +1793,55 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок 'оплатить звёздами'."""
-    query = update.callback_query
+async def send_stars_invoice(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    plan_key: str,
+    months: int,
+) -> None:
     chat_id = update.effective_chat.id
-    await query.answer()
+    stars_amount = STARS_PLANS.get(plan_key)
+    plan_meta = STARS_PLAN_META.get(plan_key, {})
 
-    data = query.data  # callback_data кнопки
-    plan_id = next((pid for pid, key in PLAN_ID_TO_STARS_KEY.items() if key == data), None)
-    if plan_id:
-        ctx.chat_data["selected_plan_id"] = plan_id
-    plan = SUBSCRIPTION_PLANS_STARS.get(data)
-
-    if not plan:
-        # На всякий случай — если callback не распознан
-        await query.edit_message_text(
-            "Не удалось определить тариф для оплаты звёздами. Попробуйте ещё раз."
-        )
-        return
-
-    title = plan["title"]
-    description = plan["description"]
-    stars_amount = int(plan["stars"])
-    days = int(plan["days"])
-
-    # Обязательно положительное количество звёзд
-    if stars_amount <= 0:
-        await query.edit_message_text(
+    if stars_amount is None or not (5 <= stars_amount <= 100_000):
+        await update.effective_chat.send_message(
             "Некорректная стоимость подписки в звёздах. Сообщите, пожалуйста, разработчику."
         )
         return
 
-    await delete_menu_message(ctx, chat_id)
+    label_months = plan_meta.get("months", months)
+    prices = [LabeledPrice(label=f"Подписка на {label_months} мес.", amount=stars_amount)]
 
-    payload = f"stars:{data}:{days}"
+    payload = f"sub_stars:{plan_key}"
+    back_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("« Назад", callback_data="sub_back")]]
+    )
+
+    await delete_menu_message(ctx, chat_id)
 
     invoice_message = await ctx.bot.send_invoice(
         chat_id=chat_id,
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token="",  # ДЛЯ Stars provider_token ДОЛЖЕН быть пустым
-        currency="XTR",  # ВАЛЮТА ДЛЯ ЗВЁЗД — XTR
-        prices=[
-            LabeledPrice(
-                label=title,
-                amount=stars_amount * 1000,  # XTR = "миллисекунды" звёзд
+        title=plan_meta.get("title", "Подписка Грамм"),
+        description=(
+            plan_meta.get(
+                "description",
+                "Доступ к голосовому и фото-анализу еды. Оплата Telegram Stars, комиссия уже включена.",
             )
-        ],
-        max_tip_amount=0,
-        is_flexible=False,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        text="🔙 Назад",
-                        callback_data="sub:invoice_back",
-                    )
-                ]
-            ]
         ),
+        payload=payload,
+        currency="XTR",
+        prices=prices,
+        max_tip_amount=0,
+        provider_token=None,
+        reply_markup=back_markup,
+        allow_paying_without_shipping_address=True,
     )
+
+    if update.callback_query:
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
 
     ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
 
@@ -1906,7 +1902,7 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     payload = query.invoice_payload or ""
-    if payload.startswith("sub:") or payload.startswith("stars:"):
+    if payload.startswith("sub:") or payload.startswith("sub_stars:"):
         await query.answer(ok=True)
     else:
         await query.answer(ok=False, error_message="Неизвестный тип оплаты.")
@@ -1948,26 +1944,23 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         new_until = now + timedelta(days=plan.months * 30)
 
-    elif payload.startswith("stars:"):
-        if len(parts) != 3:
+    elif payload.startswith("sub_stars:"):
+        if len(parts) != 2:
             await update.message.reply_text("Неизвестный тип платежа.")
             return
 
-        _, star_key, days_str = parts
-        plan = SUBSCRIPTION_PLANS_STARS.get(star_key)
-        if not plan:
+        _, plan_key = parts
+        plan_meta = STARS_PLAN_META.get(plan_key)
+        if not plan_meta:
             await update.message.reply_text(
                 "Платёж прошёл, но тариф не найден. Напиши, пожалуйста, в поддержку."
             )
             return
 
-        try:
-            days = int(days_str)
-        except ValueError:
-            days = int(plan.get("days", 0))
-
+        days = int(plan_meta.get("days", plan_meta.get("months", 0) * 30))
         if days <= 0:
-            days = int(plan["days"])
+            await update.message.reply_text("Некорректная продолжительность подписки.")
+            return
 
         await save_payment(
             db,
