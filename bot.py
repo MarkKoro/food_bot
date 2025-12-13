@@ -495,6 +495,7 @@ async def cleanup_payment_messages(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     extra_message_ids: list[int] | None = None,
+    purge_from_message_id: int | None = None,
 ) -> None:
     """Удалить все связанные с оплатой сообщения, чтобы оставить одно меню."""
 
@@ -515,6 +516,27 @@ async def cleanup_payment_messages(
             pass
 
     await delete_menu_message(ctx, chat_id)
+
+    if purge_from_message_id:
+        await purge_recent_messages(ctx, chat_id, purge_from_message_id)
+
+
+async def purge_recent_messages(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    from_message_id: int,
+    max_messages: int = 50,
+) -> None:
+    """Попробовать подчистить историю, удалив последние сообщения бота."""
+
+    end_id = max(1, from_message_id - max_messages + 1)
+    for mid in range(from_message_id, end_id - 1, -1):
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except (BadRequest, Forbidden):
+            continue
+        except Exception:
+            logger.exception("Unexpected error while purging messages", exc_info=True)
 
 
 async def delete_user_message(update: Update) -> None:
@@ -1684,7 +1706,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         await cleanup_payment_messages(
-            ctx, chat_id, [query.message.message_id if query.message else None]
+            ctx,
+            chat_id,
+            [query.message.message_id if query.message else None],
+            purge_from_message_id=query.message.message_id if query.message else None,
         )
 
         plan_id = ctx.chat_data.get("selected_plan_id")
