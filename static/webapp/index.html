@@ -131,28 +131,6 @@
         cursor: pointer;
       }
 
-      .balance-pill {
-        display: inline-flex;
-        flex-direction: column;
-        gap: 2px;
-        padding: 6px 10px;
-        border-radius: 10px;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        background: rgba(15, 23, 42, 0.95);
-        font-size: 12px;
-      }
-
-      .balance-pill__label {
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        font-size: 10px;
-        color: #9ca3af;
-      }
-
-      .balance-pill__value {
-        font-weight: 500;
-        color: #e5e7eb;
-      }
       .macro-grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -296,13 +274,6 @@
           </div>
         </div>
 
-        <div class="today-summary-row">
-          <div id="balance-pill" class="balance-pill">
-            <span class="balance-pill__label">Баланс дня</span>
-            <span class="balance-pill__value">—</span>
-          </div>
-        </div>
-
         <div id="today-summary"></div>
         <div id="today-macros"></div>
         <p class="hint" id="today-hint"></p>
@@ -338,8 +309,6 @@
       const monthErrorEl = document.getElementById("month-error");
       const todayTitleEl = document.getElementById("today-title");
       const todayCaptionEl = document.getElementById("today-date-caption");
-      const balancePill = document.getElementById("balance-pill");
-
       const btnToday = document.getElementById("btn-today");
       const btnYesterday = document.getElementById("btn-yesterday");
       const btnDate = document.getElementById("btn-date");
@@ -440,21 +409,6 @@
 
         todayTitleEl.textContent = title;
         todayCaptionEl.textContent = caption;
-
-        const balance = kcalGoal ? kcalGoal - kcal : -kcal;
-        const balanceText = balance > 0
-          ? `Можно ещё примерно ${balance.toFixed(0)} ккал`
-          : balance < 0
-            ? `Перебор примерно на ${Math.abs(balance).toFixed(0)} ккал`
-            : "Цель ровно достигнута";
-
-        if (balancePill) {
-          balancePill.querySelector(".balance-pill__value").textContent = balanceText;
-          const borderHue = getComputedStyle(document.documentElement)
-            .getPropertyValue("--ambient-hue")
-            .trim();
-          balancePill.style.borderColor = `hsla(${borderHue}, 72%, 60%, 0.8)`;
-        }
 
         todaySummaryEl.innerHTML = `
           <div class="summary-grid">
