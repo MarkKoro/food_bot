@@ -496,6 +496,7 @@ async def cleanup_payment_messages(
     chat_id: int,
     extra_message_ids: list[int] | None = None,
     purge_from_message_id: int | None = None,
+    purge_limit: int = 50,
 ) -> None:
     """Удалить все связанные с оплатой сообщения, чтобы оставить одно меню."""
 
@@ -518,7 +519,9 @@ async def cleanup_payment_messages(
     await delete_menu_message(ctx, chat_id)
 
     if purge_from_message_id:
-        await purge_recent_messages(ctx, chat_id, purge_from_message_id)
+        await purge_recent_messages(
+            ctx, chat_id, purge_from_message_id, max_messages=purge_limit
+        )
 
 
 async def purge_recent_messages(
@@ -1710,6 +1713,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id,
             [query.message.message_id if query.message else None],
             purge_from_message_id=query.message.message_id if query.message else None,
+            purge_limit=200,
         )
 
         plan_id = ctx.chat_data.get("selected_plan_id")
@@ -1758,6 +1762,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
     elif data == "premium_plans":
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if chat_id:
+            await cleanup_payment_messages(
+                ctx,
+                chat_id,
+                [query.message.message_id if query.message else None],
+                purge_from_message_id=query.message.message_id if query.message else None,
+                purge_limit=200,
+            )
         await on_premium_menu(update, ctx)
     elif data == "sub_back":
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -1917,7 +1930,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     # Сначала пытаемся отправить инвойс
     try:
-        await ctx.bot.send_invoice(
+        invoice_message = await ctx.bot.send_invoice(
             chat_id=user.id,
             title=plan.title,
             description=(
@@ -1940,6 +1953,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # Инвойс успешно создан — старое меню можно убрать
+    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
     try:
         await message.delete()
     except Exception:
@@ -2185,10 +2199,8 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Шлём единое сообщение: подтверждение + главное меню
     success_text = (
-        f"✅ Оплата прошла успешно!\n"
-        f"Ваша подписка активна до: {new_until.strftime('%d.%m.%Y')}.\n\n"
-        "Можно продолжать пользоваться ботом ❤️"
-    )
+        "Поздравляем, у вас теперь подписка!\n"
+        f"Активна до: {new_until.strftime('%d.%m.%Y')}.")
 
     await send_new_menu_message(
         ctx,
