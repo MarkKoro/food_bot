@@ -61,14 +61,42 @@
         gap: 8px;
         margin-top: 4px;
       }
+
+      .date-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .date-label {
+        font-size: 0.9rem;
+        opacity: 0.85;
+      }
+
       .pill {
-        padding: 6px 12px;
         border-radius: 999px;
-        font-size: 12px;
-        background: rgba(30, 64, 175, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        color: #e5e7eb;
+        padding: 6px 14px;
+        font-size: 0.9rem;
+        border: none;
         cursor: pointer;
+        transition: background 0.15s ease, transform 0.05s ease;
+      }
+
+      .pill-primary {
+        background: var(--accent-color, #2563eb);
+        color: #ffffff;
+        box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+      }
+
+      .pill-secondary {
+        background: #020617;
+        color: #e5e7eb;
+        border: 1px solid #374151;
+      }
+
+      .pill:hover {
+        transform: translateY(-1px);
       }
 
       .pill-small {
@@ -77,18 +105,24 @@
         background: rgba(255, 255, 255, 0.05);
       }
 
-      .pill-date {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: rgba(59, 130, 246, 0.18);
-        border: 1px solid rgba(59, 130, 246, 0.35);
-        color: #e5e7eb;
+      .pill-outline {
+        background: transparent;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        color: #e2e8f0;
       }
 
-      .pill-date-icon {
-        font-size: 13px;
-        opacity: 0.85;
+      .date-input {
+        border-radius: 999px;
+        padding: 6px 10px;
+        border: 1px solid #374151;
+        background: transparent;
+        color: #e5e7eb;
+        cursor: pointer;
+        font-size: 0.9rem;
+      }
+
+      .date-input::-webkit-calendar-picker-indicator {
+        cursor: pointer;
       }
       .macro-grid {
         display: grid;
@@ -161,23 +195,10 @@
         font-size: 20px;
       }
 
-      .today-quick-buttons {
-        display: flex;
-        gap: 8px;
-        flex-wrap: wrap;
-      }
-
-      .today-date-side {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-        justify-content: flex-end;
-      }
-
       .today-date-label {
         opacity: 0.8;
         font-size: 13px;
+        margin: 0;
       }
 
       .today-summary-row {
@@ -185,19 +206,6 @@
         gap: 8px;
         flex-wrap: wrap;
         margin-bottom: 8px;
-      }
-
-      .pill-outline {
-        background: transparent;
-        border: 1px solid rgba(148, 163, 184, 0.35);
-        color: #e2e8f0;
-      }
-
-      .hidden-date-input {
-        position: absolute;
-        left: -9999px;
-        opacity: 0;
-        pointer-events: none;
       }
 
       .ring-wrapper {
@@ -210,41 +218,6 @@
         stroke: var(--accent-color);
       }
 
-      .pill-primary {
-        background-color: var(--accent-color);
-        color: #e5e7eb;
-        border: none;
-        cursor: pointer;
-        box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
-      }
-
-      .date-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 0.75rem;
-        margin-bottom: 0.75rem;
-        flex-wrap: wrap;
-      }
-
-      .date-picker {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-      }
-
-      .date-picker input[type="date"] {
-        padding: 0.35rem 0.7rem;
-        border-radius: 999px;
-        border: 1px solid #1f2937;
-        background: #020617;
-        color: #e5e7eb;
-        font-size: 0.9rem;
-      }
-
-      .date-picker input[type="date"]::-webkit-calendar-picker-indicator {
-        cursor: pointer;
-      }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -259,19 +232,14 @@
         <div class="today-header-row">
           <div class="today-title-side">
             <h2>Сегодня</h2>
-            <div class="today-quick-buttons">
-              <button class="pill pill-small" data-day="today" id="btn-today">Сегодня</button>
-              <button class="pill pill-small" data-day="yesterday" id="btn-yesterday">Вчера</button>
-            </div>
-          </div>
+            <p class="today-date-label">Данные за <span id="selected-date-label">—</span></p>
+            <div class="date-controls">
+              <button id="btn-today" class="pill pill-primary">Сегодня</button>
+              <button id="btn-yesterday" class="pill pill-secondary">Вчера</button>
 
-          <div class="today-date-side">
-            <span class="today-date-label">Данные за</span>
-            <button class="pill pill-date" id="btn-date-picker">
-              <span id="selected-date-label">—</span>
-              <span class="pill-date-icon">📅</span>
-            </button>
-            <input type="date" id="date-input" class="hidden-date-input" />
+              <span class="date-label">или выбрать дату:</span>
+              <input id="date-picker" type="date" class="date-input" />
+            </div>
           </div>
         </div>
 
@@ -311,10 +279,9 @@
       const monthErrorEl = document.getElementById("month-error");
 
       const selectedDateLabelEl = document.getElementById("selected-date-label");
-      const dateInputEl = document.getElementById("date-input");
-      const dateTodayBtn = document.getElementById("btn-today");
-      const dateYesterdayBtn = document.getElementById("btn-yesterday");
-      const datePickerBtn = document.getElementById("btn-date-picker");
+      const btnToday = document.getElementById("btn-today");
+      const btnYesterday = document.getElementById("btn-yesterday");
+      const dateInput = document.getElementById("date-picker");
 
       const tg = window.Telegram && window.Telegram.WebApp
         ? window.Telegram.WebApp
@@ -340,10 +307,8 @@
       let monthChart = null;
       let todayRing = null;
 
-      let todaySummary = null;
-      let monthHistory = [];
+      let currentMode = "today";
       let currentDate = null;
-      let todayIso = null;
 
       function fmt(value, digits = 0) {
         return Number(value || 0).toFixed(digits);
@@ -359,6 +324,10 @@
       function formatIsoDate(dateIso) {
         if (!dateIso) return "—";
         return dateIso.split("-").reverse().join(".");
+      }
+
+      function formatDate(d) {
+        return d.toISOString().slice(0, 10);
       }
 
       function updateThemeByProgress(percent) {
@@ -381,12 +350,24 @@
           `radial-gradient(circle at 0 0, ${accent}22 0, #020617 45%, #020617 100%)`;
       }
 
-      function buildTodaySummary(today) {
-        const totals = today.totals || {};
-        const goal = today.goal || {};
+      function updateAmbientByFill(percent) {
+        updateThemeByProgress(percent);
+      }
+
+      function renderTodayBlock(stats) {
+        const totals = stats.totals || {};
+        const goal = stats.goal || {};
         const kcal = totals.kcal ?? 0;
         const kcalGoal = goal.kcal ?? 0;
-        const kcalPercent = today.percent?.kcal ?? 0;
+        const kcalPercent = stats.percent?.kcal ?? 0;
+        const dayIso = stats.day || currentDate;
+
+        if (dayIso) {
+          currentDate = dayIso;
+          if (selectedDateLabelEl) {
+            selectedDateLabelEl.textContent = formatIsoDate(dayIso);
+          }
+        }
 
         todaySummaryEl.innerHTML = `
           <div class="today-summary-row">
@@ -413,7 +394,7 @@
           </div>
         `;
 
-        updateThemeByProgress(kcalPercent);
+        updateAmbientByFill(kcalPercent);
 
         const todayRingEl = document.getElementById("today-ring");
         if (todayRing) {
@@ -543,28 +524,59 @@
         return res.json();
       }
 
-      async function loadStatsFor(dateIso) {
-        const params = new URLSearchParams(window.location.search);
-        const userIdFromQuery = params.get("user_id") || userId;
+      async function loadDayStats(mode, explicitDate) {
+        currentMode = mode;
 
-        const resp = await fetch(
-          `/api/stats/day?user_id=${userIdFromQuery}&date=${dateIso}`
-        );
-        if (!resp.ok) throw new Error("Не удалось загрузить данные за день");
-        const dayStats = await resp.json();
+        let url;
+        const userIdParam = userId;
 
-        todayErrorEl.textContent = "";
-        buildTodaySummary(dayStats);
-        return dayStats;
-      }
-
-      function setSelectedDate(dateIso) {
-        currentDate = dateIso;
-        if (selectedDateLabelEl) {
-          selectedDateLabelEl.textContent = formatIsoDate(dateIso);
+        if (!userIdParam) {
+          todayErrorEl.textContent = "Не передан user_id.";
+          throw new Error("user_id is required");
         }
-        return loadStatsFor(dateIso);
+
+        if (mode === "today") {
+          url = `/api/stats/today?user_id=${userIdParam}`;
+          currentDate = formatDate(new Date());
+        } else {
+          let dateStr = explicitDate;
+          if (!dateStr) {
+            const base = new Date();
+            if (mode === "yesterday") {
+              base.setDate(base.getDate() - 1);
+            }
+            dateStr = formatDate(base);
+          }
+          currentDate = dateStr;
+          url = `/api/stats/day?user_id=${userIdParam}&date=${encodeURIComponent(
+            dateStr
+          )}`;
+        }
+
+        if (dateInput && currentDate) {
+          dateInput.value = currentDate;
+        }
+
+        try {
+          const stats = await fetchJson(url);
+          todayErrorEl.textContent = "";
+          renderTodayBlock(stats);
+
+          return stats;
+        } catch (err) {
+          console.error(err);
+          todayErrorEl.textContent = "Ошибка загрузки данных.";
+          throw err;
+        }
       }
+
+      btnToday?.addEventListener("click", () => loadDayStats("today"));
+      btnYesterday?.addEventListener("click", () => loadDayStats("yesterday"));
+
+      dateInput?.addEventListener("change", (e) => {
+        if (!e.target.value) return;
+        loadDayStats("custom", e.target.value);
+      });
 
       async function init() {
         if (!userId) {
@@ -576,46 +588,15 @@
         }
 
         try {
-          const todayResp = await fetchJson(`/api/stats/today?user_id=${userId}`);
-          todaySummary = todayResp;
-          todayIso = todayResp.day;
-
-          await setSelectedDate(todayIso);
+          await loadDayStats("today");
 
           const [week, month] = await Promise.all([
             fetchJson(`/api/stats/history?user_id=${userId}&days=7`),
             fetchJson(`/api/stats/history?user_id=${userId}&days=30`),
           ]);
 
-          monthHistory = Array.isArray(month.items) ? month.items : [];
           buildWeekChart(week.items || []);
           buildMonthChart(month.items || []);
-
-          if (dateTodayBtn) {
-            dateTodayBtn.onclick = () => setSelectedDate(todayIso);
-          }
-
-          if (dateYesterdayBtn) {
-            dateYesterdayBtn.onclick = () => {
-              const d = new Date(todayIso);
-              d.setDate(d.getDate() - 1);
-              const iso = d.toISOString().slice(0, 10);
-              setSelectedDate(iso);
-            };
-          }
-
-          if (datePickerBtn && dateInputEl) {
-            datePickerBtn.onclick = () => {
-              if (dateInputEl.showPicker) {
-                dateInputEl.showPicker();
-              } else {
-                dateInputEl.click();
-              }
-            };
-            dateInputEl.onchange = () => {
-              if (dateInputEl.value) setSelectedDate(dateInputEl.value);
-            };
-          }
         } catch (err) {
           console.error(err);
           todayErrorEl.textContent = "Ошибка загрузки данных.";

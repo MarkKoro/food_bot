@@ -67,13 +67,18 @@ class SubscriptionPlan:
     title: str  # '1 месяц', '3 месяца', ...
     months: int
     price_rub: int  # в рублях, целое число
+    price_stars: int  # в звёздах
+
+    @property
+    def key(self) -> str:
+        return self.id
 
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349),
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899),
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490),
-    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490),
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349, 200),
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899, 500),
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490, 850),
+    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490, 1400),
 }
 
 STARS_PLANS: dict[str, int] = {
@@ -124,6 +129,8 @@ STARS_PLAN_TO_PLAN_ID: dict[str, str] = {
 # ── Конфиг ─────────────────────────────────────────────
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -195,7 +202,7 @@ def kb_premium_plans() -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     for plan_id, plan in SUB_PLANS.items():
         star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
-        stars_amount = STARS_PLANS.get(star_key)
+        stars_amount = plan.price_stars
         row = [
             InlineKeyboardButton(
                 f"{plan.title} • {plan.price_rub}₽",
@@ -206,7 +213,7 @@ def kb_premium_plans() -> InlineKeyboardMarkup:
             row.append(
                 InlineKeyboardButton(
                     f"{plan.title} • {stars_amount}⭐",
-                    callback_data=f"sub_stars:{star_key}",
+                    callback_data=f"buy_stars:{plan_id}",
                 )
             )
         buttons.append(row)
@@ -216,7 +223,8 @@ def kb_premium_plans() -> InlineKeyboardMarkup:
 
 def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
     star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
-    stars_amount = STARS_PLANS.get(star_key)
+    plan = SUB_PLANS.get(plan_id)
+    stars_amount = plan.price_stars if plan else None
     star_label = "⭐ Оплатить звёздами"
     if stars_amount:
         star_label = f"⭐ Оплатить {stars_amount}⭐"
@@ -226,9 +234,7 @@ def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     star_label,
-                    callback_data=(
-                        f"sub_stars:{star_key}" if star_key else "premium_menu"
-                    ),
+                    callback_data=(f"buy_stars:{plan_id}" if star_key else "premium_menu"),
                 )
             ],
             [
@@ -1698,6 +1704,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_settings(update, ctx)
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
+    elif data == "premium_plans":
+        await on_premium_menu(update, ctx)
     elif data == "sub_back":
         try:
             if query.message:
@@ -1718,6 +1726,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"План: {plan.title}. Выбери способ оплаты:",
             kb_payment_methods(plan_id),
         )
+    elif data.startswith("buy_stars:"):
+        await on_buy_with_stars(update, ctx)
     elif data.startswith("sub_stars:"):
         plan_key = data.split(":", 1)[1]
         plan_id = STARS_PLAN_TO_PLAN_ID.get(plan_key)
@@ -1791,6 +1801,97 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Выберите способ оплаты:",
         kb_premium_plans(),
     )
+
+
+async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Оплата подписки Telegram Stars.
+    Ожидает callback_data вида: 'buy_stars:<plan_key>'.
+    """
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    user = update.effective_user
+    message = query.message
+    if not user or not message:
+        return
+
+    # Разбираем план
+    data = query.data or ""
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        await query.edit_message_text("Не удалось определить тариф. Попробуйте ещё раз.")
+        return
+
+    plan_key = parts[1]
+    plan = SUB_PLANS.get(plan_key)
+    if not plan:
+        await query.edit_message_text("Тариф не найден. Попробуйте выбрать другой.")
+        return
+
+    # Stars: 1 звезда = amount 1. Без умножений.
+    stars_amount = max(1, int(plan.price_stars))
+
+    prices = [
+        LabeledPrice(
+            label=f"{plan.title} — {plan.price_stars}⭐",
+            amount=stars_amount,
+        )
+    ]
+
+    # Полезно иметь payload с инфой о плане и пользователе
+    payload = json.dumps(
+        {
+            "type": "subscription",
+            "plan_key": plan.key,
+            "months": plan.months,
+            "user_id": user.id,
+        }
+    )
+
+    # Клавиатура инвойса:
+    # 1) Кнопка оплаты в звёздах
+    # 2) "Назад" — возвращает к списку тарифов
+    invoice_keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Оплатить подписку ⭐", pay=True)],
+            [InlineKeyboardButton("← Назад", callback_data="premium_plans")],
+        ]
+    )
+
+    # Сначала пытаемся отправить инвойс
+    try:
+        await ctx.bot.send_invoice(
+            chat_id=user.id,
+            title=plan.title,
+            description=(
+                f"Подписка «{plan.title}» на {plan.months} мес.\n\n"
+                "Оплата произойдёт в Telegram Stars."
+            ),
+            payload=payload,
+            currency="XTR",
+            prices=prices,
+            provider_token="",  # для Stars так и нужно — пустая строка
+            reply_markup=invoice_keyboard,
+        )
+    except BadRequest as e:
+        # Если что-то пошло не так, хотя бы не оставляем пользователя без сообщения
+        logger.exception("Ошибка при отправке инвойса в Stars: %s", e)
+        await query.edit_message_text(
+            "Не удалось создать счёт в звёздах.\n"
+            "Попробуйте ещё раз или выберите оплату картой."
+        )
+        return
+
+    # Инвойс успешно создан — старое меню можно убрать
+    try:
+        await message.delete()
+    except Exception:
+        # Не критично, если не удалилось
+        pass
 
 
 async def send_stars_invoice(
@@ -1901,7 +2002,19 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.pre_checkout_query
     payload = query.invoice_payload or ""
+    allow = False
+
     if payload.startswith("sub:") or payload.startswith("sub_stars:"):
+        allow = True
+    else:
+        try:
+            payload_data = json.loads(payload)
+            if isinstance(payload_data, dict) and payload_data.get("type") == "subscription":
+                allow = True
+        except json.JSONDecodeError:
+            allow = False
+
+    if allow:
         await query.answer(ok=True)
     else:
         await query.answer(ok=False, error_message="Неизвестный тип оплаты.")
@@ -1918,6 +2031,11 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.utcnow()
 
     parts = payload.split(":", 2)
+    payload_data = None
+    try:
+        payload_data = json.loads(payload)
+    except json.JSONDecodeError:
+        payload_data = None
 
     if payload.startswith("sub:"):
         if len(parts) != 3:
@@ -1971,6 +2089,27 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         new_until = now + timedelta(days=days)
+
+    elif isinstance(payload_data, dict) and payload_data.get("type") == "subscription":
+        plan_key = payload_data.get("plan_key")
+        plan = SUB_PLANS.get(plan_key)
+        if not plan:
+            await update.message.reply_text(
+                "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
+            )
+            return
+
+        months = int(payload_data.get("months") or plan.months)
+        await save_payment(
+            db,
+            telegram_id=user_id,
+            provider="stars",
+            amount=sp.total_amount,
+            currency=sp.currency,
+            payload=payload,
+        )
+
+        new_until = now + timedelta(days=months * 30)
 
     else:
         await update.message.reply_text("Неизвестный тип платежа.")
