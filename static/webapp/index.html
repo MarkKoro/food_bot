@@ -10,8 +10,8 @@
       }
       :root {
         --accent-color: #2563eb; /* базовый синий */
-        --ambient-hue: 215; /* базовый оттенок (синий) */
-        --ambient-intensity: 0.18;
+        --amb-h: 215; /* hue */
+        --amb-a: 0.00; /* alpha */
       }
 
       body {
@@ -19,18 +19,10 @@
         padding: 0;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         background:
-          radial-gradient(
-            circle at 0 0,
-            rgba(15, 23, 42, 1) 0,
-            rgba(15, 23, 42, 1) 30%,
-            rgba(15, 23, 42, 0.9) 60%,
-            rgba(15, 23, 42, 1) 100%
-          ),
-          radial-gradient(
-            circle at 50% -20%,
-            hsla(var(--ambient-hue), 75%, 45%, var(--ambient-intensity)),
-            #020617 70%
-          );
+          radial-gradient(1200px 700px at 50% 0%,
+            hsla(var(--amb-h), 85%, 55%, var(--amb-a)) 0%,
+            rgba(0,0,0,0) 65%),
+          #0b0f18;
         color: #f5f5f5;
         transition: background 0.35s ease;
       }
@@ -123,16 +115,6 @@
       .date-picker-wrapper {
         position: relative;
         display: inline-flex;
-      }
-
-      .date-input-hidden {
-        position: absolute;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        opacity: 0;
-        cursor: pointer;
-        z-index: 2;
       }
 
       .macro-grid {
@@ -245,6 +227,23 @@
         stroke: var(--accent-color);
       }
 
+      /* кликабельность */
+      .pill, .date-pill { cursor: pointer; }
+
+      /* активный режим (Сегодня/Вчера/Дата) */
+      .pill.is-active,
+      .date-pill.is-active{
+        outline: 1px solid rgba(255,255,255,0.18);
+        box-shadow: 0 0 0 2px rgba(255,255,255,0.06) inset;
+      }
+
+      /* hover для ПК (чтобы было очевидно, что нажимается) */
+      @media (hover:hover){
+        .pill:hover, .date-pill:hover{
+          outline: 1px solid rgba(255,255,255,0.22);
+        }
+      }
+
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -263,18 +262,21 @@
               <span class="today-date-caption" id="today-date-caption"></span>
             </div>
             <div class="day-switch">
-              <button id="btn-today" class="pill pill-primary">Сегодня</button>
-              <button id="btn-yesterday" class="pill pill-secondary">Вчера</button>
+              <button id="btnToday" class="pill pill-primary">Сегодня</button>
+              <button id="btnYesterday" class="pill pill-secondary">Вчера</button>
             </div>
           </div>
 
           <div class="today-date-picker">
             <span class="muted">или выбрать дату:</span>
             <div class="date-picker-wrapper">
-              <button id="btn-date" class="pill pill-secondary pill-muted" type="button">
-                <span id="selected-date-label">Выбрать</span>
-              </button>
-              <input type="date" id="date-input" class="date-input-hidden" />
+              <div id="datePill" class="pill pill-secondary pill-muted date-pill">Выбрать</div>
+
+              <input
+                id="dateInput"
+                type="date"
+                style="position:absolute; left:-9999px; opacity:0; width:1px; height:1px;"
+              />
             </div>
           </div>
         </div>
@@ -314,18 +316,18 @@
       const monthErrorEl = document.getElementById("month-error");
       const todayTitleEl = document.getElementById("today-title");
       const todayCaptionEl = document.getElementById("today-date-caption");
-      const btnToday = document.getElementById("btn-today");
-      const btnYesterday = document.getElementById("btn-yesterday");
-      const btnDate = document.getElementById("btn-date");
-      const dateInput = document.getElementById("date-input");
-      const selectedDateLabel = document.getElementById("selected-date-label");
+      const btnToday = document.getElementById("btnToday");
+      const btnYesterday = document.getElementById("btnYesterday");
+      const datePill = document.getElementById("datePill");
+      const dateInput = document.getElementById("dateInput");
 
       let weekChart = null;
       let monthChart = null;
       let todayRing = null;
 
-      let currentMode = "today"; // "today" | "yesterday" | "date"
-      let currentDateIso = null; // YYYY-MM-DD
+      let activeMode = "today"; // "today" | "yesterday" | "date"
+      let selectedISO = null;
+      let lastLoadedDateIso = null;
 
       if (tg && tg.ready) {
         try {
@@ -335,19 +337,64 @@
         }
       }
 
+      // --- режимы ---
       function setActiveMode(mode) {
-        currentMode = mode;
+        activeMode = mode;
 
-        btnToday.classList.toggle("pill-primary", mode === "today");
-        btnToday.classList.toggle("pill-secondary", mode !== "today");
+        if (btnToday) {
+          btnToday.classList.toggle("pill-primary", mode === "today");
+          btnToday.classList.toggle("pill-secondary", mode !== "today");
+          btnToday.classList.toggle("is-active", mode === "today");
+        }
 
-        btnYesterday.classList.toggle("pill-primary", mode === "yesterday");
-        btnYesterday.classList.toggle("pill-secondary", mode !== "yesterday");
+        if (btnYesterday) {
+          btnYesterday.classList.toggle("pill-primary", mode === "yesterday");
+          btnYesterday.classList.toggle("pill-secondary", mode !== "yesterday");
+          btnYesterday.classList.toggle("is-active", mode === "yesterday");
+        }
 
-        btnDate.classList.toggle("pill-primary", mode === "date");
-        btnDate.classList.toggle("pill-secondary", mode !== "date");
-        btnDate.classList.toggle("pill-muted", mode !== "date");
+        if (datePill) {
+          datePill.classList.toggle("pill-primary", mode === "date");
+          datePill.classList.toggle("pill-secondary", mode !== "date");
+          datePill.classList.toggle("pill-muted", mode !== "date");
+          datePill.classList.toggle("is-active", mode === "date");
+        }
       }
+
+      // --- открытие календаря (ПК/телефон) ---
+      function openDatePicker() {
+        const inp = document.getElementById("dateInput");
+        if (!inp) return;
+
+        try {
+          if (typeof inp.showPicker === "function") {
+            inp.showPicker();
+            return;
+          }
+        } catch (e) {}
+
+        inp.focus({ preventScroll: true });
+        inp.click();
+      }
+
+      (function initDateUi() {
+        const datePill = document.getElementById("datePill");
+        const inp = document.getElementById("dateInput");
+        if (!datePill || !inp) return;
+
+        datePill.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openDatePicker();
+        });
+
+        inp.addEventListener("change", () => {
+          if (!inp.value) return; // YYYY-MM-DD
+          selectedISO = inp.value;
+          setActiveMode("date");
+          if (typeof loadDay === "function") loadDay("date", selectedISO);
+        });
+      })();
 
       function isoToday() {
         const d = new Date();
@@ -375,22 +422,34 @@
         return `${d}.${m}`;
       }
 
-      function updateAmbient(kcalPercent) {
-        const clamped = Math.max(0, Math.min(100, Math.round(kcalPercent || 0)));
-        const band = Math.round(clamped / 10) * 10;
+      function clamp(v, min, max) {
+        return Math.max(min, Math.min(max, v));
+      }
 
+      function lerp(a, b, t) {
+        return a + (b - a) * t;
+      }
+
+      /**
+       * percent: 0..100 (можно и больше, мы зажмём)
+       * 0%   -> холодный (синий)
+       * 50%  -> тёплый (желтоватый)
+       * 100% -> зелёный
+       */
+      function applyAmbientByPercent(percent) {
+        const p = clamp(Number(percent) || 0, 0, 100);
+        const t = p / 100;
+
+        // hue: 215 -> 50 -> 120
         let hue;
-        if (band <= 50) {
-          hue = 215 - (170 * band) / 50;
-        } else {
-          hue = 45 + (85 * (band - 50)) / 50;
-        }
+        if (t <= 0.5) hue = lerp(215, 50, t / 0.5);
+        else hue = lerp(50, 120, (t - 0.5) / 0.5);
 
-        document.documentElement.style.setProperty("--ambient-hue", hue.toString());
-        document.documentElement.style.setProperty(
-          "--ambient-intensity",
-          (0.15 + band * 0.002).toFixed(3)
-        );
+        // alpha: чтобы даже 1% давал еле заметный оттенок
+        const alpha = 0.03 + 0.20 * t; // 0.03..0.23
+
+        document.documentElement.style.setProperty("--amb-h", hue.toFixed(1));
+        document.documentElement.style.setProperty("--amb-a", alpha.toFixed(3));
       }
 
       async function fetchJson(url) {
@@ -402,15 +461,15 @@
       }
 
       function renderToday(day, title, caption) {
-        const totals = day.totals || {};
-        const goal = day.goal || {};
-        const percent = day.percent || {};
+        const totals = day?.totals || {};
+        const goal = day?.goal || day?.goals || {};
+        const percent = day?.percent || {};
 
         const kcal = totals.kcal ?? 0;
         const kcalGoal = goal.kcal ?? 0;
-        const kcalPercent = Math.round(percent.kcal ?? 0);
+        const kcalPercent = kcalGoal > 0 ? (kcal / kcalGoal) * 100 : (percent.kcal ?? 0);
 
-        updateAmbient(kcalPercent);
+        applyAmbientByPercent(kcalPercent);
 
         todayTitleEl.textContent = title;
         todayCaptionEl.textContent = caption;
@@ -514,14 +573,19 @@
           title = "Вчера";
           caption = `Данные за ${formatHuman(effectiveDate)}`;
         } else {
-          effectiveDate = dateIso || isoToday();
+          effectiveDate = dateIso || selectedISO || isoToday();
           url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
           title = formatHuman(effectiveDate);
           caption = `Данные за ${formatHuman(effectiveDate)}`;
         }
 
-        currentDateIso = effectiveDate;
-        selectedDateLabel.textContent = formatHuman(effectiveDate);
+        if (mode === "date") {
+          selectedISO = effectiveDate;
+        }
+        lastLoadedDateIso = effectiveDate;
+        if (datePill) {
+          datePill.textContent = formatHuman(effectiveDate);
+        }
         if (dateInput) {
           dateInput.value = effectiveDate;
         }
@@ -638,48 +702,6 @@
       btnYesterday?.addEventListener("click", () => {
         setActiveMode("yesterday");
         loadDay("yesterday");
-      });
-
-      btnDate?.addEventListener("click", () => {
-        if (!dateInput) return;
-
-        // Нормальный путь: нативный date-picker
-        if (typeof dateInput.showPicker === "function") {
-          dateInput.showPicker();
-          dateInput.focus();
-          return;
-        }
-
-        // Fallback для окружений без showPicker (часть десктопных Telegram WebView)
-        dateInput.focus();
-
-        const currentIso = currentDateIso || isoToday();
-        const currentHuman = formatHuman(currentIso);
-
-        const raw = prompt("Введите дату в формате ДД.ММ.ГГГГ", currentHuman);
-        if (!raw) return;
-
-        const match = raw.trim().match(/^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})$/);
-        if (!match) {
-          alert("Не понял дату. Пример: 15.12.2025");
-          return;
-        }
-
-        const [, d, m, y] = match;
-        const iso = `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
-        dateInput.value = iso;
-        setActiveMode("date");
-        loadDay("date", iso);
-      });
-
-      selectedDateLabel?.addEventListener("click", () => {
-        btnDate?.click();
-      });
-
-      dateInput?.addEventListener("change", () => {
-        if (!dateInput.value) return;
-        setActiveMode("date");
-        loadDay("date", dateInput.value);
       });
 
       (async function init() {
