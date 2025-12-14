@@ -74,18 +74,18 @@ class SubscriptionPlan:
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
     "w1": SubscriptionPlan("w1", "Одна неделя", 0, 125, 70),  # 125₽ ≈ 70⭐
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 299, 170),
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 799, 450),
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1399, 790),
-    "y1": SubscriptionPlan("y1", "1 год", 12, 2399, 1350),
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 399, 220),  # 399₽ ≈ 220⭐
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 1000, 560),  # 1000₽ ≈ 560⭐
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1800, 1010),  # 1800₽ ≈ 1010⭐
+    "y1": SubscriptionPlan("y1", "1 год", 12, 3500, 1960),  # 3500₽ ≈ 1960⭐
 }
 
 STARS_PLANS: dict[str, int] = {
     "sub_1w": 70,
-    "sub_1m": 170,
-    "sub_3m": 450,
-    "sub_6m": 790,
-    "sub_1y": 1350,
+    "sub_1m": 220,
+    "sub_3m": 560,
+    "sub_6m": 1010,
+    "sub_1y": 1960,
 }
 
 STARS_PLAN_META: dict[str, dict] = {
@@ -140,6 +140,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")      # на будущее: текст/голос
 AUDIO_TRANSCRIBE_MODEL = os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+VISION_DETAIL = os.getenv("VISION_DETAIL", "low").lower()  # low | high | auto (если у тебя поддержано)
+VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1280"))  # макс сторона после ресайза
+VISION_JPEG_QUALITY = int(os.getenv("VISION_JPEG_QUALITY", "82"))
+VISION_COMPRESS_THRESHOLD = int(os.getenv("VISION_COMPRESS_THRESHOLD", "1500000"))  # bytes; 0 = всегда
 
 ADMINS = {
     int(x)
@@ -686,6 +690,55 @@ async def on_check_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
 # ── GPT-Vision ───────────────────────────────────────
 
+def _guess_image_mime(b: bytes) -> str:
+    if len(b) >= 3 and b[:3] == b"\xFF\xD8\xFF":
+        return "image/jpeg"
+    if len(b) >= 8 and b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(b) >= 6 and b[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def compress_image_for_vision(image_bytes: bytes) -> bytes:
+    """
+    Аккуратно сжимаем/уменьшаем картинку, чтобы:
+    - меньше трафика/токенов
+    - качество распознавания еды не ушло в ад
+    Если Pillow нет — просто возвращаем оригинал (ничего не ломаем).
+    """
+    if VISION_COMPRESS_THRESHOLD > 0 and len(image_bytes) < VISION_COMPRESS_THRESHOLD:
+        return image_bytes
+
+    try:
+        from PIL import Image, ImageOps  # pillow
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)  # правильная ориентация
+        img = img.convert("RGB")
+
+        w, h = img.size
+        m = max(w, h)
+        if m > VISION_MAX_SIDE:
+            scale = VISION_MAX_SIDE / float(m)
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            img = img.resize((nw, nh), Image.LANCZOS)
+
+        out = io.BytesIO()
+        img.save(
+            out,
+            format="JPEG",
+            quality=VISION_JPEG_QUALITY,
+            optimize=True,
+            progressive=True,
+        )
+        return out.getvalue()
+    except Exception:
+        return image_bytes
+
+
 def _truncate_description(text: str, max_sentences: int = 5, max_chars: int = 600) -> str:
     text = text.strip()
     if not text:
@@ -709,6 +762,8 @@ def _truncate_description(text: str, max_sentences: int = 5, max_chars: int = 60
 
 
 async def analyze_food_photo(image_bytes: bytes, extra_description: str | None = None) -> dict:
+    image_bytes = compress_image_for_vision(image_bytes)
+    mime = _guess_image_mime(image_bytes)
     b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     user_text = FOOD_USER_INSTRUCTIONS
@@ -731,7 +786,13 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
             "role": "user",
             "content": [
                 {"type": "text", "text": user_text},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64}",
+                        "detail": VISION_DETAIL,
+                    },
+                },
             ],
         },
     ]
