@@ -24,7 +24,10 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             credits     INTEGER DEFAULT 0,
             is_premium  INTEGER DEFAULT 0,
             premium_until TEXT,
-            last_menu_message_id INTEGER
+            last_menu_message_id INTEGER,
+            trial_until TEXT,
+            trial_used_count INTEGER DEFAULT 0,
+            paid_trial_used INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS meals (
@@ -96,6 +99,17 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             "ALTER TABLE users ADD COLUMN last_menu_message_id INTEGER"
         )
         await db.commit()
+    if "trial_until" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN trial_until TEXT")
+        await db.commit()
+
+    if "trial_used_count" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN trial_used_count INTEGER DEFAULT 0")
+        await db.commit()
+
+    if "paid_trial_used" not in cols:
+        await db.execute("ALTER TABLE users ADD COLUMN paid_trial_used INTEGER DEFAULT 0")
+        await db.commit()
 
 
 # ── Пользователи / кредиты ─────────────────────────────
@@ -105,6 +119,16 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> None:
         "INSERT OR IGNORE INTO users (telegram_id) VALUES (?)",
         (telegram_id,),
     )
+
+    # Бесплатные 24 часа — один раз на пользователя.
+    # Если trial_until уже есть — повторно не выдаём (защита от /start-абуза).
+    trial_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+    await db.execute(
+        "UPDATE users SET trial_until = ?, trial_used_count = 0 "
+        "WHERE telegram_id = ? AND trial_until IS NULL",
+        (trial_until, telegram_id),
+    )
+
     await db.commit()
 
 
@@ -151,6 +175,62 @@ async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
     except Exception:
         return False
     return dt >= datetime.utcnow()
+
+
+async def get_trial_info(
+    db: aiosqlite.Connection, user_id: int
+) -> tuple[datetime | None, int, bool]:
+    async with db.execute(
+        "SELECT trial_until, trial_used_count, paid_trial_used "
+        "FROM users WHERE telegram_id = ?",
+        (user_id,),
+    ) as cur:
+        row = await cur.fetchone()
+
+    if not row:
+        return None, 0, False
+
+    trial_until_raw, used_count, paid_trial_used = row
+    trial_until = None
+    if trial_until_raw:
+        try:
+            trial_until = datetime.fromisoformat(trial_until_raw)
+        except Exception:
+            trial_until = None
+
+    return trial_until, int(used_count or 0), bool(paid_trial_used)
+
+
+async def consume_trial_request(
+    db: aiosqlite.Connection, user_id: int, *, limit: int = 6
+) -> bool:
+    # Атомарно увеличиваем счётчик, только если:
+    # - trial ещё не истёк
+    # - лимит не превышен
+    # - нет премиума
+    now_iso = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        """
+        UPDATE users
+           SET trial_used_count = trial_used_count + 1
+         WHERE telegram_id = ?
+           AND is_premium = 0
+           AND trial_until IS NOT NULL
+           AND trial_until > ?
+           AND trial_used_count < ?
+        """,
+        (user_id, now_iso, limit),
+    )
+    await db.commit()
+    return (cur.rowcount or 0) > 0
+
+
+async def mark_paid_trial_used(db: aiosqlite.Connection, user_id: int) -> None:
+    await db.execute(
+        "UPDATE users SET paid_trial_used = 1 WHERE telegram_id = ?",
+        (user_id,),
+    )
+    await db.commit()
 
 
 async def get_credits(db: aiosqlite.Connection, telegram_id: int) -> int:
