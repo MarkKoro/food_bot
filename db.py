@@ -268,6 +268,77 @@ async def dec_credits(db: aiosqlite.Connection, telegram_id: int, qty: int) -> b
     return cur.rowcount > 0
 
 
+# ── Pay-as-you-go: режим оплаты ─────────────────────────
+
+
+async def get_payment_mode(db: aiosqlite.Connection, user_id: int) -> str:
+    await ensure_user(db, user_id)
+    async with db.execute(
+        "SELECT payment_mode FROM users WHERE telegram_id = ?",
+        (user_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    mode = (row[0] if row else None) or "sub"
+    return mode
+
+
+async def set_payment_mode(db: aiosqlite.Connection, user_id: int, mode: str) -> None:
+    if mode not in ("sub", "payg"):
+        mode = "sub"
+    await ensure_user(db, user_id)
+    await db.execute(
+        "UPDATE users SET payment_mode = ? WHERE telegram_id = ?",
+        (mode, user_id),
+    )
+    await db.commit()
+
+
+async def add_payg_balance(db: aiosqlite.Connection, user_id: int, amount: int) -> None:
+    """
+    amount — целое число "кредитов" (как ты решишь: рубли/запросы).
+    Пока используем users.credits как баланс payg.
+    """
+    await add_credits(db, user_id, amount)
+
+
+async def charge_payg_balance(db: aiosqlite.Connection, user_id: int, amount: int) -> bool:
+    """
+    Списать amount с users.credits (баланс payg). Возвращает True если успешно.
+    """
+    return await dec_credits(db, user_id, amount)
+
+
+async def get_payg_balance(db: aiosqlite.Connection, user_id: int) -> int:
+    return await get_credits(db, user_id)
+
+
+# ── Requests логирование ────────────────────────────────
+
+
+async def log_request(db: aiosqlite.Connection, user_id: int, kind: str) -> None:
+    await ensure_user(db, user_id)
+    await db.execute(
+        "INSERT INTO requests (user_id, kind) VALUES (?, ?)",
+        (user_id, kind),
+    )
+    await db.commit()
+
+
+async def get_today_requests_count(db: aiosqlite.Connection, user_id: int) -> int:
+    await ensure_user(db, user_id)
+    async with db.execute(
+        """
+        SELECT COUNT(*)
+          FROM requests
+         WHERE user_id = ?
+           AND date(created_at) = date('now','localtime')
+        """,
+        (user_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0] or 0)
+
+
 # ── Приёмы пищи и цели ────────────────────────────────
 
 async def add_meal(
