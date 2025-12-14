@@ -55,7 +55,11 @@ from db import (
     get_last_menu_message_id,
     set_last_menu_message_id,
     set_premium_until,
+    get_premium_until,
     is_premium_user,
+    get_trial_info,
+    consume_trial_request,
+    mark_paid_trial_used,
 )
 
 # ── Модель тарифов ─────────────────────────────────────
@@ -75,56 +79,61 @@ class SubscriptionPlan:
 
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 349, 200),
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 899, 500),
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1490, 850),
-    "m12": SubscriptionPlan("m12", "12 месяцев", 12, 2490, 1400),
+    "w1": SubscriptionPlan("w1", "Одна неделя", 0, 125, 70),  # 125₽ ≈ 70⭐
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 299, 170),
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 799, 450),
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1399, 790),
+    "y1": SubscriptionPlan("y1", "1 год", 12, 2399, 1350),
 }
 
 STARS_PLANS: dict[str, int] = {
-    "sub_1m": 200,
-    "sub_3m": 500,
-    "sub_6m": 850,
-    "sub_12m": 1400,
+    "sub_1w": 70,
+    "sub_1m": 170,
+    "sub_3m": 450,
+    "sub_6m": 790,
+    "sub_1y": 1350,
 }
 
 STARS_PLAN_META: dict[str, dict] = {
-    "sub_1m": {
-        "months": 1,
-        "days": 30,
-        "title": "Подписка Gram на 1 месяц",
-        "description": "Доступ ко всем функциям бота на 30 дней.",
-    },
-    "sub_3m": {
-        "months": 3,
-        "days": 90,
-        "title": "Подписка Gram на 3 месяца",
-        "description": "3 месяца с удобным подсчётом КБЖУ и статистикой.",
-    },
-    "sub_6m": {
-        "months": 6,
-        "days": 180,
-        "title": "Подписка Gram на полгода",
-        "description": "Полгода подробной статистики и умного подсчёта.",
-    },
-    "sub_12m": {
-        "months": 12,
-        "days": 365,
-        "title": "Подписка Gram на год",
-        "description": "Самый выгодный тариф — год подписки.",
-    },
-}
-
-PLAN_ID_TO_STARS_PLAN: dict[str, str] = {
-    "m1": "sub_1m",
-    "m3": "sub_3m",
-    "m6": "sub_6m",
-    "m12": "sub_12m",
+    "sub_1w": {"plan_key": "w1", "months": 0, "days": 7},
+    "sub_1m": {"plan_key": "m1", "months": 1, "days": 30},
+    "sub_3m": {"plan_key": "m3", "months": 3, "days": 90},
+    "sub_6m": {"plan_key": "m6", "months": 6, "days": 180},
+    "sub_1y": {"plan_key": "y1", "months": 12, "days": 365},
 }
 
 STARS_PLAN_TO_PLAN_ID: dict[str, str] = {
-    stars_key: plan_id for plan_id, stars_key in PLAN_ID_TO_STARS_PLAN.items()
+    "sub_1w": "w1",
+    "sub_1m": "m1",
+    "sub_3m": "m3",
+    "sub_6m": "m6",
+    "sub_1y": "y1",
 }
+
+PLAN_ID_TO_STARS_PLAN: dict[str, str] = {
+    "w1": "sub_1w",
+    "m1": "sub_1m",
+    "m3": "sub_3m",
+    "m6": "sub_6m",
+    "y1": "sub_1y",
+}
+
+
+def get_plan_duration_days(plan_id: str) -> int:
+    stars_plan_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
+    plan_meta = STARS_PLAN_META.get(stars_plan_key or "") if stars_plan_key else None
+
+    if plan_meta:
+        days = int(plan_meta.get("days") or plan_meta.get("months", 0) * 30)
+        if days > 0:
+            return days
+
+    plan = SUB_PLANS.get(plan_id)
+    months = plan.months if plan else 0
+    if months > 0:
+        return months * 30
+
+    return 0
 
 # ── Конфиг ─────────────────────────────────────────────
 
@@ -150,6 +159,7 @@ FOOD_WEBAPP_URL = os.getenv(
     "FOOD_WEBAPP_URL", "https://example.com/foodbot/webapp/"
 )
 YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "").strip()
+TRIAL_LIMIT = 6
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -198,26 +208,25 @@ def kb_settings() -> InlineKeyboardMarkup:
     )
 
 
-def kb_premium_plans() -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = []
+def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
+    buttons = []
     for plan_id, plan in SUB_PLANS.items():
-        star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
-        stars_amount = plan.price_stars
+        if plan_id == "w1" and paid_trial_used:
+            continue
+
         row = [
             InlineKeyboardButton(
-                f"{plan.title} • {plan.price_rub}₽",
+                f"💳 {plan.title} — {plan.price_rub}₽",
                 callback_data=f"buy_card:{plan_id}",
-            )
+            ),
+            InlineKeyboardButton(
+                f"⭐ {plan.title} — {plan.price_stars}⭐",
+                callback_data=f"buy_stars:{plan_id}",
+            ),
         ]
-        if star_key and stars_amount:
-            row.append(
-                InlineKeyboardButton(
-                    f"{plan.title} • {stars_amount}⭐",
-                    callback_data=f"buy_stars:{plan_id}",
-                )
-            )
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -499,6 +508,12 @@ async def delete_user_message(update: Update) -> None:
             pass
 
 
+def fmt_dt(dt: datetime | None, with_time: bool = False) -> str:
+    if not dt:
+        return "—"
+    return dt.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
+
+
 # ── Шлагбаум по подписке ─────────────────────────────
 
 async def _check_member(bot, user_id: int) -> bool:
@@ -530,9 +545,53 @@ async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     return False
 
 
+async def require_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, consume: bool) -> str | None:
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+
+    if await is_premium_user(db, user_id):
+        return "premium"
+
+    trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
+    now = datetime.utcnow()
+    used = int(trial_used_count or 0)
+
+    trial_active = bool(trial_until and trial_until > now and used < TRIAL_LIMIT)
+
+    if trial_active:
+        if consume:
+            ok = await consume_trial_request(db, user_id)
+            return "trial" if ok else None
+        return "trial"
+
+    kb = kb_premium_plans(paid_trial_used=bool(paid_trial_used))
+
+    if trial_until and trial_until <= now:
+        text = (
+            "⛔️ Ваша пробная подписка закончилась.\n\n"
+            "Если ты ещё не утвердился — есть вариант «Одна неделя» (доступен один раз), "
+            "или можно взять обычную подписку."
+        )
+    elif used >= TRIAL_LIMIT:
+        text = (
+            f"⛔️ Лимит пробных запросов исчерпан ({TRIAL_LIMIT}/{TRIAL_LIMIT}).\n\n"
+            "Можно взять «Одна неделя» (доступен один раз), или обычную подписку."
+        )
+    else:
+        text = (
+            "⛔️ Доступ недоступен.\n\n"
+            "Можно взять «Одна неделя» (доступен один раз), или обычную подписку."
+        )
+
+    await edit_menu_message(update, ctx, text, kb)
+    return None
+
+
 async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     db = ctx.application.bot_data["db"]
     user_id = update.effective_user.id
+
+    _, _, paid_trial_used = await get_trial_info(db, user_id)
 
     if await is_premium_user(db, user_id):
         return True
@@ -543,7 +602,9 @@ async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool
         "для подсчёта КБЖУ и анализа питания.\n\n"
         "Хочешь оформить подписку?"
     )
-    await edit_menu_message(update, ctx, text, kb_premium_plans())
+    await edit_menu_message(
+        update, ctx, text, kb_premium_plans(paid_trial_used=bool(paid_trial_used))
+    )
     return False
 
 
@@ -771,16 +832,51 @@ def extract_totals(data: dict) -> dict:
 
 # ── Главные экраны ───────────────────────────────────
 
-async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_main_menu(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, notice: str | None = None
+) -> None:
     ctx.user_data["state"] = None
     ctx.user_data.pop("pending_meal", None)
-    text = (
-        "Я готов к работе 🍽\n\n"
-        "• Просто пришли *фото* еды — я посчитаю КБЖУ.\n"
-        "• В будущем можно будет описать приём пищи *голосом*.\n\n"
-        "Для тонких настроек и статистики — кнопки ниже."
-    )
-    await edit_menu_message(update, ctx, text, kb_main())
+
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+
+    premium_active = await is_premium_user(db, user_id)
+    premium_until = await get_premium_until(db, user_id)
+    trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
+
+    lines = [
+        "🍽️ Я готов к работе.",
+        "",
+        "Пришли фото еды или голосом скажи, что ты ел — я посчитаю КБЖУ и запишу в дневник.",
+        "",
+    ]
+
+    if notice:
+        lines.insert(0, notice)
+        lines.insert(1, "")
+
+    now = datetime.utcnow()
+    if premium_active and premium_until:
+        lines.append(f"✅ Подписка активна до: {fmt_dt(premium_until)}")
+    else:
+        if trial_until and trial_until > now:
+            left = max(0, TRIAL_LIMIT - int(trial_used_count or 0))
+            lines.append(f"🆓 Бесплатно до: {fmt_dt(trial_until, with_time=True)}")
+            lines.append(f"Осталось запросов: {left}/{TRIAL_LIMIT}")
+            if left <= 0:
+                lines.append("")
+                lines.append("⛔️ Лимит пробных запросов исчерпан.")
+                lines.append("Можно взять «Одна неделя» (один раз) или обычную подписку.")
+        else:
+            lines.append("⛔️ Ваша пробная подписка закончилась.")
+            lines.append(
+                "Если ты ещё не утвердился — есть вариант «Одна неделя» (доступен один раз),"
+            )
+            lines.append("или можно взять обычную подписку.")
+
+    text = "\n".join(lines)
+    await send_new_menu_message(update, ctx, text, kb_main())
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1386,6 +1482,14 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message = update.message
+    mode = await require_access(update, ctx, consume=True)
+    if not mode:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return
+
     chat = message.chat
     photo = message.photo[-1]
 
@@ -1396,6 +1500,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "chat_id": chat.id,
         "extras": {},
     }
+    ctx.user_data["pending_meal"]["trial_reserved"] = (mode == "trial")
     ctx.user_data["state"] = "await_meal_extras_menu"
 
     # Текст меню уточнений
@@ -1412,6 +1517,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await send_new_menu_message(
         ctx, chat.id, text, kb_meal_extras(extras), user_id=uid
     )
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
@@ -1511,11 +1621,17 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = message.chat
     uid = update.effective_user.id
 
-    # Удаляем голосовое из чата, чтобы не захламлять
+    voice = update.message.voice
+    file_id = voice.file_id
+
+    mode = await require_access(update, ctx, consume=True)
     try:
-        await message.delete()
-    except BadRequest:
+        await update.message.delete()
+    except Exception:
         pass
+
+    if not mode:
+        return
 
     # Показываем статус
     await edit_menu_message(
@@ -1528,8 +1644,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Скачиваем аудио
     try:
-        voice = message.voice
-        file = await ctx.bot.get_file(voice.file_id)
+        file = await ctx.bot.get_file(file_id)
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         bio.seek(0)
@@ -1769,11 +1884,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Оплата ───────────────────────────────────────────
 
 async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+
+    _, _, paid_trial_used = await get_trial_info(db, user_id)
+
+    text = (
+        "⭐ Подписка\n\n"
+        "Есть одноразовый вариант «Одна неделя» (если ещё не покупал), "
+        "и обычные подписки.\n\n"
+        "Выбери тариф:"
+    )
     await edit_menu_message(
-        update,
-        ctx,
-        "Выберите способ оплаты:",
-        kb_premium_plans(),
+        update, ctx, text, kb_premium_plans(paid_trial_used=bool(paid_trial_used))
     )
 
 
@@ -1803,19 +1926,12 @@ async def show_payment_menu_for_selected_plan(
         await on_premium_menu(update, ctx)
         return
 
-    # Если у тебя есть словари для звёздных планов — используем их для текста
-    star_plan_key = PLAN_ID_TO_STARS_KEY.get(plan_id) if "PLAN_ID_TO_STARS_KEY" in globals() else None
-    star_plan = (
-        SUBSCRIPTION_PLANS_STARS.get(star_plan_key)
-        if star_plan_key and "SUBSCRIPTION_PLANS_STARS" in globals()
-        else None
-    )
-    star_price = star_plan.get("stars") if star_plan else "—"
-    plan_description = (
-        star_plan.get("description")
-        if star_plan
-        else getattr(plan, "description", f"Подписка на {plan.title}")
-    )
+    if plan_id == "w1":
+        plan_description = "Подписка на 7 дней"
+    else:
+        plan_description = f"Подписка на {plan.months} мес."
+
+    star_price = plan.price_stars
 
     text = (
         f"План: {plan.title}\n"
@@ -1862,6 +1978,25 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Тариф не найден. Попробуйте выбрать другой.")
         return
 
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+    _, _, paid_trial_used = await get_trial_info(db, user_id)
+
+    if plan_key == "w1" and paid_trial_used:
+        await edit_menu_message(
+            update,
+            ctx,
+            "⛔️ Тариф «Одна неделя» доступен только один раз.\n\n"
+            "Выбери обычную подписку:",
+            kb_premium_plans(paid_trial_used=True),
+        )
+        return
+
+    duration_days = get_plan_duration_days(plan.key)
+    duration_label = (
+        f"на {plan.months} мес." if plan.months else f"на {duration_days} дн."
+    )
+
     # Stars: 1 звезда = amount 1. Без умножений.
     stars_amount = max(1, int(plan.price_stars))
 
@@ -1898,7 +2033,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             chat_id=user.id,
             title=plan.title,
             description=(
-                f"Подписка «{plan.title}» на {plan.months} мес.\n\n"
+                f"Подписка «{plan.title}» {duration_label}\n\n"
                 "Оплата произойдёт в Telegram Stars."
             ),
             payload=payload,
@@ -1942,7 +2077,13 @@ async def send_stars_invoice(
         return
 
     label_months = plan_meta.get("months", months)
-    prices = [LabeledPrice(label=f"Подписка на {label_months} мес.", amount=stars_amount)]
+    label_days = plan_meta.get("days")
+    if label_days and not label_months:
+        label = f"Подписка на {label_days} дн."
+    else:
+        label = f"Подписка на {label_months} мес."
+
+    prices = [LabeledPrice(label=label, amount=stars_amount)]
 
     payload = f"sub_stars:{plan_key}"
     back_markup = InlineKeyboardMarkup(
@@ -2060,6 +2201,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = ctx.application.bot_data["db"]
 
     now = datetime.utcnow()
+    current_until = await get_premium_until(db, user_id)
 
     parts = payload.split(":", 2)
     payload_data = None
@@ -2067,6 +2209,9 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payload_data = json.loads(payload)
     except json.JSONDecodeError:
         payload_data = None
+
+    new_until = None
+    plan_key = None
 
     if payload.startswith("sub:"):
         if len(parts) != 3:
@@ -2081,6 +2226,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        plan_key = plan.id
         await save_payment(
             db,
             telegram_id=user_id,
@@ -2090,7 +2236,15 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             payload=payload,
         )
 
-        new_until = now + timedelta(days=plan.months * 30)
+        base = current_until if (current_until and current_until > now) else now
+        days = 7 if plan_key == "w1" else plan.months * 30
+        if days <= 0:
+            days = get_plan_duration_days(plan.id)
+        if days <= 0:
+            await update.message.reply_text("Некорректная продолжительность подписки.")
+            return
+
+        new_until = base + timedelta(days=days)
 
     elif payload.startswith("sub_stars:"):
         if len(parts) != 2:
@@ -2104,12 +2258,11 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Платёж прошёл, но тариф не найден. Напиши, пожалуйста, в поддержку."
             )
             return
-
+        plan_key = plan_meta.get("plan_key") or STARS_PLAN_TO_PLAN_ID.get(plan_key)
         days = int(plan_meta.get("days", plan_meta.get("months", 0) * 30))
         if days <= 0:
             await update.message.reply_text("Некорректная продолжительность подписки.")
             return
-
         await save_payment(
             db,
             telegram_id=user_id,
@@ -2119,7 +2272,8 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             payload=payload,
         )
 
-        new_until = now + timedelta(days=days)
+        base = current_until if (current_until and current_until > now) else now
+        new_until = base + timedelta(days=days)
 
     elif isinstance(payload_data, dict) and payload_data.get("type") == "subscription":
         plan_key = payload_data.get("plan_key")
@@ -2140,12 +2294,23 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             payload=payload,
         )
 
-        new_until = now + timedelta(days=months * 30)
+        base = current_until if (current_until and current_until > now) else now
+        days = 7 if plan_key == "w1" else months * 30
+        if days <= 0:
+            days = get_plan_duration_days(plan.id)
+        if days <= 0:
+            await update.message.reply_text("Некорректная продолжительность подписки.")
+            return
+
+        new_until = base + timedelta(days=days)
 
     else:
         await update.message.reply_text("Неизвестный тип платежа.")
         return
     await set_premium_until(db, user_id, new_until)
+
+    if plan_key == "w1":
+        await mark_paid_trial_used(db, user_id)
 
     chat_id = message.chat_id
 
@@ -2163,18 +2328,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Шлём единое сообщение: подтверждение + главное меню
-    success_text = (
-        "Поздравляем, у вас теперь подписка!\n"
-        f"Активна до: {new_until.strftime('%d.%m.%Y')}.")
-
-    await send_new_menu_message(
-        ctx,
-        chat_id=chat_id,
-        text=success_text,
-        reply_markup=kb_main(),
-        user_id=user_id,
-    )
+    await show_main_menu(update, ctx, notice="🎉 Оплата прошла! Подписка обновлена.")
 
 # ── Админ и прочее (минимальный каркас) ──────────────
 
