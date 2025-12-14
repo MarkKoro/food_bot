@@ -876,7 +876,14 @@ async def show_main_menu(
             lines.append("или можно взять обычную подписку.")
 
     text = "\n".join(lines)
-    await send_new_menu_message(update, ctx, text, kb_main())
+    chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    await send_new_menu_message(
+        ctx,
+        chat_id,
+        text,
+        kb_main(),
+        user_id=update.effective_user.id if update.effective_user else None,
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
