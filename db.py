@@ -98,28 +98,21 @@ async def create_tables(db: aiosqlite.Connection) -> None:
     cur = await db.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in await cur.fetchall()]
     await cur.close()
-    if "is_premium" not in cols:
-        await db.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0")
-        await db.commit()
-    if "premium_until" not in cols:
-        await db.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
-        await db.commit()
-    if "last_menu_message_id" not in cols:
-        await db.execute(
-            "ALTER TABLE users ADD COLUMN last_menu_message_id INTEGER"
-        )
-        await db.commit()
-    if "trial_until" not in cols:
-        await db.execute("ALTER TABLE users ADD COLUMN trial_until TEXT")
-        await db.commit()
 
-    if "trial_used_count" not in cols:
-        await db.execute("ALTER TABLE users ADD COLUMN trial_used_count INTEGER DEFAULT 0")
-        await db.commit()
+    required_cols = {
+        "is_premium": "INTEGER DEFAULT 0",
+        "premium_until": "TEXT",
+        "last_menu_message_id": "INTEGER",
+        "trial_until": "TEXT",
+        "trial_used_count": "INTEGER DEFAULT 0",
+        "paid_trial_used": "INTEGER DEFAULT 0",
+        "payment_mode": "TEXT DEFAULT 'sub'",
+    }
 
-    if "paid_trial_used" not in cols:
-        await db.execute("ALTER TABLE users ADD COLUMN paid_trial_used INTEGER DEFAULT 0")
-        await db.commit()
+    for col, definition in required_cols.items():
+        if col not in cols:
+            await db.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+            await db.commit()
 
 
 # ── Пользователи / кредиты ─────────────────────────────
