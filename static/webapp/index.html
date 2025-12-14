@@ -112,15 +112,29 @@
         display: inline-flex;
       }
 
+      /* было и остаётся базой: клики идут в кнопку на ПК */
       .date-input-hidden{
         position:absolute;
         inset:0;
         width:100%;
         height:100%;
-        opacity:0;           /* можно оставить 0 */
-        z-index:0;           /* важно: input НЕ должен быть выше кнопки */
-        pointer-events:none; /* важно: чтобы клик всегда попадал в кнопку */
+        opacity:0;
+        z-index:0;
+        pointer-events:none;
         cursor:pointer;
+      }
+
+      /* ВАЖНО: на телефонах/планшетах делаем прямой tap по input,
+         чтобы iOS/Telegram WebView реально открывал календарь */
+      @media (pointer: coarse) {
+        .date-input-hidden{
+          z-index: 3;            /* выше кнопки */
+          pointer-events: auto;  /* tap попадает в input */
+          opacity: 0.001;        /* почти 0, но некоторые webview "не любят" ровно 0 */
+          -webkit-appearance: none;
+          appearance: none;
+          touch-action: manipulation;
+        }
       }
 
       .macro-grid {
@@ -402,7 +416,6 @@
 
         dateButton.addEventListener("click", (e) => {
           e.preventDefault();
-          e.stopPropagation();
           openDatePicker();
         });
 
