@@ -80,6 +80,16 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             amount_stars INTEGER NOT NULL DEFAULT 0,
             raw         TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, -- 'photo' | 'voice'
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_requests_user_created
+        ON requests(user_id, created_at);
         """
     )
     await db.commit()

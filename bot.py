@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import aiosqlite
@@ -45,12 +45,6 @@ from db import (
     set_goal,
     add_invite,
     save_payment,
-    get_credits,
-    add_credits,
-    dec_credits,
-    get_user_count,
-    get_meal_count,
-    get_total_payments,
     get_invite_stats,
     get_last_menu_message_id,
     set_last_menu_message_id,
@@ -153,6 +147,27 @@ ADMINS = {
     if x.strip()
 }
 
+ADMIN_PREMIUM_UNTIL = datetime(2099, 1, 1)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+
+def utcnow() -> datetime:
+    # чтобы не ловить DeprecationWarning по utcnow() на py3.12+
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def ensure_admin_premium(db, user_id: int) -> None:
+    if not is_admin(user_id):
+        return
+    await db.execute(
+        "UPDATE users SET is_premium=1, premium_until=?, trial_until=NULL, trial_used_count=0 WHERE telegram_id=?",
+        (ADMIN_PREMIUM_UNTIL.isoformat(), user_id),
+    )
+    await db.commit()
+
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 JOIN_URL = os.getenv("JOIN_URL", "")
 FOOD_WEBAPP_URL = os.getenv(
@@ -160,6 +175,7 @@ FOOD_WEBAPP_URL = os.getenv(
 )
 YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN", "").strip()
 TRIAL_LIMIT = 6
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -398,6 +414,24 @@ def get_db(ctx: ContextTypes.DEFAULT_TYPE) -> aiosqlite.Connection:
     return ctx.bot_data["db"]
 
 
+async def get_today_requests_count(db, user_id: int) -> int:
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM requests WHERE user_id=? AND date(created_at)=date('now','localtime')",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return int(row[0] or 0)
+
+
+async def log_request(db, user_id: int, kind: str) -> None:
+    await db.execute(
+        "INSERT INTO requests(user_id, kind) VALUES(?, ?)",
+        (user_id, kind),
+    )
+    await db.commit()
+
+
 # ── Сервисные хелперы сообщений ───────────────────────
 
 async def edit_menu_message(
@@ -545,15 +579,41 @@ async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     return False
 
 
-async def require_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, consume: bool) -> str | None:
+async def require_access(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    consume: bool,
+    kind: str | None = None,
+) -> str | bool | None:
     db = get_db(ctx)
     user_id = update.effective_user.id
 
+    # админ — всегда можно, без лимитов
+    if is_admin(user_id):
+        await ensure_admin_premium(db, user_id)
+        if kind is not None:
+            await log_request(db, user_id, kind)
+        return True
+
+    # дневной лимит только для реальных запросов (photo/voice)
+    if kind is not None:
+        used_today = await get_today_requests_count(db, user_id)
+        if used_today >= DAILY_LIMIT:
+            await send_notice(
+                update,
+                ctx,
+                f"Сегодня лимит {DAILY_LIMIT} запросов исчерпан. Попробуй завтра 🙏",
+            )
+            return False
+
     if await is_premium_user(db, user_id):
+        if kind is not None:
+            await log_request(db, user_id, kind)
         return "premium"
 
     trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
-    now = datetime.utcnow()
+    now = utcnow()
     used = int(trial_used_count or 0)
 
     trial_active = bool(trial_until and trial_until > now and used < TRIAL_LIMIT)
@@ -561,7 +621,11 @@ async def require_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, cons
     if trial_active:
         if consume:
             ok = await consume_trial_request(db, user_id)
+            if ok and kind is not None:
+                await log_request(db, user_id, kind)
             return "trial" if ok else None
+        if kind is not None:
+            await log_request(db, user_id, kind)
         return "trial"
 
     kb = kb_premium_plans(paid_trial_used=bool(paid_trial_used))
@@ -841,6 +905,8 @@ async def show_main_menu(
     db = get_db(ctx)
     user_id = update.effective_user.id
 
+    await ensure_admin_premium(db, user_id)
+
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
     trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
@@ -856,7 +922,7 @@ async def show_main_menu(
         lines.insert(0, notice)
         lines.insert(1, "")
 
-    now = datetime.utcnow()
+    now = utcnow()
     if premium_active and premium_until:
         lines.append(f"✅ Подписка активна до: {fmt_dt(premium_until)}")
     else:
@@ -874,6 +940,10 @@ async def show_main_menu(
                 "Если ты ещё не утвердился — есть вариант «Одна неделя» (доступен один раз),"
             )
             lines.append("или можно взять обычную подписку.")
+
+    if is_admin(user_id):
+        lines.append("")
+        lines.append("🛠 Админ-доступ: премиум ∞")
 
     text = "\n".join(lines)
     chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
@@ -1489,7 +1559,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message = update.message
-    mode = await require_access(update, ctx, consume=True)
+    mode = await require_access(update, ctx, consume=True, kind="photo")
     if not mode:
         try:
             await message.delete()
@@ -1631,7 +1701,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     voice = update.message.voice
     file_id = voice.file_id
 
-    mode = await require_access(update, ctx, consume=True)
+    mode = await require_access(update, ctx, consume=True, kind="voice")
     try:
         await update.message.delete()
     except Exception:
@@ -2207,7 +2277,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     db = ctx.application.bot_data["db"]
 
-    now = datetime.utcnow()
+    now = utcnow()
     current_until = await get_premium_until(db, user_id)
 
     parts = payload.split(":", 2)
@@ -2346,64 +2416,144 @@ async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await on_premium_menu(update, ctx)
 
 
-async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    await delete_user_message(update)
-    if uid not in ADMINS:
+async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
         return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
+    if len(ctx.args) != 2:
+        return await update.message.reply_text("Использование: /grant <user_id> <days>")
+
     try:
-        target = int(ctx.args[0])
-        qty = int(ctx.args[1])
-    except (IndexError, ValueError):
-        await edit_menu_message(update, ctx, "Usage: /grant <id> <qty>", kb_main())
-        return
+        target_id = int(ctx.args[0])
+        days = int(ctx.args[1])
+        if days <= 0 or days > 3650:
+            raise ValueError
+    except Exception:
+        return await update.message.reply_text("Пример: /grant 123456789 30")
+
     db = get_db(ctx)
-    await add_credits(db, target, qty)
-    total = await get_credits(db, target)
-    await edit_menu_message(
-        update, ctx, f"OK. Now {target} has {total} credits", kb_main()
+    await ensure_user(db, target_id)
+
+    cur = await db.execute("SELECT premium_until FROM users WHERE telegram_id=?", (target_id,))
+    row = await cur.fetchone()
+    await cur.close()
+
+    now = utcnow()
+    base = now
+    if row and row[0]:
+        try:
+            cur_until = datetime.fromisoformat(row[0])
+            if cur_until > now:
+                base = cur_until
+        except Exception:
+            pass
+
+    new_until = base + timedelta(days=days)
+
+    await db.execute(
+        "UPDATE users SET is_premium=1, premium_until=?, trial_until=NULL, trial_used_count=0 WHERE telegram_id=?",
+        (new_until.isoformat(), target_id),
+    )
+    await db.commit()
+
+    return await update.message.reply_text(
+        f"✅ Выдано {days} дн.\n"
+        f"ID: {target_id}\n"
+        f"Действует до: {new_until.strftime('%d.%m.%Y')}"
     )
 
 
-async def cmd_decredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    await delete_user_message(update)
-    if uid not in ADMINS:
+async def cmd_degrant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
         return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
+    if len(ctx.args) != 1:
+        return await update.message.reply_text("Использование: /degrant <user_id>")
+
     try:
-        target = int(ctx.args[0])
-        qty = int(ctx.args[1])
-    except (IndexError, ValueError):
-        await edit_menu_message(update, ctx, "Usage: /decredits <id> <qty>", kb_main())
-        return
+        target_id = int(ctx.args[0])
+    except Exception:
+        return await update.message.reply_text("Пример: /degrant 123456789")
+
     db = get_db(ctx)
-    ok = await dec_credits(db, target, qty)
-    if not ok:
-        await edit_menu_message(
-            update, ctx, "Недостаточно кредитов у пользователя.", kb_main()
-        )
-        return
-    total = await get_credits(db, target)
-    await edit_menu_message(
-        update, ctx, f"OK. Now {target} has {total} credits", kb_main()
+    await ensure_user(db, target_id)
+
+    await db.execute(
+        "UPDATE users SET is_premium=0, premium_until=NULL WHERE telegram_id=?",
+        (target_id,),
     )
+    await db.commit()
+
+    return await update.message.reply_text(f"🧹 Подписка снята. ID: {target_id}")
 
 
-async def cmd_stats_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    await delete_user_message(update)
-    if uid not in ADMINS:
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
         return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
     db = get_db(ctx)
-    users = await get_user_count(db)
-    meals = await get_meal_count(db)
-    pays = await get_total_payments(db)
+    now_iso = utcnow().isoformat()
+
+    async def q1(sql: str, params=()):
+        cur = await db.execute(sql, params)
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else 0
+
+    users_total = await q1("SELECT COUNT(*) FROM users")
+    premium_active = await q1(
+        "SELECT COUNT(*) FROM users WHERE is_premium=1 AND premium_until IS NOT NULL AND premium_until > ?",
+        (now_iso,),
+    )
+    trial_active = await q1(
+        "SELECT COUNT(*) FROM users WHERE is_premium=0 AND trial_until IS NOT NULL AND trial_until > ?",
+        (now_iso,),
+    )
+    paid_trial_used = await q1("SELECT COUNT(*) FROM users WHERE paid_trial_used=1")
+
+    req_today = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime')")
+    req_today_photo = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND kind='photo'")
+    req_today_voice = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND kind='voice'")
+
+    req_7d = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days')")
+    req_7d_photo = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days') AND kind='photo'")
+    req_7d_voice = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days') AND kind='voice'")
+    active_users_7d = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE created_at >= datetime('now','localtime','-7 days')")
+
+    avg_req_per_day_7d = req_7d / 7.0
+    avg_req_per_user_per_day_7d = (req_7d / (active_users_7d * 7.0)) if active_users_7d else 0.0
+
+    # оплаты (в общем виде)
+    cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount),0) FROM payments GROUP BY provider")
+    pay_rows = await cur.fetchall()
+    await cur.close()
+
+    pay_lines = []
+    for provider, cnt, total in pay_rows:
+        pay_lines.append(f"• {provider}: {cnt} шт., сумма={total}")
+
     text = (
-        f"Users: {users}\n"
-        f"Meals: {meals}\n"
-        f"Payments total (units): {pays}"
+        "📊 *Статистика*\n\n"
+        f"👥 Пользователи: *{users_total}*\n"
+        f"⭐ Активная подписка: *{premium_active}*\n"
+        f"🎁 Активный пробник (24ч): *{trial_active}*\n"
+        f"🧪 Платный пробник (1 неделя) использовали: *{paid_trial_used}*\n\n"
+        f"📅 Сегодня запросов: *{req_today}* (фото *{req_today_photo}* / голос *{req_today_voice}*)\n"
+        f"🗓 За 7 дней запросов: *{req_7d}* (фото *{req_7d_photo}* / голос *{req_7d_voice}*)\n"
+        f"📈 Среднее (7д): *{avg_req_per_day_7d:.1f}* запрос/день\n"
+        f"🙋‍♂️ Среднее на активного (7д): *{avg_req_per_user_per_day_7d:.2f}* запрос/польз/день\n\n"
+        "💸 Оплаты:\n"
+        + ("\n".join(pay_lines) if pay_lines else "• пока пусто")
+        + "\n"
     )
-    await edit_menu_message(update, ctx, text, kb_main())
+
+    return await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2450,8 +2600,8 @@ def main() -> None:
 
     # Админ-команды
     application.add_handler(CommandHandler("grant", cmd_grant))
-    application.add_handler(CommandHandler("decredits", cmd_decredits))
-    application.add_handler(CommandHandler("stats_admin", cmd_stats_admin))
+    application.add_handler(CommandHandler("degrant", cmd_degrant))
+    application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("mystats", cmd_my_stats))
 
     # Callback-кнопки
