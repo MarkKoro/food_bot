@@ -2607,39 +2607,57 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user = update.effective_user
     payload = f"sub:{plan.id}:card"
 
-    await delete_menu_message(ctx, chat_id)
+    # удалить старый invoice (если висит)
+    old = ctx.chat_data.pop("last_invoice_message_id", None)
+    if old:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
+        except Exception:
+            pass
 
-    invoice_message = await ctx.bot.send_invoice(
-        chat_id=chat_id,
-        title=f"Подписка на {plan.title}",
-        description="Подписка на умный дневник питания с фото и голосом.",
-        payload=payload,
-        provider_token=YOOKASSA_PROVIDER_TOKEN,
-        currency="RUB",
-        prices=[
-            LabeledPrice(
-                label=plan.title,
-                amount=plan.price_rub * 100,  # рубли в копейках
-            )
-        ],
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        text="🔙 Назад",
-                        callback_data="sub:invoice_back",
-                    )
-                ]
-            ]
-        ),
-        is_flexible=False,
-        max_tip_amount=0,
+    # ВАЖНО: для RUB-инвойса нельзя слать reply_markup без pay=True
+    invoice_kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Оплатить 💳", pay=True)],
+            [InlineKeyboardButton("🔙 Назад", callback_data="sub:invoice_back")],
+        ]
     )
 
+    try:
+        invoice_message = await ctx.bot.send_invoice(
+            chat_id=chat_id,
+            title=f"Подписка на {plan.title}",
+            description="Подписка на умный дневник питания с фото и голосом.",
+            payload=payload,
+            provider_token=YOOKASSA_PROVIDER_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label=plan.title, amount=plan.price_rub * 100)],
+            reply_markup=invoice_kb,
+            is_flexible=False,
+            max_tip_amount=0,
+        )
+    except Exception:
+        # ничего не удаляем — просто оставляем меню на месте
+        logging.exception("Failed to send RUB subscription invoice")
+        await query.edit_message_text(
+            "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
+            reply_markup=kb_payment_methods(plan_id),
+        )
+        return
+
     ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
+
+    # Инвойс создан — теперь можно убрать старое меню (чтобы чат не оставался пустым при ошибке выше)
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    try:
+        await delete_menu_message(ctx, chat_id)
+    except Exception:
+        pass
 
 
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
