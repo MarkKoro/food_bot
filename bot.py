@@ -159,7 +159,6 @@ ADMIN_PREMIUM_UNTIL = datetime(2099, 1, 1)
 PAYG_COST_RUB = 2  # 2 руб за фото или голос
 PAYG_TOPUPS_RUB = [50, 100, 200, 500]
 RUB_PER_STAR = 1.79  # твоя оценка. Можно потом поменять.
-DAILY_REQUEST_LIMIT = 10  # общий лимит на сутки (защита от "каждую минуту")
 
 
 def rub_to_stars(rub: int) -> int:
@@ -338,9 +337,23 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int):
 
 def kb_payg_topups():
     rows = []
+    has_card = bool(YOOKASSA_PROVIDER_TOKEN)
+
     for rub in PAYG_TOPUPS_RUB:
         stars = rub_to_stars(rub)
-        rows.append([InlineKeyboardButton(f"+{rub}₽  (≈ {stars}⭐)", callback_data=f"payg_buy:{rub}")])
+        if has_card:
+            rows.append([
+                InlineKeyboardButton(f"⭐ +{rub}₽ (≈{stars}⭐)", callback_data=f"payg_buy_stars:{rub}"),
+                InlineKeyboardButton(f"💳 +{rub}₽", callback_data=f"payg_buy_card:{rub}"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(f"⭐ +{rub}₽ (≈{stars}⭐)", callback_data=f"payg_buy_stars:{rub}")
+            ])
+
+    if not has_card:
+        rows.append([InlineKeyboardButton("💳 Оплата картой появится после токена YooKassa", callback_data="noop")])
+
     rows.append([InlineKeyboardButton("⬅ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(rows)
 
@@ -1198,7 +1211,7 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Текущий: **{'Pay-as-you-go' if mode == 'payg' else 'Подписка'}**\n"
         f"• Баланс PAYG: **{balance}₽**\n"
         f"• Цена: **{PAYG_COST_RUB}₽ / запрос** (фото или голос)\n"
-        f"• Лимит защиты: **{DAILY_REQUEST_LIMIT} запросов/сутки**\n\n"
+        "• Лимитов нет: PAYG списывает за каждый запрос\n\n"
         "Переключение режимов **ничего не сжигает**: подписка остаётся в базе, баланс остаётся в базе."
     )
     await edit_menu_message(update, ctx, text, kb_pay_mode(mode, has_sub, balance))
@@ -1660,13 +1673,7 @@ async def _process_meal_calculation(
         )
         return
 
-    # Pay-as-you-go биллинг и дневной лимит
-    if uid not in ADMINS:
-        used_today = await db_count_requests_today(db, uid)
-        if used_today >= DAILY_REQUEST_LIMIT:
-            await edit_menu_message(update, ctx, "⚠️ Сегодня лимит запросов исчерпан. Попробуй завтра.", kb_main())
-            return
-
+    # Pay-as-you-go биллинг (без лимитов)
     u = await db_get_user_row(db, uid)
     mode = u.get("payment_mode", "sub")
 
@@ -1677,12 +1684,12 @@ async def _process_meal_calculation(
             await edit_menu_message(
                 update,
                 ctx,
-                f"💳 Недостаточно баланса PAYG.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
+                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
                 kb_payg_topups(),
             )
             return
 
-    if uid not in ADMINS:
+        # логируем только PAYG (чтобы в SUB не было двойного лога)
         await db_log_request(db, uid, "photo")
 
     # Считаем КБЖУ
@@ -1785,13 +1792,20 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message = update.message
-    mode = await require_access(update, ctx, consume=True, kind="photo")
-    if not mode:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
+    db = get_db(ctx)
+    u0 = await db_get_user_row(db, update.effective_user.id)
+    pay_mode0 = u0.get("payment_mode", "sub")
+
+    if pay_mode0 == "payg" and not is_admin(update.effective_user.id):
+        mode = "payg"
+    else:
+        mode = await require_access(update, ctx, consume=True, kind="photo")
+        if not mode:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
 
     chat = message.chat
     photo = message.photo[-1]
@@ -1927,7 +1941,14 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     voice = update.message.voice
     file_id = voice.file_id
 
-    mode = await require_access(update, ctx, consume=True, kind="voice")
+    db = get_db(ctx)
+    u0 = await db_get_user_row(db, uid)
+    pay_mode0 = u0.get("payment_mode", "sub")
+
+    if pay_mode0 == "payg" and not is_admin(uid):
+        mode = "payg"
+    else:
+        mode = await require_access(update, ctx, consume=True, kind="voice")
     try:
         await update.message.delete()
     except Exception:
@@ -1962,15 +1983,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    db = get_db(ctx)
-
-    if uid not in ADMINS:
-        used_today = await db_count_requests_today(db, uid)
-        if used_today >= DAILY_REQUEST_LIMIT:
-            await edit_menu_message(update, ctx, "⚠️ Сегодня лимит запросов исчерпан. Попробуй завтра.", kb_main())
-            return
-
-    u = await db_get_user_row(db, uid)
+    u = u0 or await db_get_user_row(db, uid)
     pay_mode = u.get("payment_mode", "sub")
 
     if uid not in ADMINS and pay_mode == "payg":
@@ -1980,12 +1993,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await edit_menu_message(
                 update,
                 ctx,
-                f"💳 Недостаточно баланса PAYG.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
+                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
                 kb_payg_topups(),
             )
             return
 
-    if uid not in ADMINS:
         await db_log_request(db, uid, "voice")
 
     # Транскрибируем
@@ -2101,6 +2113,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_payment_menu_for_selected_plan(update, ctx)
         return
 
+    if data == "payg:invoice_back":
+        # Назад из PAYG-инвойса к выбору сумм
+        if query and query.message:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        ctx.chat_data.pop("last_invoice_message_id", None)
+        await edit_menu_message(update, ctx, "➕ Выбери сумму пополнения PAYG:", kb_payg_topups())
+        return
+
     if data == "chk_sub":
         await on_check_sub_callback(update, ctx)
         return
@@ -2123,9 +2146,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_menu_message(update, ctx, "➕ Выбери сумму пополнения PAYG:", kb_payg_topups())
         return
 
+    # backward-compat (если остались старые кнопки)
     if data.startswith("payg_buy:"):
         rub = int(data.split(":", 1)[1])
-        await send_payg_invoice(update, ctx, rub)
+        await send_payg_invoice_stars(update, ctx, rub)
+        return
+
+    if data.startswith("payg_buy_stars:"):
+        rub = int(data.split(":", 1)[1])
+        await send_payg_invoice_stars(update, ctx, rub)
+        return
+
+    if data.startswith("payg_buy_card:"):
+        rub = int(data.split(":", 1)[1])
+        await send_payg_invoice_card(update, ctx, rub)
         return
     if data == "main":
         await show_main_menu(update, ctx)
@@ -2409,23 +2443,93 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
-async def send_payg_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
+async def send_payg_invoice_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
+    chat_id = update.effective_chat.id
     uid = update.effective_user.id
 
+    # удалить старый invoice если вдруг висит
+    old = ctx.chat_data.pop("last_invoice_message_id", None)
+    if old:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
+        except Exception:
+            pass
+
+    await delete_menu_message(ctx, chat_id)
+
     stars = rub_to_stars(rub)
-    payload = json.dumps({"type": "payg_topup", "rub": rub})
+    payload = json.dumps({"type": "payg_topup", "rub": rub, "method": "stars"})
 
-    prices = [LabeledPrice(label=f"Пополнение +{rub}₽", amount=stars)]
+    prices = [LabeledPrice(label=f"PAYG +{rub}₽", amount=stars)]
 
-    await ctx.bot.send_invoice(
+    invoice_kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Оплатить ⭐", pay=True)],
+            [InlineKeyboardButton("🔙 Назад", callback_data="payg:invoice_back")],
+        ]
+    )
+
+    invoice_message = await ctx.bot.send_invoice(
         chat_id=uid,
         title="Грамм — Pay-as-you-go",
-        description=f"Пополнение баланса на +{rub}₽. Списание: {PAYG_COST_RUB}₽ за запрос.",
+        description=f"Пополнение баланса на +{rub}₽.\nСписание: {PAYG_COST_RUB}₽ за запрос.",
         payload=payload,
-        provider_token="",  # для Stars пусто
+        provider_token=None,   # Stars
         currency="XTR",
         prices=prices,
+        reply_markup=invoice_kb,
+        max_tip_amount=0,
     )
+
+    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
+
+
+async def send_payg_invoice_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+
+    if not YOOKASSA_PROVIDER_TOKEN:
+        await edit_menu_message(
+            update,
+            ctx,
+            "💳 Оплата картой появится чуть позже (нужен токен YooKassa).\nПока доступна оплата Stars.",
+            kb_payg_topups(),
+        )
+        return
+
+    old = ctx.chat_data.pop("last_invoice_message_id", None)
+    if old:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
+        except Exception:
+            pass
+
+    await delete_menu_message(ctx, chat_id)
+
+    payload = json.dumps({"type": "payg_topup", "rub": rub, "method": "card"})
+    prices = [LabeledPrice(label=f"PAYG +{rub}₽", amount=rub * 100)]  # копейки
+
+    invoice_kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Оплатить 💳", pay=True)],
+            [InlineKeyboardButton("🔙 Назад", callback_data="payg:invoice_back")],
+        ]
+    )
+
+    invoice_message = await ctx.bot.send_invoice(
+        chat_id=uid,
+        title="Грамм — Pay-as-you-go",
+        description=f"Пополнение баланса на +{rub}₽.\nСписание: {PAYG_COST_RUB}₽ за запрос.",
+        payload=payload,
+        provider_token=YOOKASSA_PROVIDER_TOKEN,
+        currency="RUB",
+        prices=prices,
+        reply_markup=invoice_kb,
+        is_flexible=False,
+        max_tip_amount=0,
+    )
+
+    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
 
 
 async def send_stars_invoice(
@@ -2584,15 +2688,32 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.get("type") == "payg_topup":
         rub = int(data.get("rub") or 0)
-        db = get_db(ctx)
-        await db_add_payg_balance(db, user_id, rub)
+        method = data.get("method") or ("stars" if sp.currency == "XTR" else "card")
+
+        db2 = get_db(ctx)
+        await db_add_payg_balance(db2, user_id, rub)
 
         try:
-            await save_payment(db, user_id, "stars", rub, "RUB", payload)
+            await save_payment(db2, user_id, method, rub, "RUB", payload)
         except Exception:
             pass
 
-        await show_main_menu(update, ctx)
+        chat_id = message.chat_id
+
+        invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
+        if invoice_msg_id:
+            try:
+                await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
+            except Exception:
+                pass
+
+        try:
+            if message:
+                await message.delete()
+        except Exception:
+            pass
+
+        await show_main_menu(update, ctx, notice=f"✅ Баланс PAYG пополнен на +{rub}₽")
         return
 
     now = utcnow()
