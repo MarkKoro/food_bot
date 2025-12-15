@@ -371,7 +371,7 @@ def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
         ]
         buttons.append(row)
 
-    buttons.append([InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(buttons)
 
 
