@@ -307,7 +307,6 @@ def kb_settings() -> InlineKeyboardMarkup:
                     "🧮 Подобрать норму по опросу", callback_data="survey_start"
                 )
             ],
-            [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")],
             [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
@@ -321,9 +320,12 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_t
 
     rows = [
         [
-            InlineKeyboardButton(f"{sub_mark} Подписка", callback_data="pay_mode_set:sub"),
+            InlineKeyboardButton(
+                f"{sub_mark} ⭐ Подписка", callback_data="pay_mode_set:sub"
+            ),
             InlineKeyboardButton(f"{payg_mark} Pay-as-you-go", callback_data="pay_mode_set:payg"),
         ],
+        [InlineKeyboardButton("⭐ Купить подписку", callback_data="premium_menu")],
         [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
         [InlineKeyboardButton("⬅ Назад", callback_data="settings")],
     ]
@@ -1156,7 +1158,7 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "⚙️ Настройки\n\n"
         "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
-        "• 💳 Подписка — сюда добавим платные режимы и бонусы за друзей.\n"
+        "• 💳 Режим оплаты — можно оформить ⭐ Подписку на срок или выбрать Pay-as-you-go и платить за каждый запрос.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
@@ -1176,14 +1178,16 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         "💳 **Режим оплаты**\n\n"
-        f"1) **Подписка** {'✅' if mode == 'sub' else ''}\n"
+        f"1) ⭐ **Подписка** {'✅' if mode == 'sub' else ''}\n"
         f"• Статус: **{sub_until_text}**\n"
         "• Лимит: **10 запросов в день** (фото/голос)\n"
-        "• Деньги с баланса не списываются\n\n"
+        "• Деньги с баланса не списываются\n"
+        "• Нажми «⭐ Купить подписку», чтобы оплатить срок\n\n"
         f"2) **Pay-as-you-go** {'✅' if mode == 'payg' else ''}\n"
         f"• Баланс: **{balance}₽**\n"
         f"• Цена: **{PAYG_COST_RUB}₽ за запрос** (фото/голос)\n"
-        "• Лимитов нет\n\n"
+        "• Лимитов нет\n"
+        "• Нажми «➕ Пополнить PAYG», чтобы пополнить\n\n"
         "Выбери режим кнопками ниже — галочка переедет, а режим сохранится."
     )
 
