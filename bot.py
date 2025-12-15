@@ -373,32 +373,6 @@ def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def kb_payment_methods(plan_id: str) -> InlineKeyboardMarkup:
-    star_key = PLAN_ID_TO_STARS_PLAN.get(plan_id)
-    plan = SUB_PLANS.get(plan_id)
-    stars_amount = plan.price_stars if plan else None
-    star_label = "⭐ Оплатить звёздами"
-    if stars_amount:
-        star_label = f"⭐ Оплатить {stars_amount}⭐"
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    star_label,
-                    callback_data=(f"buy_stars:{plan_id}" if star_key else "premium_menu"),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💳 Оплатить картой", callback_data=f"buy_card:{plan_id}"
-                )
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="premium_menu")],
-        ]
-    )
-
-
 def kb_sub() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -2108,8 +2082,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
     if data == "sub:invoice_back":
-        # Назад из инвойса к способам оплаты выбранного плана
-        await show_payment_menu_for_selected_plan(update, ctx)
+        # Назад из инвойса сразу к списку тарифов
+        old_invoice_id = ctx.chat_data.pop("last_invoice_message_id", None)
+
+        if old_invoice_id:
+            try:
+                await ctx.bot.delete_message(
+                    chat_id=update.effective_chat.id, message_id=old_invoice_id
+                )
+            except BadRequest:
+                pass
+
+        if query and query.message:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+
+        await on_premium_menu(update, ctx)
         return
 
     if data == "payg:invoice_back":
@@ -2176,7 +2166,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await on_premium_menu(update, ctx)
         return
     elif data == "sub_back":
-        # Назад от выбора способа оплаты к списку тарифов
+        # Назад к списку тарифов
         if query and query.message:
             try:
                 await query.message.delete()
@@ -2184,19 +2174,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
         await on_premium_menu(update, ctx)
         return
-    elif data.startswith("buy_plan:"):
-        _, plan_id = data.split(":", 1)
-        plan = SUB_PLANS.get(plan_id)
-        if not plan:
-            await query.edit_message_text("Неизвестный план подписки. Попробуй ещё раз.")
-            return
-        ctx.chat_data["selected_plan_id"] = plan_id
-        await edit_menu_message(
-            update,
-            ctx,
-            f"План: {plan.title}. Выбери способ оплаты:",
-            kb_payment_methods(plan_id),
-        )
     elif data.startswith("buy_stars:"):
         await on_buy_with_stars(update, ctx)
     elif data.startswith("sub_stars:"):
@@ -2279,55 +2256,6 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await edit_menu_message(
         update, ctx, text, kb_premium_plans(paid_trial_used=bool(paid_trial_used))
-    )
-
-
-# ── Вспомогательный хелпер для возврата из инвойса ─────────────────────────────
-
-async def show_payment_menu_for_selected_plan(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Вернуть пользователя к выбору способа оплаты для ранее выбранного плана."""
-    query = update.callback_query
-    chat_id = update.effective_chat.id if update.effective_chat else None
-
-    # 1) Пытаемся удалить текущее сообщение (инвойс или что там сейчас висит)
-    if query and query.message:
-        try:
-            await query.message.delete()
-        except BadRequest:
-            # Если удалить не получилось — не критично, просто идём дальше
-            pass
-
-    # 2) Пытаемся восстановить план из контекста
-    plan_id = ctx.chat_data.get("selected_plan_id")
-    plan = SUB_PLANS.get(plan_id)
-
-    if not plan:
-        # Если по какой-то причине план потеряли — просто открываем главное меню подписки
-        await on_premium_menu(update, ctx)
-        return
-
-    if plan_id == "w1":
-        plan_description = "Подписка на 7 дней"
-    else:
-        plan_description = f"Подписка на {plan.months} мес."
-
-    star_price = plan.price_stars
-
-    text = (
-        f"План: {plan.title}\n"
-        f"{plan_description}\n\n"
-        f"Стоимость:\n"
-        f"• Звёзды: {star_price}\n"
-        f"• Карта: {plan.price_rub} ₽"
-    )
-
-    await edit_menu_message(
-        update,
-        ctx,
-        text,
-        kb_payment_methods(plan_id),
     )
 
 
@@ -2596,6 +2524,9 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data
     _, plan_id = data.split(":", 1)
     ctx.chat_data["selected_plan_id"] = plan_id
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+    _, _, paid_trial_used = await get_trial_info(db, user_id)
     plan = SUB_PLANS.get(plan_id)
     if not plan:
         await query.edit_message_text("Неизвестный план подписки.")
@@ -2643,7 +2574,7 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logging.exception("Failed to send RUB subscription invoice")
         await query.edit_message_text(
             "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
-            reply_markup=kb_payment_methods(plan_id),
+            reply_markup=kb_premium_plans(paid_trial_used=bool(paid_trial_used)),
         )
         return
 
