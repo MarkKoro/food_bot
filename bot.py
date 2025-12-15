@@ -3037,50 +3037,147 @@ async def cmd_degrant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if update.effective_user.id not in ADMINS:
         return
 
     db = get_db(ctx)
-
-    if ctx.args:
-        uid = int(ctx.args[0])
-        u = await db_get_user_row(db, uid)
-        bal = int(u.get("credits", 0) or 0)
-        mode = u.get("payment_mode", "sub")
-
-        cur = await db.execute(
-            "SELECT kind, COUNT(*) FROM requests WHERE user_id=? GROUP BY kind",
-            (uid,),
-        )
-        rows = await cur.fetchall()
+    
+    async def q1(sql, params=()):
+        cur = await db.execute(sql, params)
+        row = await cur.fetchone()
         await cur.close()
+        return row[0] if row and row[0] is not None else 0
 
-        lines = [f"📊 PAYG stats for {uid}", f"• mode: {mode}", f"• balance: {bal}₽", ""]
-        for k, n in rows:
-            lines.append(f"• {k}: {n}")
-        await update.message.reply_text("\n".join(lines))
-        return
+    total_users = await q1("SELECT COUNT(*) FROM users")
+    payg_users  = await q1("SELECT COUNT(*) FROM users WHERE COALESCE(payment_mode,'sub')='payg'")
+    sub_users   = await q1("SELECT COUNT(*) FROM users WHERE COALESCE(payment_mode,'sub')='sub'")
 
-    # общий summary
-    cur = await db.execute("SELECT COUNT(*) FROM users WHERE payment_mode='payg'")
-    payg_users = (await cur.fetchone())[0]
-    await cur.close()
+    sub_active = await q1("""
+        SELECT COUNT(*) FROM users
+        WHERE COALESCE(is_premium,0)=1
+          AND premium_until IS NOT NULL
+          AND datetime(premium_until) > datetime('now')
+    """)
 
-    cur = await db.execute(
-        "SELECT kind, COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') GROUP BY kind"
+    payg_bal_users = await q1("SELECT COUNT(*) FROM users WHERE COALESCE(payment_mode,'sub')='payg' AND COALESCE(credits,0)>0")
+    payg_bal_sum   = await q1("SELECT COALESCE(SUM(credits),0) FROM users WHERE COALESCE(payment_mode,'sub')='payg'")
+    payg_bal_avg   = await q1("SELECT COALESCE(AVG(credits),0) FROM users WHERE COALESCE(payment_mode,'sub')='payg'")
+
+    # requests: today / 7d
+    req_today_total = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime')")
+    req_7d_total    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day')")
+
+    # если pay_mode/cost_rub нет — считаем грубо по join с users
+    # (позже улучшишь, но метрики уже будут)
+    req_today_payg = 0
+    req_today_sub  = 0
+    req_7d_payg    = 0
+    req_7d_sub     = 0
+
+    try:
+        req_today_payg = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='payg'")
+        req_today_sub  = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='sub'")
+        req_7d_payg    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
+        req_7d_sub     = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='sub'")
+    except Exception:
+        req_today_payg = await q1("""
+            SELECT COUNT(*) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE date(r.created_at)=date('now','localtime')
+              AND COALESCE(u.payment_mode,'sub')='payg'
+        """)
+        req_today_sub = await q1("""
+            SELECT COUNT(*) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE date(r.created_at)=date('now','localtime')
+              AND COALESCE(u.payment_mode,'sub')='sub'
+        """)
+        req_7d_payg = await q1("""
+            SELECT COUNT(*) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+              AND COALESCE(u.payment_mode,'sub')='payg'
+        """)
+        req_7d_sub = await q1("""
+            SELECT COUNT(*) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+              AND COALESCE(u.payment_mode,'sub')='sub'
+        """)
+
+    # активные юзеры за 7 дней
+    active_7d_total = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day')")
+    active_7d_payg = 0
+    active_7d_sub  = 0
+    try:
+        active_7d_payg = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
+        active_7d_sub  = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='sub'")
+    except Exception:
+        active_7d_payg = await q1("""
+            SELECT COUNT(DISTINCT r.user_id) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+              AND COALESCE(u.payment_mode,'sub')='payg'
+        """)
+        active_7d_sub = await q1("""
+            SELECT COUNT(DISTINCT r.user_id) FROM requests r
+            JOIN users u ON u.telegram_id=r.user_id
+            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+              AND COALESCE(u.payment_mode,'sub')='sub'
+        """)
+
+    # PAYG "съедено" (если есть cost_rub) иначе считаем по кол-ву запросов * 2
+    payg_spent_today = 0
+    payg_spent_7d = 0
+    try:
+        payg_spent_today = await q1("SELECT COALESCE(SUM(cost_rub),0) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='payg'")
+        payg_spent_7d    = await q1("SELECT COALESCE(SUM(cost_rub),0) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
+    except Exception:
+        payg_spent_today = int(req_today_payg) * PAYG_COST_RUB
+        payg_spent_7d    = int(req_7d_payg) * PAYG_COST_RUB
+
+    # платежи (как получится)
+    payments_by_provider = []
+    try:
+        cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount),0) FROM payments GROUP BY provider ORDER BY 3 DESC")
+        payments_by_provider = await cur.fetchall()
+        await cur.close()
+    except Exception:
+        payments_by_provider = []
+
+    conv_payg = (payg_users / total_users * 100.0) if total_users else 0.0
+    conv_sub  = (sub_users / total_users * 100.0) if total_users else 0.0
+
+    text = (
+        "📊 **PAYG / SUB метрики**\n\n"
+        f"1) Users total: **{total_users}**\n"
+        f"2) Users SUB-mode: **{sub_users}** ({conv_sub:.1f}%)\n"
+        f"3) Users PAYG-mode: **{payg_users}** ({conv_payg:.1f}%)\n"
+        f"4) Active SUB (premium_until > now): **{sub_active}**\n\n"
+        f"5) PAYG users with balance>0: **{payg_bal_users}**\n"
+        f"6) PAYG balance sum: **{payg_bal_sum}₽**\n"
+        f"7) PAYG balance avg: **{payg_bal_avg:.1f}₽**\n\n"
+        f"8) Requests today total: **{req_today_total}**\n"
+        f"9) Requests today PAYG: **{req_today_payg}**\n"
+        f"10) Requests today SUB: **{req_today_sub}**\n\n"
+        f"11) Requests 7d total: **{req_7d_total}**\n"
+        f"12) Requests 7d PAYG: **{req_7d_payg}**\n"
+        f"13) Requests 7d SUB: **{req_7d_sub}**\n\n"
+        f"14) Active users 7d total: **{active_7d_total}**\n"
+        f"15) Active users 7d PAYG: **{active_7d_payg}**\n"
+        f"16) Active users 7d SUB: **{active_7d_sub}**\n\n"
+        f"17) PAYG spent today (usage): **{payg_spent_today}₽**\n"
+        f"18) PAYG spent 7d (usage): **{payg_spent_7d}₽**\n"
+        f"19) Avg req/day per active PAYG user (7d): **{(req_7d_payg / active_7d_payg):.2f if active_7d_payg else 0}**\n"
+        f"20) Avg req/day per active SUB user (7d): **{(req_7d_sub / active_7d_sub):.2f if active_7d_sub else 0}**\n"
     )
-    today = await cur.fetchall()
-    await cur.close()
 
-    text = ["📊 PAYG summary", f"• payg users: {payg_users}", ""]
-    if today:
-        text.append("Сегодня по requests:")
-        for k, n in today:
-            text.append(f"• {k}: {n}")
-    else:
-        text.append("Сегодня requests пока пусто.")
+    if payments_by_provider:
+        text += "\n💰 **Payments by provider (all-time)**\n"
+        for prov, cnt, sm in payments_by_provider:
+            text += f"• {prov}: {cnt} / {sm}\n"
 
-    await update.message.reply_text("\n".join(text))
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
