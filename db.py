@@ -107,12 +107,21 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "trial_used_count": "INTEGER DEFAULT 0",
         "paid_trial_used": "INTEGER DEFAULT 0",
         "payment_mode": "TEXT DEFAULT 'sub'",
+        "trial_granted": "INTEGER DEFAULT 0",
     }
 
+    added_cols: set[str] = set()
     for col, definition in required_cols.items():
         if col not in cols:
             await db.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
             await db.commit()
+            added_cols.add(col)
+
+    if "trial_granted" in cols or "trial_granted" in added_cols:
+        await db.execute(
+            "UPDATE users SET trial_granted=1 WHERE trial_until IS NOT NULL AND trial_granted=0"
+        )
+        await db.commit()
 
 
 # ── Пользователи / кредиты ─────────────────────────────
@@ -127,8 +136,8 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> None:
     # Если trial_until уже есть — повторно не выдаём (защита от /start-абуза).
     trial_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
     await db.execute(
-        "UPDATE users SET trial_until = ?, trial_used_count = 0 "
-        "WHERE telegram_id = ? AND trial_until IS NULL",
+        "UPDATE users SET trial_until = ?, trial_used_count = 0, trial_granted = 1 "
+        "WHERE telegram_id = ? AND trial_granted = 0",
         (trial_until, telegram_id),
     )
 

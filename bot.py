@@ -278,17 +278,21 @@ if not JOIN_URL:
 
 # ── Клавиатуры ────────────────────────────────────────
 
-def kb_main() -> InlineKeyboardMarkup:
+def kb_main(mode: str = "sub") -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [
-            InlineKeyboardButton(
-                "📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL)
-            )
-        ],
     ]
 
+    # меняем главное меню по режиму
+    if mode == "payg":
+        keyboard.insert(1, [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")])
+    else:
+        keyboard.insert(1, [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")])
+
+    keyboard.append(
+        [InlineKeyboardButton("📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL))]
+    )
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -495,7 +499,85 @@ TEXT_FOOD_USER_INSTRUCTIONS = (
     "Если в описании явно указана граммовка или размер порции, обязательно учитывай это."
 )
 
-SURVEY_STEPS = ["age", "sex", "height", "weight", "activity", "goal", "extra"]
+SURVEYS = {
+    "short": [
+        {"k": "sex", "q": "Пол", "opts": ["М", "Ж"]},
+        {"k": "age", "q": "Возраст", "free": True},
+        {"k": "height", "q": "Рост (см)", "free": True},
+        {"k": "weight", "q": "Вес (кг)", "free": True},
+        {
+            "k": "activity",
+            "q": "Активность",
+            "opts": ["Сидячая", "Лёгкая", "Средняя", "Высокая"],
+        },
+        {"k": "goal", "q": "Цель", "opts": ["Похудеть", "Поддерживать", "Набрать"]},
+        {"k": "note", "q": "Уточнение (необязательно)", "free": True, "optional": True},
+    ],
+    "extended": [
+        {"k": "sex", "q": "Пол", "opts": ["М", "Ж"]},
+        {"k": "age", "q": "Возраст", "free": True},
+        {"k": "height", "q": "Рост (см)", "free": True},
+        {"k": "weight", "q": "Вес (кг)", "free": True},
+        {
+            "k": "activity",
+            "q": "Активность",
+            "opts": ["Сидячая", "Лёгкая", "Средняя", "Высокая"],
+        },
+        {"k": "goal", "q": "Цель", "opts": ["Похудеть", "Поддерживать", "Набрать"]},
+        {"k": "note", "q": "Уточнение (необязательно)", "free": True, "optional": True},
+        {"k": "meals", "q": "Сколько приёмов пищи в день?", "opts": ["2", "3", "4", "5+"]},
+        {
+            "k": "diet",
+            "q": "Стиль питания",
+            "opts": ["Обычное", "Вегетариан.", "Веган", "Кето/low-carb", "Другое"],
+        },
+        {"k": "allergy", "q": "Аллергии / что нельзя?", "free": True, "optional": True},
+        {
+            "k": "health",
+            "q": "Диагнозы/ограничения (если есть)",
+            "free": True,
+            "optional": True,
+        },
+        {"k": "training", "q": "Тренировки", "opts": ["Нет", "Кардио", "Силовые", "Смешанные"]},
+        {"k": "sleep", "q": "Сон", "opts": ["<6ч", "6–7ч", "7–8ч", ">8ч"]},
+        {"k": "stress", "q": "Стресс", "opts": ["Низкий", "Средний", "Высокий"]},
+        {
+            "k": "note",
+            "q": "Любые детали (что важно учесть)",
+            "free": True,
+            "optional": True,
+        },
+    ],
+}
+
+LABELS = {
+    "sex": "Пол",
+    "age": "Возраст",
+    "height": "Рост",
+    "weight": "Вес",
+    "activity": "Активность",
+    "goal": "Цель",
+    "note": "Уточнение",
+    "meals": "Приёмов пищи",
+    "diet": "Стиль питания",
+    "allergy": "Аллергии",
+    "health": "Диагнозы/ограничения",
+    "training": "Тренировки",
+    "sleep": "Сон",
+    "stress": "Стресс",
+}
+
+
+def build_survey_block(ans: dict) -> str:
+    lines = []
+    for k, v in ans.items():
+        if v is None:
+            continue
+        text = str(v).strip()
+        if not text:
+            continue
+        lines.append(f"- {LABELS.get(k, k)}: {text}")
+    return "\n".join(lines)
 
 # ── DB init ───────────────────────────────────────────
 
@@ -1067,6 +1149,10 @@ async def show_main_menu(
 
     await ensure_admin_premium(db, user_id)
 
+    u = await db_get_user_row(db, user_id)
+    mode = u.get("payment_mode", "sub")
+    balance = int(u.get("credits", 0) or 0)
+
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
     trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
@@ -1105,13 +1191,21 @@ async def show_main_menu(
         lines.append("")
         lines.append("🛠 Админ-доступ: премиум ∞")
 
+    lines.append("")
+    if mode == "payg":
+        lines.append("💳 Режим оплаты: Pay-as-you-go ✅")
+        lines.append(f"Баланс: {balance}₽ • списание {PAYG_COST_RUB}₽/запрос • без лимитов")
+    else:
+        lines.append("💳 Режим оплаты: Подписка ✅")
+        lines.append(f"Лимит: {DAILY_LIMIT}/день (защита)")
+
     text = "\n".join(lines)
     chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
     await send_new_menu_message(
         ctx,
         chat_id,
         text,
-        kb_main(),
+        kb_main(mode),
         user_id=update.effective_user.id if update.effective_user else None,
     )
 
@@ -1220,75 +1314,71 @@ async def show_survey_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 async def start_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Инициализация опроса: обнуляем данные и задаём первый вопрос.
+    Инициализация опроса: обнуляем данные и предлагаем выбрать формат.
     """
-    ctx.user_data["survey"] = {}
+    ctx.user_data["survey_answers"] = {}
     ctx.user_data["survey_step"] = 0
-    ctx.user_data["state"] = "survey_running"
-    await ask_current_survey_question(update, ctx)
+    ctx.user_data["survey_mode"] = None
+    ctx.user_data["state"] = "survey_select_mode"
+
+    text = (
+        "Выбери формат опроса:\n\n"
+        "• Быстро (≈1 мин) — базовые вопросы\n"
+        "• Точно (≈2–3 мин) — больше деталей для расчёта"
+    )
+
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Быстро (≈1 мин)", callback_data="survey_mode:short"),
+                InlineKeyboardButton("Точно (≈2–3 мин)", callback_data="survey_mode:extended"),
+            ],
+        ]
+    )
+
+    await edit_menu_message(update, ctx, text, kb)
 
 
 async def ask_current_survey_question(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Показывает текущий вопрос опроса в зависимости от survey_step.
     """
+    mode = ctx.user_data.get("survey_mode") or "short"
+    steps = SURVEYS.get(mode, [])
     step = ctx.user_data.get("survey_step", 0)
-    if step < 0 or step >= len(SURVEY_STEPS):
-        ctx.user_data["state"] = None
-        await show_settings(update, ctx)
+    if step < 0 or step >= len(steps):
+        await finish_survey(update, ctx)
         return
 
-    key = SURVEY_STEPS[step]
+    q = steps[step]
+    key = q["k"]
+    ctx.user_data["state"] = "survey_running"
 
-    if key == "age":
-        text = (
-            "Давай подберём норму КБЖУ 🧮\n\n"
-            "1/7. *Сколько тебе полных лет?*\n\n"
-            "Напиши одним числом, например: `27`"
-        )
-    elif key == "sex":
-        text = (
-            "2/7. *Твой пол?*\n\n"
-            "Напиши удобно для себя, я пойму: `м`, `ж`, `мужчина`, `женщина`."
-        )
-    elif key == "height":
-        text = (
-            "3/7. *Какой у тебя рост в сантиметрах?*\n\n"
-            "Например: `178`"
-        )
-    elif key == "weight":
-        text = (
-            "4/7. *Какой у тебя вес в килограммах?*\n\n"
-            "Например: `72`"
-        )
-    elif key == "activity":
-        text = (
-            "5/7. *Как ты обычно двигаешься в течение недели?*\n\n"
-            "Выбери цифру и напиши её:\n"
-            "1 — почти не двигаюсь (офис/дом, без спорта)\n"
-            "2 — лёгкая активность (прогулки, редкий спорт)\n"
-            "3 — умеренная (3–4 тренировки в неделю)\n"
-            "4 — высокая (ежедневный спорт или физическая работа)\n"
-            "5 — очень высокая (тяжёлый физический труд, спорт 2 раза в день)"
-        )
-    elif key == "goal":
-        text = (
-            "6/7. *Что хочешь сделать с весом в ближайшие 3–6 месяцев?*\n\n"
-            "Тоже цифрой:\n"
-            "1 — плавно похудеть\n"
-            "2 — удерживать текущий вес\n"
-            "3 — набрать массу (мышцы / вес)"
-        )
-    elif key == "extra":
-        text = (
-            "7/7. *Есть ли важные детали, про которые стоит знать?*\n\n"
-            "Например: тип тренировок, вегетарианство, ОМАД, проблемы с ЖКТ и т.п.\n"
-            "Если ничего особенного — просто напиши `нет`."
-        )
+    total = len(steps)
+    prefix = f"{step + 1}/{total}. *{q['q']}*"
+    info_lines = [prefix]
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    opts = q.get("opts")
+    if opts:
+        row: list[InlineKeyboardButton] = []
+        for opt in opts:
+            row.append(InlineKeyboardButton(opt, callback_data=f"survey_ans:{key}:{opt}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        if q.get("optional"):
+            buttons.append([InlineKeyboardButton("Пропустить", callback_data=f"survey_skip:{key}")])
     else:
-        text = "Ответь на текущий вопрос опроса."
+        info_lines.append("Напиши ответ текстом.")
+        if q.get("optional"):
+            info_lines.append("Можно пропустить, если не хочешь отвечать.")
+            buttons.append([InlineKeyboardButton("Пропустить", callback_data=f"survey_skip:{key}")])
 
-    await edit_menu_message(update, ctx, text, kb_back_to_main())
+    kb = InlineKeyboardMarkup(buttons) if buttons else kb_back_to_main()
+    await edit_menu_message(update, ctx, "\n\n".join(info_lines), kb)
 
 
 async def generate_goal_from_survey(answers: dict) -> dict:
@@ -1300,19 +1390,6 @@ async def generate_goal_from_survey(answers: dict) -> dict:
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    # Собираем описание пользователя
-    user_desc_lines = [
-        "Вот ответы пользователя на опрос для подбора дневной нормы КБЖУ:",
-        f"- Возраст: {answers.get('age', '').strip()}",
-        f"- Пол: {answers.get('sex', '').strip()}",
-        f"- Рост: {answers.get('height', '').strip()}",
-        f"- Вес: {answers.get('weight', '').strip()}",
-        f"- Активность (1–5): {answers.get('activity', '').strip()}",
-        f"- Цель (1–3): {answers.get('goal', '').strip()}",
-        f"- Дополнительные детали: {answers.get('extra', '').strip()}",
-    ]
-    user_desc = "\n".join(user_desc_lines)
 
     system_prompt = (
         "Ты — нутрициолог и тренер по образу жизни. "
@@ -1332,9 +1409,10 @@ async def generate_goal_from_survey(answers: dict) -> dict:
     )
 
     user_prompt = (
-        user_desc
-        + "\n\nПодбери дневную норму так, чтобы она была комфортной и устойчивой "
-          "на дистанции, без экстремальных голодовок или переедания."
+        "Данные пользователя:\n"
+        f"{build_survey_block(answers)}\n\n"
+        "Подбери дневную норму так, чтобы она была комфортной и устойчивой "
+        "на дистанции, без экстремальных голодовок или переедания."
     )
 
     payload = {
@@ -1368,7 +1446,7 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     db = get_db(ctx)
     uid = update.effective_user.id
-    answers = ctx.user_data.get("survey") or {}
+    answers = ctx.user_data.get("survey_answers") or {}
 
     try:
         goal_data = await generate_goal_from_survey(answers)
@@ -1830,23 +1908,29 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Опрос для подбора цели
     if state == "survey_running":
-        survey = ctx.user_data.get("survey") or {}
+        mode = ctx.user_data.get("survey_mode") or "short"
+        steps = SURVEYS.get(mode, [])
         step = ctx.user_data.get("survey_step", 0)
 
-        if step < 0 or step >= len(SURVEY_STEPS):
+        if step < 0 or step >= len(steps):
             ctx.user_data["state"] = None
             await show_settings(update, ctx)
             return
 
-        key = SURVEY_STEPS[step]
-        survey[key] = text.strip()
-        ctx.user_data["survey"] = survey
+        q = steps[step]
+        if q.get("opts"):
+            await delete_user_message(update)
+            await ask_current_survey_question(update, ctx)
+            return
+
+        survey = ctx.user_data.get("survey_answers") or {}
+        survey[q["k"]] = text.strip()
+        ctx.user_data["survey_answers"] = survey
         ctx.user_data["survey_step"] = step + 1
 
         await delete_user_message(update)
 
-        # Если есть ещё вопросы — задаём следующий, иначе завершаем опрос
-        if ctx.user_data["survey_step"] < len(SURVEY_STEPS):
+        if ctx.user_data["survey_step"] < len(steps):
             await ask_current_survey_question(update, ctx)
         else:
             await finish_survey(update, ctx)
@@ -2197,6 +2281,49 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_stats(update, ctx)
     elif data == "survey_start":
         await start_survey(update, ctx)
+    elif data.startswith("survey_mode:"):
+        mode = data.split(":", 1)[1]
+        if mode not in SURVEYS:
+            await show_settings(update, ctx)
+            return
+        ctx.user_data["survey_mode"] = mode
+        ctx.user_data["survey_step"] = 0
+        ctx.user_data["survey_answers"] = {}
+        await ask_current_survey_question(update, ctx)
+    elif data.startswith("survey_ans:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            _, key, value = parts
+            mode = ctx.user_data.get("survey_mode") or "short"
+            steps = SURVEYS.get(mode, [])
+            step = ctx.user_data.get("survey_step", 0)
+            if 0 <= step < len(steps):
+                q = steps[step]
+                if q.get("k") == key:
+                    answers = ctx.user_data.get("survey_answers") or {}
+                    answers[key] = value
+                    ctx.user_data["survey_answers"] = answers
+                    ctx.user_data["survey_step"] = step + 1
+                    if ctx.user_data["survey_step"] < len(steps):
+                        await ask_current_survey_question(update, ctx)
+                    else:
+                        await finish_survey(update, ctx)
+    elif data.startswith("survey_skip:"):
+        _, key = data.split(":", 1)
+        mode = ctx.user_data.get("survey_mode") or "short"
+        steps = SURVEYS.get(mode, [])
+        step = ctx.user_data.get("survey_step", 0)
+        if 0 <= step < len(steps):
+            q = steps[step]
+            if q.get("k") == key and q.get("optional"):
+                answers = ctx.user_data.get("survey_answers") or {}
+                answers[key] = None
+                ctx.user_data["survey_answers"] = answers
+                ctx.user_data["survey_step"] = step + 1
+                if ctx.user_data["survey_step"] < len(steps):
+                    await ask_current_survey_question(update, ctx)
+                else:
+                    await finish_survey(update, ctx)
     elif data in {"back", "back_to_main"}:
         await show_main_menu(update, ctx)
     elif data == "meal_extra_portion":
@@ -2844,7 +2971,7 @@ async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_until = base + timedelta(days=days)
 
     await db.execute(
-        "UPDATE users SET is_premium=1, premium_until=?, trial_until=NULL, trial_used_count=0 WHERE telegram_id=?",
+        "UPDATE users SET is_premium=1, premium_until=? WHERE telegram_id=?",
         (new_until.isoformat(), target_id),
     )
     await db.commit()
