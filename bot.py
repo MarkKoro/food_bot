@@ -314,24 +314,19 @@ def kb_settings() -> InlineKeyboardMarkup:
     )
 
 
-def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int):
-    rows = []
-    label_mode = "Pay-as-you-go" if current_mode == "payg" else "Подписка"
-    rows.append([InlineKeyboardButton(f"Текущий режим: {label_mode}", callback_data="noop")])
+def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_text: str):
+    # галочки
+    sub_mark = "✅" if current_mode == "sub" else "☑️"
+    payg_mark = "✅" if current_mode == "payg" else "☑️"
 
-    if current_mode != "sub":
-        rows.append([InlineKeyboardButton("Переключить на подписку", callback_data="pay_mode_set:sub")])
-    else:
-        rows.append([InlineKeyboardButton("Переключить на Pay-as-you-go", callback_data="pay_mode_set:payg")])
-
-    # подсказки
-    if current_mode == "sub" and payg_balance > 0:
-        rows.append([InlineKeyboardButton(f"У тебя есть баланс PAYG: {payg_balance}₽ → переключиться", callback_data="pay_mode_set:payg")])
-    if current_mode == "payg" and has_sub:
-        rows.append([InlineKeyboardButton("У тебя есть активная подписка → переключиться", callback_data="pay_mode_set:sub")])
-
-    rows.append([InlineKeyboardButton("➕ Пополнить баланс (PAYG)", callback_data="payg_topups")])
-    rows.append([InlineKeyboardButton("⬅ Назад", callback_data="settings")])
+    rows = [
+        [
+            InlineKeyboardButton(f"{sub_mark} Подписка", callback_data="pay_mode_set:sub"),
+            InlineKeyboardButton(f"{payg_mark} Pay-as-you-go", callback_data="pay_mode_set:payg"),
+        ],
+        [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="settings")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 
@@ -341,18 +336,16 @@ def kb_payg_topups():
 
     for rub in PAYG_TOPUPS_RUB:
         stars = rub_to_stars(rub)
+
         if has_card:
             rows.append([
-                InlineKeyboardButton(f"⭐ +{rub}₽ (≈{stars}⭐)", callback_data=f"payg_buy_stars:{rub}"),
-                InlineKeyboardButton(f"💳 +{rub}₽", callback_data=f"payg_buy_card:{rub}"),
+                InlineKeyboardButton(f"💳 {rub}₽", callback_data=f"payg_buy_card:{rub}"),
+                InlineKeyboardButton(f"{stars}⭐", callback_data=f"payg_buy_stars:{rub}"),
             ])
         else:
             rows.append([
-                InlineKeyboardButton(f"⭐ +{rub}₽ (≈{stars}⭐)", callback_data=f"payg_buy_stars:{rub}")
+                InlineKeyboardButton(f"{stars}⭐", callback_data=f"payg_buy_stars:{rub}")
             ])
-
-    if not has_card:
-        rows.append([InlineKeyboardButton("💳 Оплата картой появится после токена YooKassa", callback_data="noop")])
 
     rows.append([InlineKeyboardButton("⬅ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(rows)
@@ -1202,19 +1195,25 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mode = u.get("payment_mode", "sub")
     balance = int(u.get("credits", 0) or 0)
 
-    # активная подписка? (если у тебя логика по premium_until — используем её)
     premium_until = _parse_dt(u.get("premium_until"))
     has_sub = bool(u.get("is_premium")) and premium_until and premium_until > datetime.now()
 
+    sub_until_text = premium_until.strftime("%d.%m.%Y") if has_sub else "нет активной подписки"
+
     text = (
         "💳 **Режим оплаты**\n\n"
-        f"• Текущий: **{'Pay-as-you-go' if mode == 'payg' else 'Подписка'}**\n"
-        f"• Баланс PAYG: **{balance}₽**\n"
-        f"• Цена: **{PAYG_COST_RUB}₽ / запрос** (фото или голос)\n"
-        "• Лимитов нет: PAYG списывает за каждый запрос\n\n"
-        "Переключение режимов **ничего не сжигает**: подписка остаётся в базе, баланс остаётся в базе."
+        f"1) **Подписка** {'✅' if mode == 'sub' else ''}\n"
+        f"• Статус: **{sub_until_text}**\n"
+        "• Лимит: **10 запросов в день** (фото/голос)\n"
+        "• Деньги с баланса не списываются\n\n"
+        f"2) **Pay-as-you-go** {'✅' if mode == 'payg' else ''}\n"
+        f"• Баланс: **{balance}₽**\n"
+        f"• Цена: **{PAYG_COST_RUB}₽ за запрос** (фото/голос)\n"
+        "• Лимитов нет\n\n"
+        "Выбери режим кнопками ниже — галочка переедет, а режим сохранится."
     )
-    await edit_menu_message(update, ctx, text, kb_pay_mode(mode, has_sub, balance))
+
+    await edit_menu_message(update, ctx, text, kb_pay_mode(mode, has_sub, balance, sub_until_text))
 
 
 # ── Опрос для подбора цели ─────────────────────────────
@@ -2995,6 +2994,95 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def cmd_grant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /grant_payg <user_id> [rub]")
+        return
+
+    target_id = int(ctx.args[0])
+    rub = int(ctx.args[1]) if len(ctx.args) > 1 else 0
+
+    db = get_db(ctx)
+    await ensure_user(db, target_id)
+    await db_set_payment_mode(db, target_id, "payg")
+
+    new_bal = None
+    if rub > 0:
+        new_bal = await db_add_payg_balance(db, target_id, rub)
+
+    if new_bal is None:
+        u = await db_get_user_row(db, target_id)
+        new_bal = int(u.get("credits", 0) or 0)
+
+    await update.message.reply_text(f"✅ PAYG включен для {target_id}. Баланс: {new_bal}₽")
+
+
+async def cmd_degrant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /degrant_payg <user_id>")
+        return
+
+    target_id = int(ctx.args[0])
+    db = get_db(ctx)
+    await ensure_user(db, target_id)
+    await db_set_payment_mode(db, target_id, "sub")
+    u = await db_get_user_row(db, target_id)
+    bal = int(u.get("credits", 0) or 0)
+
+    await update.message.reply_text(f"✅ PAYG выключен для {target_id}. Баланс сохранён: {bal}₽")
+
+
+async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+
+    db = get_db(ctx)
+
+    if ctx.args:
+        uid = int(ctx.args[0])
+        u = await db_get_user_row(db, uid)
+        bal = int(u.get("credits", 0) or 0)
+        mode = u.get("payment_mode", "sub")
+
+        cur = await db.execute(
+            "SELECT kind, COUNT(*) FROM requests WHERE user_id=? GROUP BY kind",
+            (uid,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+
+        lines = [f"📊 PAYG stats for {uid}", f"• mode: {mode}", f"• balance: {bal}₽", ""]
+        for k, n in rows:
+            lines.append(f"• {k}: {n}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # общий summary
+    cur = await db.execute("SELECT COUNT(*) FROM users WHERE payment_mode='payg'")
+    payg_users = (await cur.fetchone())[0]
+    await cur.close()
+
+    cur = await db.execute(
+        "SELECT kind, COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') GROUP BY kind"
+    )
+    today = await cur.fetchall()
+    await cur.close()
+
+    text = ["📊 PAYG summary", f"• payg users: {payg_users}", ""]
+    if today:
+        text.append("Сегодня по requests:")
+        for k, n in today:
+            text.append(f"• {k}: {n}")
+    else:
+        text.append("Сегодня requests пока пусто.")
+
+    await update.message.reply_text("\n".join(text))
+
+
 async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     await delete_user_message(update)
@@ -3041,6 +3129,9 @@ def main() -> None:
     application.add_handler(CommandHandler("grant", cmd_grant))
     application.add_handler(CommandHandler("degrant", cmd_degrant))
     application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("grant_payg", cmd_grant_payg))
+    application.add_handler(CommandHandler("degrant_payg", cmd_degrant_payg))
+    application.add_handler(CommandHandler("stats_payg", cmd_stats_payg))
     application.add_handler(CommandHandler("mystats", cmd_my_stats))
 
     # Callback-кнопки
