@@ -6,7 +6,9 @@ import io
 import json
 import base64
 import logging
+import math
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -153,6 +155,90 @@ ADMINS = {
 
 ADMIN_PREMIUM_UNTIL = datetime(2099, 1, 1)
 
+# Pay-as-you-go
+PAYG_COST_RUB = 2  # 2 руб за фото или голос
+PAYG_TOPUPS_RUB = [50, 100, 200, 500]
+RUB_PER_STAR = 1.79  # твоя оценка. Можно потом поменять.
+DAILY_REQUEST_LIMIT = 10  # общий лимит на сутки (защита от "каждую минуту")
+
+
+def rub_to_stars(rub: int) -> int:
+    return int(math.ceil(rub / RUB_PER_STAR))
+
+
+async def db_get_user_row(db, user_id: int) -> dict:
+    cur = await db.execute(
+        "SELECT telegram_id, credits, payment_mode, is_premium, premium_until, trial_until, trial_used_count, paid_trial_used "
+        "FROM users WHERE telegram_id=?",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return {}
+    return {
+        "telegram_id": row[0],
+        "credits": row[1] or 0,
+        "payment_mode": (row[2] or "sub"),
+        "is_premium": int(row[3] or 0),
+        "premium_until": row[4],
+        "trial_until": row[5],
+        "trial_used_count": int(row[6] or 0),
+        "paid_trial_used": int(row[7] or 0),
+    }
+
+
+async def db_set_payment_mode(db, user_id: int, mode: str) -> None:
+    await db.execute("UPDATE users SET payment_mode=? WHERE telegram_id=?", (mode, user_id))
+    await db.commit()
+
+
+async def db_add_payg_balance(db, user_id: int, rub: int) -> int:
+    await db.execute("UPDATE users SET credits = COALESCE(credits,0) + ? WHERE telegram_id=?", (rub, user_id))
+    await db.commit()
+    cur = await db.execute("SELECT credits FROM users WHERE telegram_id=?", (user_id,))
+    v = await cur.fetchone()
+    await cur.close()
+    return int((v[0] if v else 0) or 0)
+
+
+async def db_try_spend_payg(db, user_id: int, rub: int) -> bool:
+    # атомарно: списать только если хватает
+    cur = await db.execute(
+        "UPDATE users SET credits = credits - ? WHERE telegram_id=? AND COALESCE(credits,0) >= ?",
+        (rub, user_id, rub),
+    )
+    await db.commit()
+    return cur.rowcount == 1
+
+
+async def db_count_requests_today(db, user_id: int) -> int:
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM requests WHERE user_id=? AND date(created_at)=date('now','localtime')",
+        (user_id,),
+    )
+    n = await cur.fetchone()
+    await cur.close()
+    return int((n[0] if n else 0) or 0)
+
+
+async def db_log_request(db, user_id: int, kind: str) -> None:
+    await db.execute(
+        "INSERT INTO requests(user_id, kind) VALUES(?, ?)",
+        (user_id, kind),
+    )
+    await db.commit()
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        # обычно хранится как 'YYYY-MM-DD HH:MM:SS'
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
@@ -223,9 +309,40 @@ def kb_settings() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")],
+            [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
     )
+
+
+def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int):
+    rows = []
+    label_mode = "Pay-as-you-go" if current_mode == "payg" else "Подписка"
+    rows.append([InlineKeyboardButton(f"Текущий режим: {label_mode}", callback_data="noop")])
+
+    if current_mode != "sub":
+        rows.append([InlineKeyboardButton("Переключить на подписку", callback_data="pay_mode_set:sub")])
+    else:
+        rows.append([InlineKeyboardButton("Переключить на Pay-as-you-go", callback_data="pay_mode_set:payg")])
+
+    # подсказки
+    if current_mode == "sub" and payg_balance > 0:
+        rows.append([InlineKeyboardButton(f"У тебя есть баланс PAYG: {payg_balance}₽ → переключиться", callback_data="pay_mode_set:payg")])
+    if current_mode == "payg" and has_sub:
+        rows.append([InlineKeyboardButton("У тебя есть активная подписка → переключиться", callback_data="pay_mode_set:sub")])
+
+    rows.append([InlineKeyboardButton("➕ Пополнить баланс (PAYG)", callback_data="payg_topups")])
+    rows.append([InlineKeyboardButton("⬅ Назад", callback_data="settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_payg_topups():
+    rows = []
+    for rub in PAYG_TOPUPS_RUB:
+        stars = rub_to_stars(rub)
+        rows.append([InlineKeyboardButton(f"+{rub}₽  (≈ {stars}⭐)", callback_data=f"payg_buy:{rub}")])
+    rows.append([InlineKeyboardButton("⬅ Назад", callback_data="pay_mode")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
@@ -1064,6 +1181,29 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await edit_menu_message(update, ctx, text, kb_settings())
 
 
+async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    db = get_db(ctx)
+    u = await db_get_user_row(db, uid)
+
+    mode = u.get("payment_mode", "sub")
+    balance = int(u.get("credits", 0) or 0)
+
+    # активная подписка? (если у тебя логика по premium_until — используем её)
+    premium_until = _parse_dt(u.get("premium_until"))
+    has_sub = bool(u.get("is_premium")) and premium_until and premium_until > datetime.now()
+
+    text = (
+        "💳 **Режим оплаты**\n\n"
+        f"• Текущий: **{'Pay-as-you-go' if mode == 'payg' else 'Подписка'}**\n"
+        f"• Баланс PAYG: **{balance}₽**\n"
+        f"• Цена: **{PAYG_COST_RUB}₽ / запрос** (фото или голос)\n"
+        f"• Лимит защиты: **{DAILY_REQUEST_LIMIT} запросов/сутки**\n\n"
+        "Переключение режимов **ничего не сжигает**: подписка остаётся в базе, баланс остаётся в базе."
+    )
+    await edit_menu_message(update, ctx, text, kb_pay_mode(mode, has_sub, balance))
+
+
 # ── Опрос для подбора цели ─────────────────────────────
 
 async def show_survey_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1520,6 +1660,31 @@ async def _process_meal_calculation(
         )
         return
 
+    # Pay-as-you-go биллинг и дневной лимит
+    if uid not in ADMINS:
+        used_today = await db_count_requests_today(db, uid)
+        if used_today >= DAILY_REQUEST_LIMIT:
+            await edit_menu_message(update, ctx, "⚠️ Сегодня лимит запросов исчерпан. Попробуй завтра.", kb_main())
+            return
+
+    u = await db_get_user_row(db, uid)
+    mode = u.get("payment_mode", "sub")
+
+    if uid not in ADMINS and mode == "payg":
+        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
+        if not ok:
+            bal = int(u.get("credits", 0) or 0)
+            await edit_menu_message(
+                update,
+                ctx,
+                f"💳 Недостаточно баланса PAYG.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
+                kb_payg_topups(),
+            )
+            return
+
+    if uid not in ADMINS:
+        await db_log_request(db, uid, "photo")
+
     # Считаем КБЖУ
     try:
         data = await analyze_food_photo(image_bytes, extra_description=extra_description)
@@ -1797,6 +1962,32 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    db = get_db(ctx)
+
+    if uid not in ADMINS:
+        used_today = await db_count_requests_today(db, uid)
+        if used_today >= DAILY_REQUEST_LIMIT:
+            await edit_menu_message(update, ctx, "⚠️ Сегодня лимит запросов исчерпан. Попробуй завтра.", kb_main())
+            return
+
+    u = await db_get_user_row(db, uid)
+    pay_mode = u.get("payment_mode", "sub")
+
+    if uid not in ADMINS and pay_mode == "payg":
+        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
+        if not ok:
+            bal = int(u.get("credits", 0) or 0)
+            await edit_menu_message(
+                update,
+                ctx,
+                f"💳 Недостаточно баланса PAYG.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
+                kb_payg_topups(),
+            )
+            return
+
+    if uid not in ADMINS:
+        await db_log_request(db, uid, "voice")
+
     # Транскрибируем
     try:
         transcript = await transcribe_voice_audio(audio_bytes)
@@ -1822,7 +2013,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Анализируем текст как приём пищи
-    db = get_db(ctx)
     try:
         data = await analyze_food_text(transcript)
         totals = extract_totals(data)
@@ -1903,6 +2093,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     data = query.data or ""
+    uid = update.effective_user.id
     await query.answer()
 
     if data == "sub:invoice_back":
@@ -1915,6 +2106,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not await ensure_subscription(update, ctx):
+        return
+
+    if data == "pay_mode":
+        await show_pay_mode(update, ctx)
+        return
+
+    if data.startswith("pay_mode_set:"):
+        mode = data.split(":", 1)[1]
+        db = get_db(ctx)
+        await db_set_payment_mode(db, uid, mode)
+        await show_pay_mode(update, ctx)
+        return
+
+    if data == "payg_topups":
+        await edit_menu_message(update, ctx, "➕ Выбери сумму пополнения PAYG:", kb_payg_topups())
+        return
+
+    if data.startswith("payg_buy:"):
+        rub = int(data.split(":", 1)[1])
+        await send_payg_invoice(update, ctx, rub)
         return
     if data == "main":
         await show_main_menu(update, ctx)
@@ -2198,6 +2409,25 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
+async def send_payg_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
+    uid = update.effective_user.id
+
+    stars = rub_to_stars(rub)
+    payload = json.dumps({"type": "payg_topup", "rub": rub})
+
+    prices = [LabeledPrice(label=f"Пополнение +{rub}₽", amount=stars)]
+
+    await ctx.bot.send_invoice(
+        chat_id=uid,
+        title="Грамм — Pay-as-you-go",
+        description=f"Пополнение баланса на +{rub}₽. Списание: {PAYG_COST_RUB}₽ за запрос.",
+        payload=payload,
+        provider_token="",  # для Stars пусто
+        currency="XTR",
+        prices=prices,
+    )
+
+
 async def send_stars_invoice(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -2310,8 +2540,17 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    payload = query.invoice_payload or ""
+    q = update.pre_checkout_query
+    payload = q.invoice_payload or ""
+
+    try:
+        data = json.loads(payload)
+        if data.get("type") in ("sub", "payg_topup", "subscription"):
+            await q.answer(ok=True)
+            return
+    except Exception:
+        pass
+
     allow = False
 
     if payload.startswith("sub:") or payload.startswith("sub_stars:"):
@@ -2325,9 +2564,9 @@ async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             allow = False
 
     if allow:
-        await query.answer(ok=True)
+        await q.answer(ok=True)
     else:
-        await query.answer(ok=False, error_message="Неизвестный тип оплаты.")
+        await q.answer(ok=False, error_message="Неизвестный тип оплаты.")
 
 
 async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2337,6 +2576,24 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     payload = sp.invoice_payload or ""
     user_id = user.id
     db = ctx.application.bot_data["db"]
+
+    try:
+        data = json.loads(payload)
+    except Exception:
+        data = {}
+
+    if data.get("type") == "payg_topup":
+        rub = int(data.get("rub") or 0)
+        db = get_db(ctx)
+        await db_add_payg_balance(db, user_id, rub)
+
+        try:
+            await save_payment(db, user_id, "stars", rub, "RUB", payload)
+        except Exception:
+            pass
+
+        await show_main_menu(update, ctx)
+        return
 
     now = utcnow()
     current_until = await get_premium_until(db, user_id)
