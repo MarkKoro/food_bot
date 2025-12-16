@@ -104,6 +104,21 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_templates_user ON templates(user_id);
+
+        CREATE TABLE IF NOT EXISTS promotions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT DEFAULT (datetime('now','utc')),
+            total_slots INTEGER NOT NULL,
+            remaining_slots INTEGER NOT NULL,
+            bonus_days INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS promotion_grants (
+            promo_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            granted_at TEXT DEFAULT (datetime('now','utc')),
+            PRIMARY KEY (promo_id, user_id)
+        );
         """
     )
     await db.commit()
@@ -167,11 +182,12 @@ async def create_tables(db: aiosqlite.Connection) -> None:
 
 # ── Пользователи / кредиты ─────────────────────────────
 
-async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> None:
-    await db.execute(
+async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> bool:
+    cur = await db.execute(
         "INSERT OR IGNORE INTO users (telegram_id) VALUES (?)",
         (telegram_id,),
     )
+    new_user = cur.rowcount > 0
 
     # Бесплатные 24 часа — один раз на пользователя.
     # Если trial_until уже есть — повторно не выдаём (защита от /start-абуза).
@@ -183,7 +199,100 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> None:
     )
 
     await db.commit()
+    return new_user
 
+
+async def add_promotion(
+    db: aiosqlite.Connection, total_slots: int, bonus_days: int
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO promotions (total_slots, remaining_slots, bonus_days) VALUES (?, ?, ?)",
+        (total_slots, total_slots, bonus_days),
+    )
+    await db.commit()
+    return int(cur.lastrowid)
+
+
+async def list_active_promotions(db: aiosqlite.Connection) -> list[dict]:
+    cur = await db.execute(
+        "SELECT id, total_slots, remaining_slots, bonus_days, created_at "
+        "FROM promotions WHERE remaining_slots > 0 ORDER BY id ASC"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    promos: list[dict] = []
+    for row in rows:
+        promos.append(
+            {
+                "id": int(row[0]),
+                "total_slots": int(row[1]),
+                "remaining_slots": int(row[2]),
+                "bonus_days": int(row[3]),
+                "created_at": row[4],
+            }
+        )
+    return promos
+
+
+async def get_active_promotion(db: aiosqlite.Connection) -> dict | None:
+    promos = await list_active_promotions(db)
+    return promos[0] if promos else None
+
+
+async def grant_active_promotion(
+    db: aiosqlite.Connection, user_id: int
+) -> tuple[dict | None, bool]:
+    await ensure_user(db, user_id)
+
+    cur = await db.execute(
+        "SELECT promo_id FROM promotion_grants WHERE user_id = ?",
+        (user_id,),
+    )
+    already = await cur.fetchone()
+    await cur.close()
+    if already:
+        return None, False
+
+    promo = await get_active_promotion(db)
+    if not promo:
+        return None, False
+
+    async with db.execute(
+        "UPDATE promotions SET remaining_slots = remaining_slots - 1 "
+        "WHERE id = ? AND remaining_slots > 0",
+        (promo["id"],),
+    ) as upd:
+        await db.commit()
+        if upd.rowcount != 1:
+            return None, False
+
+    await db.execute(
+        "INSERT INTO promotion_grants (promo_id, user_id) VALUES (?, ?)",
+        (promo["id"], user_id),
+    )
+    await db.commit()
+
+    promo["remaining_slots"] -= 1
+    return promo, True
+
+
+async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
+    tables_with_user_id = [
+        "meals",
+        "goals",
+        "subscriptions",
+        "payments",
+        "requests",
+        "templates",
+        "promotion_grants",
+    ]
+
+    for table in tables_with_user_id:
+        await db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
+    await db.execute("DELETE FROM users WHERE telegram_id = ?", (user_id,))
+    await db.execute("DELETE FROM invites WHERE referrer_id = ? OR invited_id = ?", (user_id, user_id))
+    await db.commit()
 
 async def set_premium_until(
     db: aiosqlite.Connection, user_id: int, premium_until: datetime
