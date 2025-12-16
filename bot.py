@@ -88,19 +88,19 @@ class SubscriptionPlan:
 
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
-    "w1": SubscriptionPlan("w1", "Одна неделя", 0, 125, 70),  # 125₽ ≈ 70⭐
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 399, 220),  # 399₽ ≈ 220⭐
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 1000, 560),  # 1000₽ ≈ 560⭐
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1800, 1010),  # 1800₽ ≈ 1010⭐
-    "y1": SubscriptionPlan("y1", "1 год", 12, 3500, 1960),  # 3500₽ ≈ 1960⭐
+    "w1": SubscriptionPlan("w1", "Одна неделя", 0, 125, 84),  # 125₽ ≈ 84⭐
+    "m1": SubscriptionPlan("m1", "1 месяц", 1, 399, 266),  # 399₽ ≈ 266⭐
+    "m3": SubscriptionPlan("m3", "3 месяца", 3, 1000, 667),  # 1000₽ ≈ 667⭐
+    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1800, 1200),  # 1800₽ ≈ 1200⭐
+    "y1": SubscriptionPlan("y1", "1 год", 12, 3500, 2334),  # 3500₽ ≈ 2334⭐
 }
 
 STARS_PLANS: dict[str, int] = {
-    "sub_1w": 70,
-    "sub_1m": 220,
-    "sub_3m": 560,
-    "sub_6m": 1010,
-    "sub_1y": 1960,
+    "sub_1w": 84,
+    "sub_1m": 266,
+    "sub_3m": 667,
+    "sub_6m": 1200,
+    "sub_1y": 2334,
 }
 
 STARS_PLAN_META: dict[str, dict] = {
@@ -173,8 +173,8 @@ ADMIN_PREMIUM_UNTIL = datetime(2099, 1, 1)
 
 # Pay-as-you-go
 PAYG_COST_RUB = 2  # 2 руб за фото или голос
-PAYG_TOPUPS_RUB = [50, 100, 200, 500]
-RUB_PER_STAR = 1.79  # твоя оценка. Можно потом поменять.
+PAYG_TOPUPS_RUB = [60, 100, 200, 400]
+RUB_PER_STAR = 1.5  # 1 звезда = 1.5₽
 
 
 def rub_to_stars(rub: int) -> int:
