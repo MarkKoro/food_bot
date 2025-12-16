@@ -148,6 +148,7 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "provider_charge_id": "TEXT",
         "amount_rub": "INTEGER NOT NULL DEFAULT 0",
         "amount_stars": "INTEGER NOT NULL DEFAULT 0",
+        "raw": "TEXT",
     }
     for col, definition in required_pcols.items():
         if col not in pcols:
