@@ -189,15 +189,6 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> bool:
     )
     new_user = cur.rowcount > 0
 
-    # Бесплатные 24 часа — один раз на пользователя.
-    # Если trial_until уже есть — повторно не выдаём (защита от /start-абуза).
-    trial_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
-    await db.execute(
-        "UPDATE users SET trial_until = ?, trial_used_count = 0, trial_granted = 1 "
-        "WHERE telegram_id = ? AND trial_granted = 0",
-        (trial_until, telegram_id),
-    )
-
     await db.commit()
     return new_user
 
