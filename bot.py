@@ -2380,7 +2380,9 @@ async def _process_meal_calculation(
 
 # ── Фото еды ─────────────────────────────────────────
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _handle_image_message(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_id: str
+) -> None:
     if not await ensure_subscription(update, ctx):
         await delete_user_message(update)
         return
@@ -2430,11 +2432,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     chat = message.chat
-    photo = message.photo[-1]
 
     # Сохраняем новую pending_meal, затирая старую
     ctx.user_data["pending_meal"] = {
-        "photo_file_id": photo.file_id,
+        "photo_file_id": file_id,
         "photo_msg_id": message.message_id,
         "chat_id": chat.id,
         "extras": {"save_template": False},
@@ -2457,10 +2458,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx, chat.id, text, kb_meal_extras(extras), user_id=uid
     )
 
-    try:
-        await message.delete()
-    except Exception:
-        pass
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    photo = update.message.photo[-1]
+    await _handle_image_message(update, ctx, file_id=photo.file_id)
+
+
+async def handle_document_photo(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE
+) -> None:
+    document = update.message.document
+    if not document:
+        return
+
+    if document.mime_type and not document.mime_type.startswith("image/"):
+        return
+
+    await _handle_image_message(update, ctx, file_id=document.file_id)
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
@@ -4226,6 +4240,11 @@ def main() -> None:
     # Фото еды
     application.add_handler(
         MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo)
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.Document.IMAGE & ~filters.COMMAND, handle_document_photo
+        )
     )
 
     # Голосовые (заглушка)
