@@ -2464,14 +2464,22 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_image_message(update, ctx, file_id=photo.file_id)
 
 
+def _is_image_document(document) -> bool:
+    mime_type = (document.mime_type or "").lower()
+    if mime_type.startswith("image/"):
+        return True
+
+    file_name = (document.file_name or "").lower()
+    return file_name.endswith(
+        (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".tiff", ".gif")
+    )
+
+
 async def handle_document_photo(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE
 ) -> None:
     document = update.message.document
-    if not document:
-        return
-
-    if document.mime_type and not document.mime_type.startswith("image/"):
+    if not document or not _is_image_document(document):
         return
 
     await _handle_image_message(update, ctx, file_id=document.file_id)
@@ -4243,7 +4251,7 @@ def main() -> None:
     )
     application.add_handler(
         MessageHandler(
-            filters.Document.IMAGE & ~filters.COMMAND, handle_document_photo
+            filters.Document.ALL & ~filters.COMMAND, handle_document_photo
         )
     )
 
