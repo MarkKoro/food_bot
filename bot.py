@@ -64,6 +64,10 @@ from db import (
     delete_template,
     rename_template,
     has_templates,
+    add_promotion,
+    list_active_promotions,
+    grant_active_promotion,
+    purge_user,
 )
 
 # ── Модель тарифов ─────────────────────────────────────
@@ -1243,6 +1247,9 @@ async def show_main_menu(
     ctx.user_data["state"] = None
     ctx.user_data.pop("pending_meal", None)
 
+    if notice is None:
+        notice = ctx.user_data.pop("promo_notice", None)
+
     db = get_db(ctx)
     user_id = update.effective_user.id
 
@@ -1315,17 +1322,37 @@ async def show_main_menu(
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
-    await ensure_user(db, uid)
     await delete_user_message(update)
 
     if not await ensure_subscription(update, ctx):
         return
 
+    new_user = await ensure_user(db, uid)
+    notice = None
+
+    if new_user:
+        promo, granted = await grant_active_promotion(db, uid)
+        if granted and promo:
+            now = utcnow()
+            current_until = await get_premium_until(db, uid)
+            base = current_until if current_until and current_until > now else now
+            bonus_days = int(promo.get("bonus_days") or 0)
+            new_until = base + timedelta(days=bonus_days)
+            await set_premium_until(db, uid, new_until)
+
+            notice = (
+                "🎁 Поздравляем! Вы получили {days} суток премиум-доступа "
+                "в подарок от команды бота. Пользуйтесь на здоровье!"
+            ).format(days=bonus_days)
+
+    if notice:
+        ctx.user_data["promo_notice"] = notice
+
     goal = await get_goal(db, uid)
     if goal is None:
         await show_survey_offer(update, ctx)
     else:
-        await show_main_menu(update, ctx)
+        await show_main_menu(update, ctx, notice=notice)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3664,6 +3691,96 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def cmd_add_promotion(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
+    if len(ctx.args) != 2:
+        return await update.message.reply_text(
+            "Использование: /promo_add <кол-во пользователей> <дней>"
+        )
+
+    try:
+        slots = int(ctx.args[0])
+        days = int(ctx.args[1])
+    except Exception:
+        return await update.message.reply_text("Пример: /promo_add 10 5")
+
+    if slots <= 0 or days <= 0:
+        return await update.message.reply_text(
+            "Числа должны быть положительными. Пример: /promo_add 10 5"
+        )
+
+    db = get_db(ctx)
+    promo_id = await add_promotion(db, slots, days)
+    queue = await list_active_promotions(db)
+    active = queue[0] if queue else None
+    queue_len = max(0, len(queue) - 1)
+
+    lines = [
+        f"✅ Акция добавлена (ID {promo_id}).",
+        f"Следующие {slots} пользователей получат {days} д. премиума.",
+    ]
+
+    if active:
+        lines.append(
+            f"Сейчас активна акция ID {active['id']}: осталось {active['remaining_slots']} из {active['total_slots']} на {active['bonus_days']} д."
+        )
+    if queue_len:
+        lines.append(f"В очереди ещё: {queue_len}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_promo_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
+    queue = await list_active_promotions(get_db(ctx))
+    if not queue:
+        return await update.message.reply_text("Сейчас нет активных или ожидающих акций.")
+
+    active = queue[0]
+    rest = queue[1:]
+
+    lines = [
+        "🎯 Акции",
+        f"Активная: ID {active['id']} — {active['bonus_days']} д., осталось {active['remaining_slots']} из {active['total_slots']}.",
+    ]
+
+    if rest:
+        lines.append("")
+        lines.append("Далее в очереди:")
+        for idx, promo in enumerate(rest, start=1):
+            lines.append(
+                f"{idx}) ID {promo['id']} — {promo['bonus_days']} д., осталось {promo['remaining_slots']} из {promo['total_slots']}"
+            )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_purge_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("Нет доступа.")
+
+    if not ctx.args or ctx.args[0] != "CONFIRM_PURGE":
+        return await update.message.reply_text(
+            "⚠️ Команда удалит все ваши данные. Для подтверждения введите: /purge_me CONFIRM_PURGE"
+        )
+
+    db = get_db(ctx)
+    await purge_user(db, update.effective_user.id)
+    await update.message.reply_text(
+        "🧹 Профиль полностью удалён. Нажмите /start, чтобы зарегистрироваться заново."
+    )
+
+
 async def cmd_grant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -3897,6 +4014,9 @@ def main() -> None:
     application.add_handler(CommandHandler("grant", cmd_grant))
     application.add_handler(CommandHandler("degrant", cmd_degrant))
     application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("promo_add", cmd_add_promotion))
+    application.add_handler(CommandHandler("promo_status", cmd_promo_status))
+    application.add_handler(CommandHandler("purge_me", cmd_purge_me))
     application.add_handler(CommandHandler("grant_payg", cmd_grant_payg))
     application.add_handler(CommandHandler("degrant_payg", cmd_degrant_payg))
     application.add_handler(CommandHandler("stats_payg", cmd_stats_payg))
