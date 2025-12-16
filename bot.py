@@ -869,7 +869,9 @@ async def _get_access_flags(
     return has_subscription, subscription_until, trial_active
 
 
-def kb_payment_offer(show_switch_to_modes: bool = False) -> InlineKeyboardMarkup:
+def kb_payment_offer(
+    show_switch_to_modes: bool = False, *, show_subscription_button: bool = True
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
     if show_switch_to_modes:
@@ -881,17 +883,18 @@ def kb_payment_offer(show_switch_to_modes: bool = False) -> InlineKeyboardMarkup
             ]
         )
 
-    rows.extend(
-        [
-            [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
+    rows.append([InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")])
+
+    if show_subscription_button:
+        rows.append(
             [
                 InlineKeyboardButton(
                     "⭐ Оформить подписку", callback_data="premium_menu"
                 )
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
-        ]
-    )
+            ]
+        )
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -945,7 +948,10 @@ async def send_payment_block_notice(
         update,
         ctx,
         "\n\n".join(lines),
-        kb_payment_offer(show_switch_to_modes=show_switch),
+        kb_payment_offer(
+            show_switch_to_modes=show_switch,
+            show_subscription_button=not has_subscription,
+        ),
     )
 
 
