@@ -701,6 +701,56 @@ def escape_md(text: str) -> str:
     return re.sub(r"([_*`\\[\\]])", r"\\\1", text)
 
 
+def _reset_limit_block_state(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасываем счётчики попыток на новый день."""
+
+    today = datetime.now().date().isoformat()
+    if ctx.user_data.get("limit_block_date") != today:
+        ctx.user_data["limit_block_date"] = today
+        ctx.user_data["limit_block_attempts"] = 0
+        ctx.user_data["limit_block_easter_shown"] = False
+
+
+async def handle_limit_reached(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Меню при исчерпании дневного лимита."""
+
+    _reset_limit_block_state(ctx)
+
+    attempts = int(ctx.user_data.get("limit_block_attempts", 0) or 0) + 1
+    ctx.user_data["limit_block_attempts"] = attempts
+
+    easter_shown = bool(ctx.user_data.get("limit_block_easter_shown"))
+
+    if not easter_shown and attempts >= 5:
+        text = "НУ ТЫ СЕРЬЁЗНО?\n\nМОЖЕТ БЫТЬ, ХВАТИТ?"
+        ctx.user_data["limit_block_easter_shown"] = True
+        ctx.user_data["limit_block_attempts"] = 0
+    else:
+        text = "Извини, дружище, но на сегодня ты лимит исчерпал."
+
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("pending_meal", None)
+
+    main_kb = await build_main_keyboard(ctx, update.effective_user.id)
+    await edit_menu_message(update, ctx, text, main_kb)
+
+
+async def build_remaining_limit_notice(
+    db: aiosqlite.Connection, user_id: int, *, mode: str
+) -> str | None:
+    if mode == "payg":
+        return None
+
+    used_today = await get_today_requests_count(db, user_id)
+    remaining = DAILY_LIMIT - used_today
+
+    if remaining not in (1, 2):
+        return None
+
+    suffix = "ОТВЕТ" if remaining == 1 else "ОТВЕТА"
+    return f"ОСТАЛОСЬ {remaining} {suffix}"
+
+
 async def build_main_keyboard(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> InlineKeyboardMarkup:
     db = get_db(ctx)
     has_tpl = await has_templates(db, user_id)
@@ -968,6 +1018,8 @@ async def require_access(
     db = get_db(ctx)
     user_id = update.effective_user.id
 
+    _reset_limit_block_state(ctx)
+
     # админ — всегда можно, без лимитов
     if is_admin(user_id):
         await ensure_admin_premium(db, user_id)
@@ -979,11 +1031,7 @@ async def require_access(
     if kind is not None:
         used_today = await get_today_requests_count(db, user_id)
         if used_today >= DAILY_LIMIT:
-            await send_notice(
-                update,
-                ctx,
-                f"Сегодня лимит {DAILY_LIMIT} запросов исчерпан. Попробуй завтра 🙏",
-            )
+            await handle_limit_reached(update, ctx)
             return False
 
     if await is_premium_user(db, user_id):
@@ -1371,10 +1419,19 @@ async def show_main_menu(
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
 
-    lines = [
-        "🍽️ Я готов к работе. Посчитаем твои граммы.",
-        "",
-    ]
+    remaining_limit_text = await build_remaining_limit_notice(db, user_id, mode=mode)
+
+    lines = []
+
+    if remaining_limit_text:
+        lines.extend([remaining_limit_text, ""])
+
+    lines.extend(
+        [
+            "🍽️ Я готов к работе. Посчитаем твои граммы.",
+            "",
+        ]
+    )
 
     if mode == "payg":
         lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
