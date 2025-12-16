@@ -2232,6 +2232,21 @@ async def _process_meal_calculation(
     # Pay-as-you-go биллинг (без лимитов)
     u = await db_get_user_row(db, uid)
     mode = u.get("payment_mode", "sub")
+    has_subscription, subscription_until, _ = await _get_access_flags(db, uid)
+
+    if mode != "payg" and not has_subscription:
+        await send_payment_block_notice(
+            update,
+            ctx,
+            pay_mode=mode,
+            payg_balance=int(u.get("credits", 0) or 0),
+            has_subscription=has_subscription,
+            subscription_until=subscription_until,
+        )
+        await delete_user_message(update)
+        ctx.user_data["state"] = None
+        ctx.user_data["pending_meal"] = None
+        return
 
     if uid not in ADMINS and mode == "payg":
         ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
