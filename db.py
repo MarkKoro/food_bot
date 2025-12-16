@@ -129,6 +129,7 @@ async def create_tables(db: aiosqlite.Connection) -> None:
     await cur.close()
 
     required_pcols = {
+        "ts": "INTEGER NOT NULL DEFAULT (strftime('%s','now'))",
         "telegram_charge_id": "TEXT",
         "provider_charge_id": "TEXT",
     }
