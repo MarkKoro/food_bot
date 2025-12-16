@@ -123,6 +123,29 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         )
         await db.commit()
 
+    # ── Миграции: payments (идемпотентность платежей)
+    cur = await db.execute("PRAGMA table_info(payments)")
+    pcols = [row[1] for row in await cur.fetchall()]
+    await cur.close()
+
+    required_pcols = {
+        "telegram_charge_id": "TEXT",
+        "provider_charge_id": "TEXT",
+    }
+    for col, definition in required_pcols.items():
+        if col not in pcols:
+            await db.execute(f"ALTER TABLE payments ADD COLUMN {col} {definition}")
+            await db.commit()
+
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_telegram_charge_id "
+        "ON payments(telegram_charge_id) WHERE telegram_charge_id IS NOT NULL"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_payments_user_ts ON payments(user_id, ts)"
+    )
+    await db.commit()
+
 
 # ── Пользователи / кредиты ─────────────────────────────
 
@@ -595,44 +618,65 @@ async def set_subscription(db, user_id: int, active_until: int, plan: str) -> No
 
 
 async def log_payment(
-    db,
+    db: aiosqlite.Connection,
     user_id: int,
     provider: str,
     payload: str,
     amount_rub: int = 0,
     amount_stars: int = 0,
-    raw: str | None = None,
-) -> None:
-    """Записать факт платежа в таблицу payments."""
+    raw: str = "",
+    telegram_charge_id: str | None = None,
+    provider_charge_id: str | None = None,
+) -> bool:
     ts = int(time.time())
-    await db.execute(
-        "INSERT INTO payments (user_id, ts, provider, payload, amount_rub, amount_stars, raw) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, ts, provider, payload, amount_rub, amount_stars, raw),
+    cur = await db.execute(
+        """
+        INSERT OR IGNORE INTO payments
+            (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            ts,
+            provider,
+            payload,
+            int(amount_rub),
+            int(amount_stars),
+            raw or "",
+            telegram_charge_id,
+            provider_charge_id,
+        ),
     )
     await db.commit()
+    return cur.rowcount == 1
 
 
 async def save_payment(
     db: aiosqlite.Connection,
-    telegram_id: int,
+    user_id: int,
     provider: str,
-    amount: float,
+    amount: int,
     currency: str,
     payload: str,
-) -> None:
-    await ensure_user(db, telegram_id)
-    currency_code = currency.upper()
-    amount_rub = int(amount) if currency_code == "RUB" else 0
-    amount_stars = int(amount) if currency_code == "XTR" else 0
-    await log_payment(
-        db,
-        user_id=telegram_id,
+    telegram_charge_id: str | None = None,
+    provider_charge_id: str | None = None,
+) -> bool:
+    # Важно: тут храним как у тебя было (RUB → amount_rub, XTR → amount_stars)
+    amount_rub = int(amount) if currency == "RUB" else 0
+    amount_stars = int(amount) if currency == "XTR" else 0
+    raw = f"currency={currency}; amount={amount}; provider={provider}; payload={payload}"
+
+    return await log_payment(
+        db=db,
+        user_id=user_id,
         provider=provider,
         payload=payload,
         amount_rub=amount_rub,
         amount_stars=amount_stars,
-        raw=None,
+        raw=raw,
+        telegram_charge_id=telegram_charge_id,
+        provider_charge_id=provider_charge_id,
     )
 
 
