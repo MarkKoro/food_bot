@@ -158,10 +158,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
 TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")      # на будущее: текст/голос
 AUDIO_TRANSCRIBE_MODEL = os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-VISION_DETAIL = os.getenv("VISION_DETAIL", "low").lower()  # low | high | auto (если у тебя поддержано)
-VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1280"))  # макс сторона после ресайза
-VISION_JPEG_QUALITY = int(os.getenv("VISION_JPEG_QUALITY", "82"))
-VISION_COMPRESS_THRESHOLD = int(os.getenv("VISION_COMPRESS_THRESHOLD", "1500000"))  # bytes; 0 = всегда
+VISION_DETAIL = os.getenv("VISION_DETAIL", "high").lower()  # low | high | auto (если у тебя поддержано)
+VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1600"))  # макс сторона после ресайза
+VISION_JPEG_QUALITY = int(os.getenv("VISION_JPEG_QUALITY", "90"))
+VISION_COMPRESS_THRESHOLD = int(os.getenv("VISION_COMPRESS_THRESHOLD", "2500000"))  # bytes; 0 = всегда
 
 ADMINS = {
     int(x)
@@ -1977,18 +1977,20 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await set_goal(db, uid, kcal, protein, fat, carbs)
     ctx.user_data["state"] = None
+    goal_totals = {
+        "kcal": kcal,
+        "protein_g": protein,
+        "fat_g": fat,
+        "carbs_g": carbs,
+    }
 
-    text = (
+    notice = (
         "Готово ✅\n\n"
-        "По твоим ответам я предлагаю такую дневную норму:\n\n"
-        f"🍽 Калории: *{kcal}* ккал\n"
-        f"🥩 Белки: *{protein:.0f}* г\n"
-        f"🧈 Жиры: *{fat:.0f}* г\n"
-        f"🍞 Углеводы: *{carbs:.0f}* г\n\n"
-        "_Это не медицинская рекомендация, а разумная оценка под твой режим жизни. "
-        "При желании ты всегда можешь скорректировать цель вручную._"
+        "Я подобрал цель по опросу. Ты в главном меню, вот твоя дневная норма:\n"
+        f"{format_totals_short(goal_totals)}\n\n"
+        "Это ориентировочная цель, её всегда можно скорректировать в «⚙️ Настройки»."
     )
-    await edit_menu_message(update, ctx, text, kb_settings())
+    await show_main_menu(update, ctx, notice=notice)
 
 
 # ── Цель КБЖУ ─────────────────────────────────────────
