@@ -2752,6 +2752,8 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
     sp = message.successful_payment
+    tg_charge_id = getattr(sp, "telegram_payment_charge_id", None)
+    prov_charge_id = getattr(sp, "provider_payment_charge_id", None)
     payload = sp.invoice_payload or ""
     user_id = user.id
     db = ctx.application.bot_data["db"]
@@ -2766,12 +2768,22 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         method = data.get("method") or ("stars" if sp.currency == "XTR" else "card")
 
         db2 = get_db(ctx)
-        await db_add_payg_balance(db2, user_id, rub)
+        inserted = await save_payment(
+            db2,
+            user_id,
+            method,
+            rub,
+            "RUB",
+            payload,
+            telegram_charge_id=tg_charge_id,
+            provider_charge_id=prov_charge_id,
+        )
+        if not inserted:
+            logging.warning("Duplicate payment ignored (PAYG): %s", tg_charge_id)
+            await show_main_menu(update, ctx)
+            return
 
-        try:
-            await save_payment(db2, user_id, method, rub, "RUB", payload)
-        except Exception:
-            pass
+        await db_add_payg_balance(db2, user_id, rub)
 
         chat_id = message.chat_id
 
@@ -2818,14 +2830,20 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         plan_key = plan.id
-        await save_payment(
+        inserted = await save_payment(
             db,
-            telegram_id=user_id,
-            provider=provider,
-            amount=sp.total_amount,
-            currency=sp.currency,
-            payload=payload,
+            user_id,
+            provider,
+            sp.total_amount,
+            sp.currency,
+            payload,
+            telegram_charge_id=tg_charge_id,
+            provider_charge_id=prov_charge_id,
         )
+        if not inserted:
+            logging.warning("Duplicate payment ignored (SUB card): %s", tg_charge_id)
+            await show_main_menu(update, ctx)
+            return
 
         base = current_until if (current_until and current_until > now) else now
         days = 7 if plan_key == "w1" else plan.months * 30
@@ -2854,14 +2872,20 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if days <= 0:
             await update.message.reply_text("Некорректная продолжительность подписки.")
             return
-        await save_payment(
+        inserted = await save_payment(
             db,
-            telegram_id=user_id,
-            provider="stars",
-            amount=sp.total_amount,
-            currency=sp.currency,
-            payload=payload,
+            user_id,
+            "stars",
+            sp.total_amount,
+            sp.currency,
+            payload,
+            telegram_charge_id=tg_charge_id,
+            provider_charge_id=prov_charge_id,
         )
+        if not inserted:
+            logging.warning("Duplicate payment ignored (SUB stars): %s", tg_charge_id)
+            await show_main_menu(update, ctx)
+            return
 
         base = current_until if (current_until and current_until > now) else now
         new_until = base + timedelta(days=days)
@@ -2876,14 +2900,20 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         months = int(payload_data.get("months") or plan.months)
-        await save_payment(
+        inserted = await save_payment(
             db,
-            telegram_id=user_id,
-            provider="stars",
-            amount=sp.total_amount,
-            currency=sp.currency,
-            payload=payload,
+            user_id,
+            "stars",
+            sp.total_amount,
+            sp.currency,
+            payload,
+            telegram_charge_id=tg_charge_id,
+            provider_charge_id=prov_charge_id,
         )
+        if not inserted:
+            logging.warning("Duplicate payment ignored (SUB stars): %s", tg_charge_id)
+            await show_main_menu(update, ctx)
+            return
 
         base = current_until if (current_until and current_until > now) else now
         days = 7 if plan_key == "w1" else months * 30
