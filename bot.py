@@ -1148,12 +1148,10 @@ async def show_main_menu(
 
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
-    trial_until, trial_used_count, paid_trial_used = await get_trial_info(db, user_id)
 
     lines = [
-        "🍽️ Я готов к работе.",
-        "",
-        "Пришли фото еды или голосом скажи, что ты ел — я посчитаю КБЖУ и запишу в дневник.",
+        "🍽️ Я готов к работе. Посчитаем твой грамм, посчитаем твои граммы.",
+        "Вся красивая статистика — по кнопке «Мои граммы».",
         "",
     ]
 
@@ -1161,36 +1159,27 @@ async def show_main_menu(
         lines.insert(0, notice)
         lines.insert(1, "")
 
-    now = utcnow()
-    if premium_active and premium_until:
-        lines.append(f"✅ Подписка активна до: {fmt_dt(premium_until)}")
-    else:
-        if trial_until and trial_until > now:
-            left = max(0, TRIAL_LIMIT - int(trial_used_count or 0))
-            lines.append(f"🆓 Бесплатно до: {fmt_dt(trial_until, with_time=True)}")
-            lines.append(f"Осталось запросов: {left}/{TRIAL_LIMIT}")
-            if left <= 0:
-                lines.append("")
-                lines.append("⛔️ Лимит пробных запросов исчерпан.")
-                lines.append("Можно взять «Одна неделя» (один раз) или обычную подписку.")
-        else:
-            lines.append("⛔️ Ваша пробная подписка закончилась.")
-            lines.append(
-                "Если ты ещё не утвердился — есть вариант «Одна неделя» (доступен один раз),"
-            )
-            lines.append("или можно взять обычную подписку.")
-
-    if is_admin(user_id):
-        lines.append("")
-        lines.append("🛠 Админ-доступ: премиум ∞")
-
-    lines.append("")
     if mode == "payg":
-        lines.append("💳 Режим оплаты: Pay-as-you-go ✅")
-        lines.append(f"Баланс: {balance}₽ • списание {PAYG_COST_RUB}₽/запрос • без лимитов")
+        lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
+        lines.append(f"Баланс: {balance}₽.")
+        lines.append(f"Цена: {PAYG_COST_RUB}₽ за фотоголос.")
     else:
-        lines.append("💳 Режим оплаты: Подписка ✅")
-        lines.append(f"Лимит: {DAILY_LIMIT}/день (защита)")
+        status_text = (
+            f"активно до {fmt_dt(premium_until)}."
+            if premium_active and premium_until
+            else "Не активно."
+        )
+        lines.append("💳 Выбранный режим оплаты — подписка.")
+        lines.append(f"Статус: {status_text}")
+        lines.append(f"Лимит: {DAILY_LIMIT} запросов в день.")
+
+    lines.extend(
+        [
+            "",
+            "_Присылай в любое время голосовое с тем, что ты поел, или с тем, что намереваешься поесть._",
+            "_Или пришли мне фото блюда, и я посчитаю количество калорий._",
+        ]
+    )
 
     text = "\n".join(lines)
     chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
