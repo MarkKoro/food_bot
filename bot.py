@@ -21,8 +21,8 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    WebAppInfo,
     LabeledPrice,
+    WebAppInfo,
 )
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -281,18 +281,9 @@ if not JOIN_URL:
 def kb_main(mode: str = "sub") -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
     ]
-
-    # меняем главное меню по режиму
-    if mode == "payg":
-        keyboard.insert(1, [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")])
-    else:
-        keyboard.insert(1, [InlineKeyboardButton("⭐ Подписка", callback_data="premium_menu")])
-
-    keyboard.append(
-        [InlineKeyboardButton("📈 Веб-статистика", web_app=WebAppInfo(url=FOOD_WEBAPP_URL))]
-    )
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -308,13 +299,16 @@ def kb_settings() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🎯 Цель КБЖУ", callback_data="set_goal")],
             [
                 InlineKeyboardButton(
-                    "🧮 Подобрать норму по опросу", callback_data="survey_start"
+                    "🧮 Подобрать цель по опросу", callback_data="survey_start"
                 )
             ],
-            [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
     )
+
+
+def kb_goal_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]])
 
 
 def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_text: str):
@@ -331,7 +325,7 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_t
         ],
         [InlineKeyboardButton("⭐ Купить подписку", callback_data="premium_menu")],
         [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="settings")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="main")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -524,7 +518,6 @@ SURVEYS = {
             "opts": ["Сидячая", "Лёгкая", "Средняя", "Высокая"],
         },
         {"k": "goal", "q": "Цель", "opts": ["Похудеть", "Поддерживать", "Набрать"]},
-        {"k": "note", "q": "Уточнение (необязательно)", "free": True, "optional": True},
         {"k": "meals", "q": "Сколько приёмов пищи в день?", "opts": ["2", "3", "4", "5+"]},
         {
             "k": "diet",
@@ -1205,7 +1198,7 @@ async def show_main_menu(
         ctx,
         chat_id,
         text,
-        kb_main(mode),
+        kb_main(),
         user_id=update.effective_user.id if update.effective_user else None,
     )
 
@@ -1252,7 +1245,6 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "⚙️ Настройки\n\n"
         "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
-        "• 💳 Режим оплаты — можно оформить ⭐ Подписку на срок или выбрать Pay-as-you-go и платить за каждый запрос.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
@@ -1295,18 +1287,18 @@ async def show_survey_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     Показывает предложение пройти опрос при первом старте,
     если цель ещё не задана.
     """
-    ctx.user_data["state"] = None
+    ctx.user_data["state"] = "survey_select_mode"
     text = (
-        "Хочешь, чтобы я помог прикинуть твою дневную норму калорий и БЖУ? 🧮\n\n"
-        "Короткий опрос на 5–7 вопросов, без медицины и морализаторства — "
-        "просто чтобы прикинуть комфортные цифры под твой режим."
+        "Привет! Я бот Грамм. Помогу держать тело в форме — буду считать КБЖУ по фото и голосу.\n\n"
+        "Чтобы подобрать комфортную норму, давай пройдём короткий опрос. Выбери формат:"
     )
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Да, пройти опрос", callback_data="survey_start"),
-                InlineKeyboardButton("Позже", callback_data="main"),
-            ]
+                InlineKeyboardButton("Быстро (≈1 мин)", callback_data="survey_mode:short"),
+                InlineKeyboardButton("Точно (≈2–3 мин)", callback_data="survey_mode:extended"),
+            ],
+            [InlineKeyboardButton("Позже", callback_data="main")],
         ]
     )
     await edit_menu_message(update, ctx, text, kb)
@@ -1497,22 +1489,39 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Цель КБЖУ ─────────────────────────────────────────
 
+
+def build_goal_prompt(goal: dict | None, prefix: str | None = None) -> str:
+    lines = []
+    if prefix:
+        lines.append(prefix)
+        lines.append("")
+
+    lines.append(
+        "Если хочешь сам указать желаемый уровень КБЖУ — напиши его цифрами в одном сообщении."
+    )
+    lines.append("Пример одной строкой: `2300 150 70 250`")
+    lines.append("Или в столбик:")
+    lines.append("`2300\n150\n70\n250`")
+    lines.append("")
+    lines.append("Порядок: калории, белки, жиры, углеводы.")
+
+    if goal:
+        lines.append("")
+        lines.append(
+            "Сейчас задано: "
+            f"🍽 {goal['kcal']} ккал • 🥩 {goal['protein']} г • 🧈 {goal['fat']} г • 🍞 {goal['carbs']} г"
+        )
+
+    return "\n".join(lines)
+
 async def show_set_goal_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data["state"] = "await_goal"
-    example = (
-        "🎯 Задаём дневную цель по КБЖУ.\n\n"
-        "Напиши цель одним сообщением.\n"
-        "Можно в одну строку:\n"
-        "`2300 150 70 250`\n"
-        "или в столбик:\n"
-        "`2300\n150\n70\n250`\n\n"
-        "Порядок значений:\n"
-        "1) калории (ккал)\n"
-        "2) белки (г)\n"
-        "3) жиры (г)\n"
-        "4) углеводы (г)"
-    )
-    await edit_menu_message(update, ctx, example, kb_settings())
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    goal = await get_goal(db, uid)
+
+    prompt = build_goal_prompt(goal, "🎯 Задаём дневную цель по КБЖУ.")
+    await edit_menu_message(update, ctx, prompt, kb_goal_back())
 
 
 async def handle_goal_input(
@@ -1526,25 +1535,19 @@ async def handle_goal_input(
     parts = [p for p in cleaned.split() if p.strip()]
 
     if len(parts) != 4:
-        example = (
-            "Не понял формат.\n\n"
-            "Пример одной строкой:\n"
-            "`2300 150 70 250`\n\n"
-            "Или в столбик:\n"
-            "`2300\n150\n70\n250`\n\n"
-            "Порядок: калории, белки, жиры, углеводы."
-        )
-        await edit_menu_message(update, ctx, example, kb_settings())
+        db = get_db(ctx)
+        goal = await get_goal(db, update.effective_user.id)
+        text = build_goal_prompt(goal, "Не понял формат. Проверь, что четыре числа идут через пробел или с новой строки.")
+        await edit_menu_message(update, ctx, text, kb_goal_back())
         return
 
     try:
         kcal, p, f, c = map(float, parts)
     except ValueError:
-        example = (
-            "Должны быть только числа.\n\n"
-            "Пример: `2300 150 70 250`"
-        )
-        await edit_menu_message(update, ctx, example, kb_settings())
+        db = get_db(ctx)
+        goal = await get_goal(db, update.effective_user.id)
+        text = build_goal_prompt(goal, "Должны быть только числа. Пример: `2300 150 70 250`.")
+        await edit_menu_message(update, ctx, text, kb_goal_back())
         return
 
     db = get_db(ctx)
@@ -1559,7 +1562,7 @@ async def handle_goal_input(
         f"🧈 Жиры: {f} г\n"
         f"🍞 Углеводы: {c} г"
     )
-    await edit_menu_message(update, ctx, msg, kb_settings())
+    await edit_menu_message(update, ctx, msg, kb_goal_back())
 
 
 # ── Статистика за сегодня / вчера / 7 дней ────────────
