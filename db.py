@@ -239,6 +239,25 @@ async def get_active_promotion(db: aiosqlite.Connection) -> dict | None:
     return promos[0] if promos else None
 
 
+async def clear_promotions(db: aiosqlite.Connection) -> int:
+    """Deactivate all promotions so that no new users can receive bonuses.
+
+    Returns the number of promotions that were active before clearing.
+    """
+
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM promotions WHERE remaining_slots > 0"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    active_count = int(row[0] or 0)
+
+    await db.execute("UPDATE promotions SET remaining_slots = 0")
+    await db.commit()
+
+    return active_count
+
+
 async def grant_active_promotion(
     db: aiosqlite.Connection, user_id: int
 ) -> tuple[dict | None, bool]:

@@ -67,6 +67,7 @@ from db import (
     add_promotion,
     list_active_promotions,
     grant_active_promotion,
+    clear_promotions,
     purge_user,
 )
 
@@ -3763,11 +3764,29 @@ async def cmd_promo_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_purge_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_clear_promotions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("Нет доступа.")
+
+    db = get_db(ctx)
+    active_count = await clear_promotions(db)
+
+    if active_count:
+        text = (
+            "🧹 Все текущие промоакции деактивированы. "
+            f"Активных акций до очистки: {active_count}."
+        )
+    else:
+        text = "ℹ️ Активных промоакций не было. Очередь очищена."
+
+    await update.message.reply_text(text)
+
+
+async def cmd_purge_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
 
     if not ctx.args or ctx.args[0] != "CONFIRM_PURGE":
         return await update.message.reply_text(
@@ -4016,6 +4035,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("promo_add", cmd_add_promotion))
     application.add_handler(CommandHandler("promo_status", cmd_promo_status))
+    application.add_handler(CommandHandler("promo_clear", cmd_clear_promotions))
     application.add_handler(CommandHandler("purge_me", cmd_purge_me))
     application.add_handler(CommandHandler("grant_payg", cmd_grant_payg))
     application.add_handler(CommandHandler("degrant_payg", cmd_degrant_payg))
