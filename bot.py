@@ -2385,7 +2385,7 @@ async def _process_meal_calculation(
 # ── Фото еды ─────────────────────────────────────────
 
 async def _handle_image_message(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_id: str
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, photo_file_id: str
 ) -> None:
     if not await ensure_subscription(update, ctx):
         await delete_user_message(update)
@@ -2439,7 +2439,7 @@ async def _handle_image_message(
 
     # Сохраняем новую pending_meal, затирая старую
     ctx.user_data["pending_meal"] = {
-        "photo_file_id": file_id,
+        "photo_file_id": photo_file_id,
         "photo_msg_id": message.message_id,
         "chat_id": chat.id,
         "extras": {"save_template": False},
@@ -2465,7 +2465,7 @@ async def _handle_image_message(
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     photo = update.message.photo[-1]
-    await _handle_image_message(update, ctx, file_id=photo.file_id)
+    await _handle_image_message(update, ctx, photo_file_id=photo.file_id)
 
 
 def _is_image_document(document) -> bool:
@@ -2479,7 +2479,7 @@ def _is_image_document(document) -> bool:
     )
 
 
-async def _document_looks_like_image(document, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _document_looks_like_image(document, bot) -> bool:
     """Пытаемся определить, что документ — это изображение.
 
     Дополнительно к MIME/расширению учитываем превью Telegram, а при его
@@ -2490,7 +2490,7 @@ async def _document_looks_like_image(document, ctx: ContextTypes.DEFAULT_TYPE) -
         return True
 
     try:
-        file = await ctx.bot.get_file(document.file_id)
+        file = await bot.get_file(document.file_id)
         bio = io.BytesIO()
         await file.download_to_memory(out=bio)
         bio.seek(0)
@@ -2505,22 +2505,23 @@ async def _document_looks_like_image(document, ctx: ContextTypes.DEFAULT_TYPE) -
 async def handle_document_photo(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    document = update.message.document
-    if not document:
+    if not update.message or not update.message.document:
+        return
+    
+    doc = update.message.document
+
+    # 1) проверяем, что документ похож на картинку
+    is_image = _is_image_document(doc)
+    if not is_image:
+        is_image = await _document_looks_like_image(doc, ctx.bot)
+
+    if not is_image:
+        await send_new_menu_message(update, ctx, "📎 Это не похоже на фото еды. Пришли именно картинку 🙂")
         return
 
-    is_image = _is_image_document(document)
-    if not is_image:
-        is_image = await _document_looks_like_image(document, ctx)
-
-    if not is_image:
-        await update.message.reply_text(
-            "Не похоже на фото. Попробуй пересохранить файл как изображение "
-            "(JPG/PNG/HEIC) и отправить снова."
-        )
-        return
-
-    await _handle_image_message(update, ctx, file_id=document.file_id)
+    # 2) важно: если это фото-документ — обрабатываем точно так же, как обычное фото
+    await delete_user_message(update)
+    await _handle_image_message(update, ctx, photo_file_id=doc.file_id)
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
