@@ -851,6 +851,104 @@ async def ensure_subscription(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     return False
 
 
+async def _get_access_flags(
+    db, user_id: int
+) -> tuple[bool, datetime | None, bool]:
+    """Возвращает признаки подписки/триала без побочных эффектов."""
+
+    premium_active = await is_premium_user(db, user_id)
+    premium_until = await get_premium_until(db, user_id)
+
+    trial_until, trial_used_count, _ = await get_trial_info(db, user_id)
+    used = int(trial_used_count or 0)
+    trial_active = bool(trial_until and trial_until > utcnow() and used < TRIAL_LIMIT)
+
+    has_subscription = premium_active or trial_active
+    subscription_until = premium_until or (trial_until if trial_active else None)
+
+    return has_subscription, subscription_until, trial_active
+
+
+def kb_payment_offer(show_switch_to_modes: bool = False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if show_switch_to_modes:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Да, выбрать другой режим", callback_data="pay_mode"
+                )
+            ]
+        )
+
+    rows.extend(
+        [
+            [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
+            [
+                InlineKeyboardButton(
+                    "⭐ Оформить подписку", callback_data="premium_menu"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
+        ]
+    )
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_payment_block_notice(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    pay_mode: str,
+    payg_balance: int,
+    has_subscription: bool,
+    subscription_until: datetime | None,
+) -> None:
+    lines: list[str] = [
+        "Мы бы очень хотели обработать это сообщение, но сейчас не можем.",
+    ]
+
+    balance_text = f"Баланс PAYG: {payg_balance}₽"
+
+    if payg_balance < PAYG_COST_RUB and not has_subscription:
+        lines.append(
+            "Сейчас нет активной подписки и нет средств на Pay-as-you-go."\
+            " Пополните баланс или оформите подписку."
+        )
+    elif pay_mode == "payg" and payg_balance < PAYG_COST_RUB:
+        lines.append(
+            f"Выбран Pay-as-you-go, но баланс пуст. {balance_text}."
+        )
+    elif pay_mode != "payg" and not has_subscription:
+        lines.append("Подписка не активна, поэтому запрос не можем выполнить.")
+
+    show_switch = False
+
+    if pay_mode == "payg" and has_subscription:
+        until_txt = fmt_dt(subscription_until) if subscription_until else "активна"
+        lines.append(
+            f"При этом подписка активна до {until_txt}. "
+            "Переключить режим, чтобы использовать её?"
+        )
+        show_switch = True
+    elif pay_mode != "payg" and payg_balance >= PAYG_COST_RUB:
+        lines.append(
+            f"На балансе PAYG есть {payg_balance}₽ — можно перейти в этот режим "
+            f"и списывать по {PAYG_COST_RUB}₽ за запрос. Перейти в выбор режима?"
+        )
+        show_switch = True
+
+    lines.append("Выберите, что сделать:")
+
+    await edit_menu_message(
+        update,
+        ctx,
+        "\n\n".join(lines),
+        kb_payment_offer(show_switch_to_modes=show_switch),
+    )
+
+
 async def require_access(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -2268,10 +2366,38 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     u0 = await db_get_user_row(db, update.effective_user.id)
     pay_mode0 = u0.get("payment_mode", "sub")
+    payg_balance = int(u0.get("credits", 0) or 0)
+
+    has_subscription, subscription_until, _ = await _get_access_flags(
+        db, update.effective_user.id
+    )
 
     if pay_mode0 == "payg" and not is_admin(update.effective_user.id):
+        if payg_balance < PAYG_COST_RUB:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            await delete_user_message(update)
+            return
         mode = "payg"
     else:
+        if not has_subscription:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            await delete_user_message(update)
+            return
+
         mode = await require_access(update, ctx, consume=True, kind="photo")
         if not mode:
             try:
@@ -2450,10 +2576,35 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     u0 = await db_get_user_row(db, uid)
     pay_mode0 = u0.get("payment_mode", "sub")
+    payg_balance = int(u0.get("credits", 0) or 0)
+
+    has_subscription, subscription_until, _ = await _get_access_flags(db, uid)
 
     if pay_mode0 == "payg" and not is_admin(uid):
+        if payg_balance < PAYG_COST_RUB:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            await delete_user_message(update)
+            return
         mode = "payg"
     else:
+        if not has_subscription:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            await delete_user_message(update)
+            return
         mode = await require_access(update, ctx, consume=True, kind="voice")
     try:
         await update.message.delete()
