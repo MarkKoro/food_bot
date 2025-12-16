@@ -24,6 +24,7 @@ from telegram import (
     InlineKeyboardButton,
     LabeledPrice,
     WebAppInfo,
+    Message,
 )
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -3254,6 +3255,40 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+def format_payment_success_notice(
+    kind: str, *, amount_rub: int | None = None, plan_title: str | None = None
+) -> str:
+    lines = ["🎉 Поздравляем!"]
+
+    if kind == "payg":
+        add = f"Баланс пополнен на +{amount_rub}₽." if amount_rub is not None else "Баланс пополнен."
+        lines.append(add)
+    else:
+        title = plan_title or "Подписка активирована."
+        lines.append(title)
+
+    lines.append("Приятного подсчёта своих граммов — я уже готов к новым запросам!")
+
+    return "\n".join(lines)
+
+
+async def cleanup_payment_messages(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, payment_message: Message | None
+) -> None:
+    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
+    if invoice_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
+        except Exception:
+            pass
+
+    if payment_message:
+        try:
+            await payment_message.delete()
+        except Exception:
+            pass
+
+
 async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.pre_checkout_query
     payload = q.invoice_payload or ""
@@ -3299,6 +3334,8 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         data = {}
 
+    plan_title: str | None = None
+
     if data.get("type") == "payg_topup":
         rub = int(data.get("rub") or 0)
         method = data.get("method") or ("stars" if sp.currency == "XTR" else "card")
@@ -3322,21 +3359,10 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await db_add_payg_balance(db2, user_id, rub)
 
         chat_id = message.chat_id
+        await cleanup_payment_messages(ctx, chat_id, message)
 
-        invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
-        if invoice_msg_id:
-            try:
-                await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
-            except Exception:
-                pass
-
-        try:
-            if message:
-                await message.delete()
-        except Exception:
-            pass
-
-        await show_main_menu(update, ctx, notice=f"✅ Баланс PAYG пополнен на +{rub}₽")
+        notice = format_payment_success_notice("payg", amount_rub=rub)
+        await show_main_menu(update, ctx, notice=notice)
         return
 
     now = utcnow()
@@ -3366,6 +3392,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         plan_key = plan.id
+        plan_title = f"Подписка {plan.title} оформлена."
         inserted = await save_payment(
             db,
             user_id,
@@ -3404,6 +3431,10 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         plan_key = plan_meta.get("plan_key") or STARS_PLAN_TO_PLAN_ID.get(plan_key)
+        if plan_key and (plan := SUB_PLANS.get(plan_key)):
+            plan_title = f"Подписка {plan.title} оформлена."
+        elif plan_meta.get("title"):
+            plan_title = f"Подписка {plan_meta.get('title')} оформлена."
         days = int(plan_meta.get("days", plan_meta.get("months", 0) * 30))
         if days <= 0:
             await update.message.reply_text("Некорректная продолжительность подписки.")
@@ -3436,6 +3467,7 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         months = int(payload_data.get("months") or plan.months)
+        plan_title = f"Подписка {plan.title} оформлена."
         inserted = await save_payment(
             db,
             user_id,
@@ -3470,22 +3502,12 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await mark_paid_trial_used(db, user_id)
 
     chat_id = message.chat_id
+    await cleanup_payment_messages(ctx, chat_id, message)
 
-    invoice_msg_id = ctx.chat_data.pop("last_invoice_message_id", None)
-    if invoice_msg_id:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
-        except Exception:
-            pass
-
-    # Платёжное сервисное сообщение тоже убираем, если оно осталось
-    try:
-        if message:
-            await message.delete()
-    except Exception:
-        pass
-
-    await show_main_menu(update, ctx, notice="🎉 Оплата прошла! Подписка обновлена.")
+    notice = format_payment_success_notice(
+        "sub", plan_title=plan_title or "Подписка обновлена."
+    )
+    await show_main_menu(update, ctx, notice=notice)
 
 # ── Админ и прочее (минимальный каркас) ──────────────
 
