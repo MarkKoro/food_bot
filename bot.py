@@ -165,7 +165,7 @@ VISION_JPEG_QUALITY = int(os.getenv("VISION_JPEG_QUALITY", "90"))
 VISION_COMPRESS_THRESHOLD = int(os.getenv("VISION_COMPRESS_THRESHOLD", "2500000"))  # bytes; 0 = всегда
 
 # Лимит длины голосового сообщения
-MAX_VOICE_SEC = 90  # 1.5 минуты
+MAX_VOICE_SEC = 60  # 1 минута
 
 ADMINS = {
     int(x)
