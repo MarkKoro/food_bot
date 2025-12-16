@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import asyncio
 import io
 import json
 import base64
@@ -56,6 +57,12 @@ from db import (
     get_trial_info,
     consume_trial_request,
     mark_paid_trial_used,
+    add_template,
+    list_templates,
+    get_template,
+    delete_template,
+    rename_template,
+    has_templates,
 )
 
 # ── Модель тарифов ─────────────────────────────────────
@@ -135,6 +142,9 @@ def get_plan_duration_days(plan_id: str) -> int:
 
 load_dotenv()
 
+MAX_CONCURRENT_OPENAI = int(os.getenv("MAX_CONCURRENT_OPENAI", "5"))
+_OPENAI_SEM = asyncio.Semaphore(MAX_CONCURRENT_OPENAI)
+
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -163,6 +173,9 @@ RUB_PER_STAR = 1.79  # твоя оценка. Можно потом поменя
 
 def rub_to_stars(rub: int) -> int:
     return int(math.ceil(rub / RUB_PER_STAR))
+
+
+TEMPLATE_PORTION_OPTIONS: list[float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 
 async def db_get_user_row(db, user_id: int) -> dict:
@@ -278,12 +291,16 @@ if not JOIN_URL:
 
 # ── Клавиатуры ────────────────────────────────────────
 
-def kb_main(mode: str = "sub") -> InlineKeyboardMarkup:
+def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
     ]
+
+    if has_templates:
+        keyboard.insert(0, [InlineKeyboardButton("📁 Добавить из шаблона", callback_data="templates")])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -412,6 +429,12 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    label("💾 Добавить в шаблоны", "save_template"),
+                    callback_data="meal_extra_template",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "✅ Считать как есть / отправить",
                     callback_data="meal_extra_send",
                 )
@@ -419,6 +442,27 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("❌ Отмена", callback_data="meal_extra_cancel")],
         ]
     )
+
+
+def meal_extras_info_text(extras: dict) -> str:
+    info_lines = ["Фото получено ✅\n"]
+    if extras.get("portion"):
+        info_lines.append(f"📏 Граммовка: _{extras['portion']}_")
+    if extras.get("composition"):
+        info_lines.append(f"🍲 Состав: _{extras['composition']}_")
+    if extras.get("plate"):
+        info_lines.append(f"🍽 Тарелка: _{extras['plate']}_")
+    if extras.get("save_template"):
+        info_lines.append("💾 Будет сохранено в заготовки")
+
+    info_lines.append("\nМожно добавить ещё детали или сразу отправить на подсчёт.")
+    return "\n".join(info_lines)
+
+
+async def refresh_meal_extras_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = ctx.user_data.get("pending_meal") or {}
+    extras = pending.get("extras") or {}
+    await edit_menu_message(update, ctx, meal_extras_info_text(extras), kb_meal_extras(extras))
 
 
 # ── Промпт для GPT-Vision ─────────────────────────────
@@ -608,6 +652,16 @@ async def log_request(db, user_id: int, kind: str) -> None:
         (user_id, kind),
     )
     await db.commit()
+
+
+def escape_md(text: str) -> str:
+    return re.sub(r"([_*`\\[\\]])", r"\\\1", text)
+
+
+async def build_main_keyboard(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> InlineKeyboardMarkup:
+    db = get_db(ctx)
+    has_tpl = await has_templates(db, user_id)
+    return kb_main(has_templates=has_tpl)
 
 
 # ── Сервисные хелперы сообщений ───────────────────────
@@ -854,11 +908,12 @@ async def on_check_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     if await ensure_subscription(update, ctx):
+        kb = await build_main_keyboard(ctx, update.effective_user.id)
         await edit_menu_message(
             update,
             ctx,
             "Подписка найдена, можно пользоваться ботом ✅\n\nВыбери действие:",
-            kb_main(),
+            kb,
         )
 
 
@@ -977,14 +1032,18 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         "response_format": {"type": "json_object"},
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    await _OPENAI_SEM.acquire()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    finally:
+        _OPENAI_SEM.release()
 
     content = data["choices"][0]["message"]["content"].strip()
     parsed = json.loads(content)
@@ -1004,15 +1063,19 @@ async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg"
         "language": "ru",
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers=headers,
-            data=data,
-            files=files,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+    await _OPENAI_SEM.acquire()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers=headers,
+                data=data,
+                files=files,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+    finally:
+        _OPENAI_SEM.release()
 
     text = payload.get("text", "").strip()
     logging.debug("Voice transcript: %s", text[:500])
@@ -1041,14 +1104,18 @@ async def analyze_food_text(description: str) -> dict:
         "response_format": {"type": "json_object"},
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    await _OPENAI_SEM.acquire()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    finally:
+        _OPENAI_SEM.release()
 
     content = data["choices"][0]["message"]["content"].strip()
     parsed = json.loads(content)
@@ -1132,7 +1199,11 @@ def extract_totals(data: dict) -> dict:
 # ── Главные экраны ───────────────────────────────────
 
 async def show_main_menu(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, notice: str | None = None
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    notice: str | None = None,
+    *,
+    notice_at_bottom: bool = False,
 ) -> None:
     ctx.user_data["state"] = None
     ctx.user_data.pop("pending_meal", None)
@@ -1145,6 +1216,7 @@ async def show_main_menu(
     u = await db_get_user_row(db, user_id)
     mode = u.get("payment_mode", "sub")
     balance = int(u.get("credits", 0) or 0)
+    templates_exist = await has_templates(db, user_id)
 
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
@@ -1153,10 +1225,6 @@ async def show_main_menu(
         "🍽️ Я готов к работе. Посчитаем твои граммы.",
         "",
     ]
-
-    if notice:
-        lines.insert(0, notice)
-        lines.insert(1, "")
 
     if mode == "payg":
         lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
@@ -1185,13 +1253,26 @@ async def show_main_menu(
         ]
     )
 
+    if templates_exist:
+        lines.append(
+            "\n📁 Есть сохранённые заготовки. Жми «Добавить из шаблона», чтобы быстро учесть блюдо."
+        )
+
+    if notice and notice_at_bottom:
+        lines.append("")
+        lines.append(notice)
+    elif notice:
+        lines.insert(0, notice)
+        lines.insert(1, "")
+
     text = "\n".join(lines)
     chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    main_kb = await build_main_keyboard(ctx, user_id)
     await send_new_menu_message(
         ctx,
         chat_id,
         text,
-        kb_main(),
+        main_kb,
         user_id=update.effective_user.id if update.effective_user else None,
     )
 
@@ -1229,7 +1310,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• голосовой ввод приёма пищи;\n"
         "• WebApp с красивыми графиками за месяц."
     )
-    await edit_menu_message(update, ctx, text, kb_main())
+    kb = await build_main_keyboard(ctx, update.effective_user.id)
+    await edit_menu_message(update, ctx, text, kb)
 
 
 async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1241,6 +1323,199 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
+
+# ── Заготовки (шаблоны блюд) ───────────────────────────
+
+
+def format_totals_short(totals: dict) -> str:
+    kcal = round(float(totals.get("kcal", 0) or 0))
+    protein = round(float(totals.get("protein_g", 0) or 0))
+    fat = round(float(totals.get("fat_g", 0) or 0))
+    carbs = round(float(totals.get("carbs_g", 0) or 0))
+    return f"🍽 {kcal} ккал · 🥩 {protein} г · 🧈 {fat} г · 🍞 {carbs} г"
+
+
+def infer_template_name(data: dict, extras: dict) -> str:
+    if extras.get("composition"):
+        return extras["composition"].strip()
+
+    items = data.get("items") if isinstance(data, dict) else None
+    if isinstance(items, list) and items:
+        first = items[0]
+        if isinstance(first, dict) and first.get("name"):
+            return str(first.get("name")).strip()
+
+    return "Блюдо"
+
+
+def kb_template_portions(template_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    current: list[InlineKeyboardButton] = []
+    for portion in TEMPLATE_PORTION_OPTIONS:
+        label = f"x{portion}" if portion != 1 else "Обычная порция"
+        current.append(
+            InlineKeyboardButton(label, callback_data=f"tpl_portion:{template_id}:{portion}")
+        )
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="tpl_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_templates_list(templates: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for tpl in templates:
+        name = escape_md(tpl.get("name") or "Без названия")
+        rows.append([InlineKeyboardButton(name, callback_data=f"tpl_use:{tpl['id']}")])
+
+    rows.append([InlineKeyboardButton("⚙️ Настройки заготовок", callback_data="tpl_settings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_template_settings_menu(templates: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for tpl in templates:
+        name = escape_md(tpl.get("name") or "Без названия")
+        rows.append([InlineKeyboardButton(name, callback_data=f"tpl_manage:{tpl['id']}")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="templates")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_template_manage(template_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Переименовать", callback_data=f"tpl_rename:{template_id}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tpl_delete:{template_id}")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")],
+        ]
+    )
+
+
+async def show_templates_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    templates = await list_templates(db, uid)
+
+    if not templates:
+        text = (
+            "Заготовок пока нет.\n\n"
+            "Отправь фото и нажми «Добавить в шаблоны», чтобы сохранить блюдо."
+        )
+        await edit_menu_message(update, ctx, text, kb_main(has_templates=False))
+        return
+
+    lines = ["Добавить из заготовок 📁\n", "Выбери блюдо, которое нужно учесть:"]
+    text = "\n".join(lines)
+    await edit_menu_message(update, ctx, text, kb_templates_list(templates))
+
+
+async def show_template_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    templates = await list_templates(db, uid)
+
+    if not templates:
+        text = (
+            "Пока что заготовок нет.\n\n"
+            "Отправь фото и отметь «Добавить в шаблоны», чтобы сохранить блюдо."
+        )
+        await edit_menu_message(update, ctx, text, kb_main(has_templates=False))
+        return
+
+    text = (
+        "Настройки заготовок ⚙️\n\n"
+        "Нажми на заготовку, чтобы переименовать или удалить её."
+    )
+    await edit_menu_message(update, ctx, text, kb_template_settings_menu(templates))
+
+
+async def show_template_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE, template_id: int) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    tpl = await get_template(db, uid, template_id)
+    if not tpl:
+        await show_template_settings(update, ctx)
+        return
+
+    totals = {
+        "kcal": tpl.get("kcal", 0),
+        "protein_g": tpl.get("protein", 0),
+        "fat_g": tpl.get("fat", 0),
+        "carbs_g": tpl.get("carbs", 0),
+    }
+    text = (
+        f"Заготовка «{escape_md(tpl['name'])}»\n"
+        f"{format_totals_short(totals)}\n\n"
+        "Выбери действие:"
+    )
+    await edit_menu_message(update, ctx, text, kb_template_manage(template_id))
+
+
+async def ask_template_portion(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, template_id: int
+) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    tpl = await get_template(db, uid, template_id)
+    if not tpl:
+        await show_templates_menu(update, ctx)
+        return
+
+    totals = {
+        "kcal": tpl.get("kcal", 0),
+        "protein_g": tpl.get("protein", 0),
+        "fat_g": tpl.get("fat", 0),
+        "carbs_g": tpl.get("carbs", 0),
+    }
+    text = (
+        f"«{escape_md(tpl['name'])}»\n"
+        f"Базовая порция: {format_totals_short(totals)}\n\n"
+        "Выбери размер порции, которую добавить в статистику:"
+    )
+    await edit_menu_message(update, ctx, text, kb_template_portions(template_id))
+
+
+async def apply_template_portion(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, template_id: int, portion: float
+) -> None:
+    db = get_db(ctx)
+    uid = update.effective_user.id
+    tpl = await get_template(db, uid, template_id)
+    if not tpl:
+        await show_templates_menu(update, ctx)
+        return
+
+    base_totals = {
+        "kcal": float(tpl.get("kcal") or 0.0),
+        "protein_g": float(tpl.get("protein") or 0.0),
+        "fat_g": float(tpl.get("fat") or 0.0),
+        "carbs_g": float(tpl.get("carbs") or 0.0),
+    }
+
+    scaled = {k: v * portion for k, v in base_totals.items()}
+    raw_json = json.dumps(
+        {
+            "source": "template",
+            "template_id": template_id,
+            "template_name": tpl.get("name"),
+            "portion": portion,
+            "base_totals": base_totals,
+        },
+        ensure_ascii=False,
+    )
+
+    await add_meal(db, uid, scaled, raw_json)
+
+    notice = (
+        f"✅ Успешно добавлено из «{escape_md(tpl['name'])}» (x{portion}).\n"
+        f"{format_totals_short(scaled)}"
+    )
+    await show_main_menu(update, ctx, notice=notice, notice_at_bottom=True)
 
 async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
@@ -1682,7 +1957,7 @@ async def _process_meal_calculation(
             update,
             ctx,
             "Что-то пошло не так с фотографией. Попробуй отправить её ещё раз.",
-            kb_main(),
+            await build_main_keyboard(ctx, uid),
         )
         return
 
@@ -1720,7 +1995,7 @@ async def _process_meal_calculation(
             update,
             ctx,
             "Не смог скачать фото. Попробуй ещё раз отправить снимок.",
-            kb_main(),
+            await build_main_keyboard(ctx, uid),
         )
         return
 
@@ -1761,7 +2036,7 @@ async def _process_meal_calculation(
                 "• постарайся, чтобы еда была хорошо видна;\n"
                 "• при необходимости добавь описание через меню уточнений."
             ),
-            kb_main(),
+            await build_main_keyboard(ctx, uid),
         )
         return
 
@@ -1771,6 +2046,17 @@ async def _process_meal_calculation(
     carbs = round(float(totals.get("carbs_g", 0) or 0))
 
     await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+
+    template_saved = False
+    template_name = None
+    if extras.get("save_template"):
+        template_name = infer_template_name(data, extras)
+        template_raw = json.dumps({"analysis": data, "extras": extras}, ensure_ascii=False)
+        try:
+            await add_template(db, uid, template_name, totals, template_raw)
+            template_saved = True
+        except Exception:
+            logging.exception("failed to save template for user %s", uid)
 
     # После добавления приёма пересчитываем статистику за сегодня
     today_totals = await get_daily_totals(db, uid)
@@ -1798,6 +2084,9 @@ async def _process_meal_calculation(
     lines.append(f"🥩 Белки: ~*{protein}* г")
     lines.append(f"🧈 Жиры: ~*{fat}* г")
     lines.append(f"🍞 Углеводы: ~*{carbs}* г\n")
+
+    if template_saved and template_name:
+        lines.append(f"💾 Сохранено в заготовки как «{escape_md(template_name)}».\n")
 
     lines.append("За сегодняшний день:\n")
     lines.append(f"🍽 Калории: *{today_kcal}* ккал")
@@ -1832,7 +2121,8 @@ async def _process_meal_calculation(
     )
 
     msg = "\n".join(lines)
-    await edit_menu_message(update, ctx, msg, kb_main())
+    main_kb = await build_main_keyboard(ctx, uid)
+    await edit_menu_message(update, ctx, msg, main_kb)
 
 
 # ── Фото еды ─────────────────────────────────────────
@@ -1866,7 +2156,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "photo_file_id": photo.file_id,
         "photo_msg_id": message.message_id,
         "chat_id": chat.id,
-        "extras": {},
+        "extras": {"save_template": False},
     }
     ctx.user_data["pending_meal"]["trial_reserved"] = (mode == "trial")
     ctx.user_data["state"] = "await_meal_extras_menu"
@@ -1899,6 +2189,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await delete_user_message(update)
         return
 
+    uid = update.effective_user.id
+    db = get_db(ctx)
     text = (update.message.text or "").strip()
     state = ctx.user_data.get("state")
 
@@ -1937,6 +2229,33 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await handle_goal_input(update, ctx, text)
         return
 
+    if state == "await_template_rename":
+        await delete_user_message(update)
+        template_id = ctx.user_data.get("rename_template_id")
+        new_name = text.strip()
+
+        if not template_id:
+            ctx.user_data["state"] = None
+            await show_template_settings(update, ctx)
+            return
+
+        if not new_name:
+            await edit_menu_message(
+                update,
+                ctx,
+                "Название не может быть пустым. Введи новое название или вернись назад.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")]]
+                ),
+            )
+            return
+
+        await rename_template(db, uid, int(template_id), new_name)
+        ctx.user_data["state"] = None
+        ctx.user_data.pop("rename_template_id", None)
+        await show_template_settings(update, ctx)
+        return
+
     # Уточнения после фото
     pending = ctx.user_data.get("pending_meal") or {}
     extras = pending.get("extras") or {}
@@ -1957,20 +2276,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Обновляем меню уточнений
         chat_id = pending.get("chat_id") or update.effective_chat.id
-        info_lines = ["Фото получено ✅\n"]
-        if extras.get("portion"):
-            info_lines.append(f"📏 Граммовка: _{extras['portion']}_")
-        if extras.get("composition"):
-            info_lines.append(f"🍲 Состав: _{extras['composition']}_")
-        if extras.get("plate"):
-            info_lines.append(f"🍽 Тарелка: _{extras['plate']}_")
-        info_lines.append(
-            "\nМожно добавить ещё детали или сразу отправить на подсчёт."
-        )
         await edit_menu_message(
             update,
             ctx,
-            "\n".join(info_lines),
+            meal_extras_info_text(extras),
             kb_meal_extras(extras),
         )
         return
@@ -2015,12 +2324,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Показываем статус
+    main_kb = await build_main_keyboard(ctx, uid)
     await edit_menu_message(
         update,
         ctx,
         "Слушаю и расшифровываю приём пищи… 🎧\n\n"
         "Потом оценю калории и БЖУ.",
-        kb_main(),
+        main_kb,
     )
 
     # Скачиваем аудио
@@ -2036,7 +2346,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             update,
             ctx,
             "Не смог скачать голосовое сообщение. Попробуй записать ещё раз.",
-            kb_main(),
+            main_kb,
         )
         return
 
@@ -2067,7 +2377,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx,
             "Не смог расшифровать голос. Попробуй говорить чуть чётче "
             "и без лишнего шума на фоне.",
-            kb_main(),
+            main_kb,
         )
         return
 
@@ -2077,7 +2387,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx,
             "В расшифровке не получилось распознать текст. "
             "Попробуй перезаписать сообщение, описав, что и сколько ты съел.",
-            kb_main(),
+            main_kb,
         )
         return
 
@@ -2093,7 +2403,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Не смог оценить этот приём пищи по тексту.\n\n"
             "Попробуй описать его чуть подробнее: что именно, как приготовлено "
             "и какие примерные порции.",
-            kb_main(),
+            main_kb,
         )
         return
 
@@ -2154,7 +2464,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     msg = "\n".join(lines)
-    await edit_menu_message(update, ctx, msg, kb_main())
+    await edit_menu_message(update, ctx, msg, main_kb)
 
 
 # ── Callback-кнопки ───────────────────────────────────
@@ -2164,6 +2474,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = query.data or ""
     uid = update.effective_user.id
     await query.answer()
+    db = get_db(ctx)
 
     if data == "sub:invoice_back":
         # Назад из инвойса сразу к списку тарифов
@@ -2210,7 +2521,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data.startswith("pay_mode_set:"):
         mode = data.split(":", 1)[1]
-        db = get_db(ctx)
         await db_set_payment_mode(db, uid, mode)
         await show_pay_mode(update, ctx)
         return
@@ -2236,6 +2546,68 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data == "main":
         await show_main_menu(update, ctx)
+    elif data == "templates":
+        ctx.user_data["state"] = None
+        await show_templates_menu(update, ctx)
+    elif data == "tpl_settings":
+        ctx.user_data["state"] = None
+        await show_template_settings(update, ctx)
+    elif data == "tpl_back":
+        ctx.user_data["state"] = None
+        await show_templates_menu(update, ctx)
+    elif data.startswith("tpl_use:"):
+        try:
+            template_id = int(data.split(":", 1)[1])
+        except Exception:
+            await show_templates_menu(update, ctx)
+            return
+        ctx.user_data["state"] = None
+        await ask_template_portion(update, ctx, template_id)
+    elif data.startswith("tpl_portion:"):
+        try:
+            _, template_id_str, portion_str = data.split(":", 2)
+            template_id = int(template_id_str)
+            portion = float(portion_str)
+        except Exception:
+            await show_templates_menu(update, ctx)
+            return
+        ctx.user_data["state"] = None
+        await apply_template_portion(update, ctx, template_id, portion)
+    elif data.startswith("tpl_manage:"):
+        try:
+            template_id = int(data.split(":", 1)[1])
+        except Exception:
+            await show_template_settings(update, ctx)
+            return
+        ctx.user_data["state"] = None
+        await show_template_manage(update, ctx, template_id)
+    elif data.startswith("tpl_rename:"):
+        try:
+            template_id = int(data.split(":", 1)[1])
+        except Exception:
+            await show_template_settings(update, ctx)
+            return
+        tpl = await get_template(db, uid, template_id)
+        ctx.user_data["state"] = "await_template_rename"
+        ctx.user_data["rename_template_id"] = template_id
+        title = escape_md(tpl["name"]) if tpl else "заготовку"
+        await edit_menu_message(
+            update,
+            ctx,
+            f"Как переименовать «{title}»? Просто пришли новое название.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")]]
+            ),
+        )
+    elif data.startswith("tpl_delete:"):
+        try:
+            template_id = int(data.split(":", 1)[1])
+        except Exception:
+            await show_template_settings(update, ctx)
+            return
+        await delete_template(db, uid, template_id)
+        ctx.user_data["state"] = None
+        await show_template_settings(update, ctx)
     elif data == "settings":
         await show_settings(update, ctx)
     elif data == "premium_menu":
@@ -2352,6 +2724,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "_«Глубокая тарелка ~500 мл, заполнена примерно на 2/3»_",
             kb_back_to_main(),
         )
+    elif data == "meal_extra_template":
+        ctx.user_data["state"] = "await_meal_extras_menu"
+        pending = ctx.user_data.get("pending_meal") or {}
+        extras = pending.get("extras") or {}
+        extras["save_template"] = not extras.get("save_template")
+        pending["extras"] = extras
+        ctx.user_data["pending_meal"] = pending
+        await refresh_meal_extras_menu(update, ctx)
     elif data == "meal_extra_send":
         await _process_meal_calculation(update, ctx)
     elif data == "meal_extra_cancel":
@@ -3302,7 +3682,8 @@ async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"- Жиры: {round(totals['fat'])} г\n"
         f"- Углеводы: {round(totals['carbs'])} г\n"
     )
-    await edit_menu_message(update, ctx, text, kb_main())
+    kb = await build_main_keyboard(ctx, uid)
+    await edit_menu_message(update, ctx, text, kb)
 
 
 # ── main ─────────────────────────────────────────────

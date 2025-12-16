@@ -90,6 +90,20 @@ async def create_tables(db: aiosqlite.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_requests_user_created
         ON requests(user_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kcal REAL NOT NULL,
+            protein REAL NOT NULL,
+            fat REAL NOT NULL,
+            carbs REAL NOT NULL,
+            raw_json TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_templates_user ON templates(user_id);
         """
     )
     await db.commit()
@@ -370,6 +384,126 @@ async def get_today_requests_count(db: aiosqlite.Connection, user_id: int) -> in
     ) as cur:
         row = await cur.fetchone()
     return int(row[0] or 0)
+
+
+# ── Заготовки (шаблоны блюд) ────────────────────────────
+
+
+async def add_template(
+    db: aiosqlite.Connection,
+    user_id: int,
+    name: str,
+    totals: dict,
+    raw_json: str | None = None,
+) -> int:
+    await ensure_user(db, user_id)
+
+    kcal = float(totals.get("kcal") or 0.0)
+    protein = float(totals.get("protein_g") or 0.0)
+    fat = float(totals.get("fat_g") or 0.0)
+    carbs = float(totals.get("carbs_g") or 0.0)
+
+    cur = await db.execute(
+        """
+        INSERT INTO templates (user_id, name, kcal, protein, fat, carbs, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, name, kcal, protein, fat, carbs, raw_json),
+    )
+    await db.commit()
+    return int(cur.lastrowid)
+
+
+async def list_templates(db: aiosqlite.Connection, user_id: int) -> list[dict]:
+    await ensure_user(db, user_id)
+
+    cur = await db.execute(
+        """
+        SELECT id, name, kcal, protein, fat, carbs, raw_json
+          FROM templates
+         WHERE user_id = ?
+         ORDER BY id DESC
+        """,
+        (user_id,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+
+    templates: list[dict] = []
+    for row in rows:
+        templates.append(
+            {
+                "id": int(row[0]),
+                "name": row[1],
+                "kcal": float(row[2]),
+                "protein": float(row[3]),
+                "fat": float(row[4]),
+                "carbs": float(row[5]),
+                "raw_json": row[6],
+            }
+        )
+
+    return templates
+
+
+async def get_template(
+    db: aiosqlite.Connection, user_id: int, template_id: int
+) -> dict | None:
+    await ensure_user(db, user_id)
+    cur = await db.execute(
+        """
+        SELECT id, name, kcal, protein, fat, carbs, raw_json
+          FROM templates
+         WHERE id = ? AND user_id = ?
+        """,
+        (template_id, user_id),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+
+    if not row:
+        return None
+
+    return {
+        "id": int(row[0]),
+        "name": row[1],
+        "kcal": float(row[2]),
+        "protein": float(row[3]),
+        "fat": float(row[4]),
+        "carbs": float(row[5]),
+        "raw_json": row[6],
+    }
+
+
+async def delete_template(
+    db: aiosqlite.Connection, user_id: int, template_id: int
+) -> None:
+    await ensure_user(db, user_id)
+    await db.execute(
+        "DELETE FROM templates WHERE id = ? AND user_id = ?",
+        (template_id, user_id),
+    )
+    await db.commit()
+
+
+async def rename_template(
+    db: aiosqlite.Connection, user_id: int, template_id: int, new_name: str
+) -> None:
+    await ensure_user(db, user_id)
+    await db.execute(
+        "UPDATE templates SET name = ? WHERE id = ? AND user_id = ?",
+        (new_name, template_id, user_id),
+    )
+    await db.commit()
+
+
+async def has_templates(db: aiosqlite.Connection, user_id: int) -> bool:
+    await ensure_user(db, user_id)
+    async with db.execute(
+        "SELECT COUNT(*) FROM templates WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return bool(row and int(row[0] or 0) > 0)
 
 
 # ── Приёмы пищи и цели ────────────────────────────────
