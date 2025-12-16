@@ -176,6 +176,34 @@ def rub_to_stars(rub: int) -> int:
 
 
 TEMPLATE_PORTION_OPTIONS: list[float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+TEMPLATES_PER_PAGE = 8
+
+
+KEYCAP_DIGITS = {
+    "0": "0️⃣",
+    "1": "1️⃣",
+    "2": "2️⃣",
+    "3": "3️⃣",
+    "4": "4️⃣",
+    "5": "5️⃣",
+    "6": "6️⃣",
+    "7": "7️⃣",
+    "8": "8️⃣",
+    "9": "9️⃣",
+}
+
+
+def emoji_number(n: int) -> str:
+    if n == 10:
+        return "🔟"
+    return "".join(KEYCAP_DIGITS.get(ch, ch) for ch in str(n))
+
+
+def paginate_list(items: list, page: int, per_page: int) -> tuple[list, int, int]:
+    total_pages = max(1, math.ceil(len(items) / per_page))
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    return items[start : start + per_page], page, total_pages
 
 
 async def db_get_user_row(db, user_id: int) -> dict:
@@ -307,6 +335,12 @@ def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboard
 def kb_back_to_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")]]
+    )
+
+
+def kb_back_to_meal_extras() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data="meal_extra_back")]]
     )
 
 
@@ -1365,38 +1399,77 @@ def kb_template_portions(template_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def kb_templates_list(templates: list[dict]) -> InlineKeyboardMarkup:
+def kb_templates_list(templates: list[dict], page: int = 0) -> InlineKeyboardMarkup:
+    page_items, page, total_pages = paginate_list(templates, page, TEMPLATES_PER_PAGE)
     rows = []
-    for tpl in templates:
+    start_index = page * TEMPLATES_PER_PAGE
+    for idx, tpl in enumerate(page_items, start=start_index + 1):
         name = escape_md(tpl.get("name") or "Без названия")
-        rows.append([InlineKeyboardButton(name, callback_data=f"tpl_use:{tpl['id']}")])
+        prefix = emoji_number(idx)
+        rows.append(
+            [InlineKeyboardButton(f"{prefix} {name}", callback_data=f"tpl_use:{tpl['id']}")]
+        )
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"tpl_page:{page - 1}"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"tpl_page:{page + 1}"))
+        rows.append(nav_row)
 
     rows.append([InlineKeyboardButton("⚙️ Настройки заготовок", callback_data="tpl_settings")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_template_settings_menu(templates: list[dict]) -> InlineKeyboardMarkup:
+def kb_template_settings_menu(
+    templates: list[dict], page: int = 0
+) -> InlineKeyboardMarkup:
+    page_items, page, total_pages = paginate_list(templates, page, TEMPLATES_PER_PAGE)
     rows = []
-    for tpl in templates:
+    start_index = page * TEMPLATES_PER_PAGE
+    for idx, tpl in enumerate(page_items, start=start_index + 1):
         name = escape_md(tpl.get("name") or "Без названия")
-        rows.append([InlineKeyboardButton(name, callback_data=f"tpl_manage:{tpl['id']}")])
+        prefix = emoji_number(idx)
+        rows.append(
+            [InlineKeyboardButton(f"{prefix} {name}", callback_data=f"tpl_manage:{tpl['id']}")]
+        )
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton("⬅️", callback_data=f"tpl_settings_page:{page - 1}")
+            )
+        if page < total_pages - 1:
+            nav_row.append(
+                InlineKeyboardButton("➡️", callback_data=f"tpl_settings_page:{page + 1}")
+            )
+        rows.append(nav_row)
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="templates")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_template_manage(template_id: int) -> InlineKeyboardMarkup:
+def kb_template_manage(template_id: int, return_page: int | None = None) -> InlineKeyboardMarkup:
+    back_cb = (
+        f"tpl_settings_page:{return_page}"
+        if return_page is not None
+        else "tpl_settings"
+    )
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Переименовать", callback_data=f"tpl_rename:{template_id}")],
             [InlineKeyboardButton("🗑 Удалить", callback_data=f"tpl_delete:{template_id}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)],
         ]
     )
 
 
-async def show_templates_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_templates_menu(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0
+) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
     templates = await list_templates(db, uid)
@@ -1409,12 +1482,26 @@ async def show_templates_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         await edit_menu_message(update, ctx, text, kb_main(has_templates=False))
         return
 
-    lines = ["Добавить из заготовок 📁\n", "Выбери блюдо, которое нужно учесть:"]
+    page_items, page, total_pages = paginate_list(templates, page, TEMPLATES_PER_PAGE)
+    ctx.user_data["templates_page"] = page
+
+    lines = [
+        "Добавить из заготовок 📁\n",
+        "Выберите блюдо, чтобы добавить его к ИБЖУ себе в статистику.",
+        "Если хотите что-то изменить, зайдите в настройки заготовок и переименуйте или удалите блюдо.",
+    ]
+
+    if total_pages > 1:
+        lines.append("")
+        lines.append(f"Страница {page + 1}/{total_pages}. Листайте стрелками ⬅️➡️.")
+
     text = "\n".join(lines)
-    await edit_menu_message(update, ctx, text, kb_templates_list(templates))
+    await edit_menu_message(update, ctx, text, kb_templates_list(templates, page))
 
 
-async def show_template_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_template_settings(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int | None = None
+) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
     templates = await list_templates(db, uid)
@@ -1427,11 +1514,23 @@ async def show_template_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await edit_menu_message(update, ctx, text, kb_main(has_templates=False))
         return
 
-    text = (
-        "Настройки заготовок ⚙️\n\n"
-        "Нажми на заготовку, чтобы переименовать или удалить её."
-    )
-    await edit_menu_message(update, ctx, text, kb_template_settings_menu(templates))
+    if page is None:
+        page = ctx.user_data.get("tpl_settings_page", 0)
+
+    page_items, page, total_pages = paginate_list(templates, page, TEMPLATES_PER_PAGE)
+    ctx.user_data["tpl_settings_page"] = page
+
+    text_lines = [
+        "Настройки заготовок ⚙️\n",
+        "Нажми на заготовку, чтобы переименовать или удалить её.",
+    ]
+
+    if total_pages > 1:
+        text_lines.append("")
+        text_lines.append(f"Страница {page + 1}/{total_pages}. Листайте стрелками ⬅️➡️.")
+
+    text = "\n".join(text_lines)
+    await edit_menu_message(update, ctx, text, kb_template_settings_menu(templates, page))
 
 
 async def show_template_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE, template_id: int) -> None:
@@ -1439,7 +1538,8 @@ async def show_template_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE, t
     uid = update.effective_user.id
     tpl = await get_template(db, uid, template_id)
     if not tpl:
-        await show_template_settings(update, ctx)
+        page = ctx.user_data.get("tpl_settings_page", 0)
+        await show_template_settings(update, ctx, page=page)
         return
 
     totals = {
@@ -1453,7 +1553,8 @@ async def show_template_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE, t
         f"{format_totals_short(totals)}\n\n"
         "Выбери действие:"
     )
-    await edit_menu_message(update, ctx, text, kb_template_manage(template_id))
+    page = ctx.user_data.get("tpl_settings_page")
+    await edit_menu_message(update, ctx, text, kb_template_manage(template_id, page))
 
 
 async def ask_template_portion(
@@ -1463,7 +1564,8 @@ async def ask_template_portion(
     uid = update.effective_user.id
     tpl = await get_template(db, uid, template_id)
     if not tpl:
-        await show_templates_menu(update, ctx)
+        page = ctx.user_data.get("templates_page", 0)
+        await show_templates_menu(update, ctx, page=page)
         return
 
     totals = {
@@ -1487,7 +1589,8 @@ async def apply_template_portion(
     uid = update.effective_user.id
     tpl = await get_template(db, uid, template_id)
     if not tpl:
-        await show_templates_menu(update, ctx)
+        page = ctx.user_data.get("templates_page", 0)
+        await show_templates_menu(update, ctx, page=page)
         return
 
     base_totals = {
@@ -2240,12 +2343,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if not new_name:
+            back_page = ctx.user_data.get("tpl_settings_page", 0)
             await edit_menu_message(
                 update,
                 ctx,
                 "Название не может быть пустым. Введи новое название или вернись назад.",
                 InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")]]
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад",
+                                callback_data=f"tpl_settings_page:{back_page}",
+                            )
+                        ]
+                    ]
                 ),
             )
             return
@@ -2548,18 +2659,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_main_menu(update, ctx)
     elif data == "templates":
         ctx.user_data["state"] = None
-        await show_templates_menu(update, ctx)
+        ctx.user_data["templates_page"] = 0
+        await show_templates_menu(update, ctx, page=0)
+    elif data.startswith("tpl_page:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        ctx.user_data["state"] = None
+        await show_templates_menu(update, ctx, page=page)
     elif data == "tpl_settings":
         ctx.user_data["state"] = None
-        await show_template_settings(update, ctx)
+        ctx.user_data["tpl_settings_page"] = 0
+        await show_template_settings(update, ctx, page=0)
+    elif data.startswith("tpl_settings_page:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        ctx.user_data["state"] = None
+        await show_template_settings(update, ctx, page=page)
     elif data == "tpl_back":
         ctx.user_data["state"] = None
-        await show_templates_menu(update, ctx)
+        page = ctx.user_data.get("templates_page", 0)
+        await show_templates_menu(update, ctx, page=page)
     elif data.startswith("tpl_use:"):
         try:
             template_id = int(data.split(":", 1)[1])
         except Exception:
-            await show_templates_menu(update, ctx)
+            page = ctx.user_data.get("templates_page", 0)
+            await show_templates_menu(update, ctx, page=page)
             return
         ctx.user_data["state"] = None
         await ask_template_portion(update, ctx, template_id)
@@ -2569,7 +2698,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             template_id = int(template_id_str)
             portion = float(portion_str)
         except Exception:
-            await show_templates_menu(update, ctx)
+            page = ctx.user_data.get("templates_page", 0)
+            await show_templates_menu(update, ctx, page=page)
             return
         ctx.user_data["state"] = None
         await apply_template_portion(update, ctx, template_id, portion)
@@ -2577,7 +2707,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             template_id = int(data.split(":", 1)[1])
         except Exception:
-            await show_template_settings(update, ctx)
+            page = ctx.user_data.get("tpl_settings_page", 0)
+            await show_template_settings(update, ctx, page=page)
             return
         ctx.user_data["state"] = None
         await show_template_manage(update, ctx, template_id)
@@ -2585,29 +2716,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             template_id = int(data.split(":", 1)[1])
         except Exception:
-            await show_template_settings(update, ctx)
+            page = ctx.user_data.get("tpl_settings_page", 0)
+            await show_template_settings(update, ctx, page=page)
             return
         tpl = await get_template(db, uid, template_id)
         ctx.user_data["state"] = "await_template_rename"
         ctx.user_data["rename_template_id"] = template_id
         title = escape_md(tpl["name"]) if tpl else "заготовку"
+        back_page = ctx.user_data.get("tpl_settings_page", 0)
         await edit_menu_message(
             update,
             ctx,
             f"Как переименовать «{title}»? Просто пришли новое название.",
             InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Назад", callback_data="tpl_settings")]]
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад",
+                            callback_data=f"tpl_settings_page:{back_page}",
+                        )
+                    ]
+                ]
             ),
         )
     elif data.startswith("tpl_delete:"):
         try:
             template_id = int(data.split(":", 1)[1])
         except Exception:
-            await show_template_settings(update, ctx)
+            page = ctx.user_data.get("tpl_settings_page", 0)
+            await show_template_settings(update, ctx, page=page)
             return
         await delete_template(db, uid, template_id)
         ctx.user_data["state"] = None
-        await show_template_settings(update, ctx)
+        page = ctx.user_data.get("tpl_settings_page", 0)
+        await show_template_settings(update, ctx, page=page)
     elif data == "settings":
         await show_settings(update, ctx)
     elif data == "premium_menu":
@@ -2694,6 +2836,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     await finish_survey(update, ctx)
     elif data in {"back", "back_to_main"}:
         await show_main_menu(update, ctx)
+    elif data == "meal_extra_back":
+        pending = ctx.user_data.get("pending_meal") or {}
+        extras = pending.get("extras") or {}
+        if not pending:
+            ctx.user_data["state"] = None
+            await show_main_menu(update, ctx)
+        else:
+            ctx.user_data["state"] = "await_meal_extras_menu"
+            await edit_menu_message(
+                update,
+                ctx,
+                meal_extras_info_text(extras),
+                kb_meal_extras(extras),
+            )
     elif data == "meal_extra_portion":
         ctx.user_data["state"] = "await_extra_portion"
         await edit_menu_message(
@@ -2702,7 +2858,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Напиши одним сообщением примерную граммовку / размер порции.\n\n"
             "Например:\n"
             "_«Около 300 г гарнира и 150 г мяса»_",
-            kb_back_to_main(),
+            kb_back_to_meal_extras(),
         )
     elif data == "meal_extra_composition":
         ctx.user_data["state"] = "await_extra_composition"
@@ -2712,7 +2868,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Опиши, что именно на тарелке и из чего состоит блюдо.\n\n"
             "Например:\n"
             "_«Куриная грудка на гриле, гречка без масла, салат из огурцов и помидоров с ложкой оливкового масла»_",
-            kb_back_to_main(),
+            kb_back_to_meal_extras(),
         )
     elif data == "meal_extra_plate":
         ctx.user_data["state"] = "await_extra_plate"
@@ -2722,7 +2878,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "Опиши размер тарелки или её объём, если знаешь.\n\n"
             "Например:\n"
             "_«Глубокая тарелка ~500 мл, заполнена примерно на 2/3»_",
-            kb_back_to_main(),
+            kb_back_to_meal_extras(),
         )
     elif data == "meal_extra_template":
         ctx.user_data["state"] = "await_meal_extras_menu"
