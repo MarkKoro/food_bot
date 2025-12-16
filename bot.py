@@ -4,7 +4,6 @@
 import os
 import asyncio
 import io
-import imghdr
 import json
 import base64
 import logging
@@ -2468,62 +2467,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_image_message(update, ctx, photo_file_id=photo.file_id)
 
 
-def _is_image_document(document) -> bool:
-    mime_type = (document.mime_type or "").lower()
-    if mime_type.startswith("image/"):
-        return True
-
-    file_name = (document.file_name or "").lower()
-    return file_name.endswith(
-        (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".tiff", ".gif")
-    )
-
-
-async def _document_looks_like_image(document, bot) -> bool:
-    """Пытаемся определить, что документ — это изображение.
-
-    Дополнительно к MIME/расширению учитываем превью Telegram, а при его
-    отсутствии пробуем распознать формат по заголовку файла.
-    """
-
-    if getattr(document, "thumb", None):
-        return True
-
-    try:
-        file = await bot.get_file(document.file_id)
-        bio = io.BytesIO()
-        await file.download_to_memory(out=bio)
-        bio.seek(0)
-        header = bio.read(8192)
-        kind = imghdr.what(None, header)
-        return kind is not None
-    except Exception:
-        logging.exception("failed to inspect document image for user %s", document.file_id)
-        return False
-
-
-async def handle_document_photo(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE
-) -> None:
-    if not update.message or not update.message.document:
-        return
-    
-    doc = update.message.document
-
-    # 1) проверяем, что документ похож на картинку
-    is_image = _is_image_document(doc)
-    if not is_image:
-        is_image = await _document_looks_like_image(doc, ctx.bot)
-
-    if not is_image:
-        await send_new_menu_message(update, ctx, "📎 Это не похоже на фото еды. Пришли именно картинку 🙂")
-        return
-
-    # 2) важно: если это фото-документ — обрабатываем точно так же, как обычное фото
-    await delete_user_message(update)
-    await _handle_image_message(update, ctx, photo_file_id=doc.file_id)
-
-
 # ── Текст: цель / уточнения / остальное ──────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4302,12 +4245,6 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo)
     )
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL & ~filters.COMMAND, handle_document_photo
-        )
-    )
-
     # Голосовые (заглушка)
     application.add_handler(
         MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice)
