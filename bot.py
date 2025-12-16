@@ -4,6 +4,7 @@
 import os
 import asyncio
 import io
+import imghdr
 import json
 import base64
 import logging
@@ -162,6 +163,9 @@ VISION_DETAIL = os.getenv("VISION_DETAIL", "high").lower()  # low | high | auto 
 VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1600"))  # макс сторона после ресайза
 VISION_JPEG_QUALITY = int(os.getenv("VISION_JPEG_QUALITY", "90"))
 VISION_COMPRESS_THRESHOLD = int(os.getenv("VISION_COMPRESS_THRESHOLD", "2500000"))  # bytes; 0 = всегда
+
+# Лимит длины голосового сообщения
+MAX_VOICE_SEC = 90  # 1.5 минуты
 
 ADMINS = {
     int(x)
@@ -2475,11 +2479,45 @@ def _is_image_document(document) -> bool:
     )
 
 
+async def _document_looks_like_image(document, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Пытаемся определить, что документ — это изображение.
+
+    Дополнительно к MIME/расширению учитываем превью Telegram, а при его
+    отсутствии пробуем распознать формат по заголовку файла.
+    """
+
+    if getattr(document, "thumb", None):
+        return True
+
+    try:
+        file = await ctx.bot.get_file(document.file_id)
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+        header = bio.read(8192)
+        kind = imghdr.what(None, header)
+        return kind is not None
+    except Exception:
+        logging.exception("failed to inspect document image for user %s", document.file_id)
+        return False
+
+
 async def handle_document_photo(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE
 ) -> None:
     document = update.message.document
-    if not document or not _is_image_document(document):
+    if not document:
+        return
+
+    is_image = _is_image_document(document)
+    if not is_image:
+        is_image = await _document_looks_like_image(document, ctx)
+
+    if not is_image:
+        await update.message.reply_text(
+            "Не похоже на фото. Попробуй пересохранить файл как изображение "
+            "(JPG/PNG/HEIC) и отправить снова."
+        )
         return
 
     await _handle_image_message(update, ctx, file_id=document.file_id)
@@ -2616,6 +2654,20 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
 
     voice = update.message.voice
+    if voice and voice.duration and voice.duration > MAX_VOICE_SEC:
+        main_kb = await build_main_keyboard(ctx, uid)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await edit_menu_message(
+            update,
+            ctx,
+            "🎙️ Голосовое слишком длинное. Пожалуйста, уложись в 1–1.5 минуты 🙂",
+            main_kb,
+        )
+        return
+
     file_id = voice.file_id
 
     db = get_db(ctx)
