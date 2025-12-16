@@ -2442,7 +2442,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx,
         "Слушаю и расшифровываю приём пищи… 🎧\n\n"
         "Потом оценю калории и БЖУ.",
-        main_kb,
+        None,
     )
 
     # Скачиваем аудио
@@ -2575,7 +2575,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "\n_Это приблизительная оценка по описанию, которое ты произнёс._"
     )
 
-    msg = "\n".join(lines)
+    payg_footer = ""
+    if pay_mode == "payg":
+        user_state = await db_get_user_row(db, uid)
+        payg_balance = int(user_state.get("credits", 0) or 0)
+        payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
+
+    msg = "\n".join(lines) + payg_footer
     await edit_menu_message(update, ctx, msg, main_kb)
 
 
