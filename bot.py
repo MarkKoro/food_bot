@@ -331,7 +331,6 @@ if not JOIN_URL:
 def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
     ]
 
@@ -362,6 +361,7 @@ def kb_settings() -> InlineKeyboardMarkup:
                     "🧮 Подобрать цель по опросу", callback_data="survey_start"
                 )
             ],
+            [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
     )
@@ -385,7 +385,7 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_t
         ],
         [InlineKeyboardButton("⭐ Купить подписку", callback_data="premium_menu")],
         [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
-        [InlineKeyboardButton("⬅ Назад", callback_data="main")],
+        [InlineKeyboardButton("⬅ Назад", callback_data="settings")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1089,7 +1089,7 @@ async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool
 
     text = (
         "Пока что у тебя нет активной премиум-подписки.\n\n"
-        "С премиумом можно без ограничений отправлять фото и голосовые "
+        "С премиумом можно без ограничений отправлять фото, голосовые и тексты "
         "для подсчёта КБЖУ и анализа питания.\n\n"
         "Хочешь оформить подписку?"
     )
@@ -1436,7 +1436,7 @@ async def show_main_menu(
     if mode == "payg":
         lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
         lines.append(f"Баланс: {balance}₽.")
-        lines.append(f"Цена: {PAYG_COST_RUB}₽ за фотоголос.")
+        lines.append(f"Цена: {PAYG_COST_RUB}₽ за запрос (фото/голос/текст).")
     else:
         status_text = (
             f"активно до {fmt_dt(premium_until)}."
@@ -1456,6 +1456,7 @@ async def show_main_menu(
             "",
             "_• В любое время пришли голосовое с тем, что ты поел или планируешь._",
             "_• Или отправь фото блюда — посчитаю калории и БЖУ._",
+            "_• Можно и просто написать текстом, что ел — тоже посчитаю._",
         ]
     )
 
@@ -1546,6 +1547,7 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "⚙️ Настройки\n\n"
         "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
+        "• 💳 Режим оплаты — управление подпиской и PAYG внутри настроек.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
@@ -1829,12 +1831,12 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "💳 **Режим оплаты**\n\n"
         f"1) ⭐ **Подписка** {'✅' if mode == 'sub' else ''}\n"
         f"• Статус: **{sub_until_text}**\n"
-        "• Лимит: **10 запросов в день** (фото/голос)\n"
+        "• Лимит: **10 запросов в день** (фото/голос/текст)\n"
         "• Деньги с баланса не списываются\n"
         "• Нажми «⭐ Купить подписку», чтобы оплатить срок\n\n"
         f"2) **Pay-as-you-go** {'✅' if mode == 'payg' else ''}\n"
         f"• Баланс: **{balance}₽**\n"
-        f"• Цена: **{PAYG_COST_RUB}₽ за запрос** (фото/голос)\n"
+        f"• Цена: **{PAYG_COST_RUB}₽ за запрос** (фото/голос/текст)\n"
         "• Лимитов нет\n"
         "• Нажми «➕ Пополнить PAYG», чтобы пополнить\n\n"
         "Выбери режим кнопками ниже — галочка переедет, а режим сохранится."
@@ -1852,7 +1854,7 @@ async def show_survey_offer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     """
     ctx.user_data["state"] = "survey_select_mode"
     text = (
-        "Привет! Я бот Грамм. Помогу держать тело в форме — буду считать КБЖУ по фото и голосу.\n\n"
+        "Привет! Я бот Грамм. Помогу держать тело в форме — буду считать КБЖУ по фото, голосу и тексту.\n\n"
         "Чтобы подобрать комфортную норму, давай пройдём короткий опрос. Выбери формат:"
     )
     kb = InlineKeyboardMarkup(
@@ -2523,6 +2525,97 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_image_message(update, ctx, photo_file_id=photo.file_id)
 
 
+async def process_meal_description(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    description: str,
+    *,
+    header: str,
+    note: str,
+    pay_mode: str,
+    main_kb: InlineKeyboardMarkup,
+) -> None:
+    uid = update.effective_user.id
+    db = get_db(ctx)
+
+    try:
+        data = await analyze_food_text(description)
+        totals = extract_totals(data)
+    except Exception:
+        logging.exception("analyze_food_text failed for %s", uid)
+        await edit_menu_message(
+            update,
+            ctx,
+            "Не смог оценить этот приём пищи по тексту.\n\n"
+            "Попробуй описать его чуть подробнее: что именно, как приготовлено "
+            "и какие примерные порции.",
+            main_kb,
+        )
+        return
+
+    kcal = round(float(totals.get("kcal", 0) or 0))
+    protein = round(float(totals.get("protein_g", 0) or 0))
+    fat = round(float(totals.get("fat_g", 0) or 0))
+    carbs = round(float(totals.get("carbs_g", 0) or 0))
+
+    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+
+    today_totals = await get_daily_totals(db, uid)
+    goal = await get_goal(db, uid)
+
+    today_kcal = round(today_totals["kcal"])
+    today_p = round(today_totals["protein"])
+    today_f = round(today_totals["fat"])
+    today_c = round(today_totals["carbs"])
+
+    lines = []
+    lines.append(f"{header}\n")
+    lines.append("Этот приём:")
+    lines.append(f"🍽 Калории: ~*{kcal}* ккал")
+    lines.append(f"🥩 Белки: ~*{protein}* г")
+    lines.append(f"🧈 Жиры: ~*{fat}* г")
+    lines.append(f"🍞 Углеводы: ~*{carbs}* г\n")
+
+    lines.append("За сегодняшний день:")
+    lines.append(f"🍽 Калории: *{today_kcal}* ккал")
+    if goal:
+        lines.append(
+            f"  из {int(goal['kcal'])} ккал (*{_perc(today_kcal, goal['kcal'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🥩 Белки: *{today_p}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['protein']} г (*{_perc(today_p, goal['protein'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🧈 Жиры: *{today_f}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['fat']} г (*{_perc(today_f, goal['fat'])}%*)"
+        )
+
+    lines.append("")
+    lines.append(f"🍞 Углеводы: *{today_c}* г")
+    if goal:
+        lines.append(
+            f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
+        )
+
+    lines.append(f"\n_{note}_")
+
+    payg_footer = ""
+    if pay_mode == "payg":
+        user_state = await db_get_user_row(db, uid)
+        payg_balance = int(user_state.get("credits", 0) or 0)
+        payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
+
+    msg = "\n".join(lines) + payg_footer
+    await edit_menu_message(update, ctx, msg, main_kb)
+
+
 # ── Текст: цель / уточнения / остальное ──────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2633,9 +2726,84 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Любой другой текст — удаляем и возвращаем меню
+    # Любой другой текст — считаем как самостоятельный приём пищи
     await delete_user_message(update)
-    await show_main_menu(update, ctx)
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("pending_meal", None)
+
+    if not text:
+        await show_main_menu(update, ctx)
+        return
+
+    db = get_db(ctx)
+    u0 = await db_get_user_row(db, uid)
+    pay_mode0 = u0.get("payment_mode", "sub")
+    payg_balance = int(u0.get("credits", 0) or 0)
+
+    has_subscription, subscription_until, _ = await _get_access_flags(db, uid)
+
+    if pay_mode0 == "payg" and not is_admin(uid):
+        if payg_balance < PAYG_COST_RUB:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            return
+        mode = "payg"
+    else:
+        if not has_subscription:
+            await send_payment_block_notice(
+                update,
+                ctx,
+                pay_mode=pay_mode0,
+                payg_balance=payg_balance,
+                has_subscription=has_subscription,
+                subscription_until=subscription_until,
+            )
+            return
+        mode = await require_access(update, ctx, consume=True, kind="text")
+
+    if not mode:
+        return
+
+    main_kb = await build_main_keyboard(ctx, uid)
+    await edit_menu_message(
+        update,
+        ctx,
+        "Читаю твой текстовый запрос… ✍️\n\nПотом оценю калории и БЖУ.",
+        None,
+    )
+
+    u = u0 or await db_get_user_row(db, uid)
+    pay_mode = u.get("payment_mode", "sub")
+
+    if uid not in ADMINS and pay_mode == "payg":
+        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
+        if not ok:
+            bal = int(u.get("credits", 0) or 0)
+            await edit_menu_message(
+                update,
+                ctx,
+                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
+                kb_payg_topups(),
+            )
+            return
+
+        await db_log_request(db, uid, "text")
+
+    await process_meal_description(
+        update,
+        ctx,
+        text,
+        header="Текстовый приём пищи ✍️",
+        note="Это приблизительная оценка по описанию, которое ты прислал.",
+        pay_mode=pay_mode,
+        main_kb=main_kb,
+    )
 
 
 # ── Голосовые ─────────────────────────────────────────
@@ -2779,86 +2947,15 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Анализируем текст как приём пищи
-    try:
-        data = await analyze_food_text(transcript)
-        totals = extract_totals(data)
-    except Exception:
-        logging.exception("analyze_food_text failed for %s", uid)
-        await edit_menu_message(
-            update,
-            ctx,
-            "Не смог оценить этот приём пищи по тексту.\n\n"
-            "Попробуй описать его чуть подробнее: что именно, как приготовлено "
-            "и какие примерные порции.",
-            main_kb,
-        )
-        return
-
-    kcal = round(float(totals.get("kcal", 0) or 0))
-    protein = round(float(totals.get("protein_g", 0) or 0))
-    fat = round(float(totals.get("fat_g", 0) or 0))
-    carbs = round(float(totals.get("carbs_g", 0) or 0))
-
-    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
-
-    # Пересчитываем статистику за сегодня
-    today_totals = await get_daily_totals(db, uid)
-    goal = await get_goal(db, uid)
-
-    today_kcal = round(today_totals["kcal"])
-    today_p = round(today_totals["protein"])
-    today_f = round(today_totals["fat"])
-    today_c = round(today_totals["carbs"])
-
-    lines = []
-    lines.append("Голосовой приём пищи 🎙\n")
-    lines.append("Этот приём:\n")
-    lines.append(f"🍽 Калории: ~*{kcal}* ккал")
-    lines.append(f"🥩 Белки: ~*{protein}* г")
-    lines.append(f"🧈 Жиры: ~*{fat}* г")
-    lines.append(f"🍞 Углеводы: ~*{carbs}* г\n")
-
-    lines.append("За сегодняшний день:\n")
-    lines.append(f"🍽 Калории: *{today_kcal}* ккал")
-    if goal:
-        lines.append(
-            f"  из {int(goal['kcal'])} ккал (*{_perc(today_kcal, goal['kcal'])}%*)"
-        )
-
-    lines.append("")
-    lines.append(f"🥩 Белки: *{today_p}* г")
-    if goal:
-        lines.append(
-            f"  из {goal['protein']} г (*{_perc(today_p, goal['protein'])}%*)"
-        )
-
-    lines.append("")
-    lines.append(f"🧈 Жиры: *{today_f}* г")
-    if goal:
-        lines.append(
-            f"  из {goal['fat']} г (*{_perc(today_f, goal['fat'])}%*)"
-        )
-
-    lines.append("")
-    lines.append(f"🍞 Углеводы: *{today_c}* г")
-    if goal:
-        lines.append(
-            f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
-        )
-
-    lines.append(
-        "\n_Это приблизительная оценка по описанию, которое ты произнёс._"
+    await process_meal_description(
+        update,
+        ctx,
+        transcript,
+        header="Голосовой приём пищи 🎙",
+        note="Это приблизительная оценка по описанию, которое ты произнёс.",
+        pay_mode=pay_mode,
+        main_kb=main_kb,
     )
-
-    payg_footer = ""
-    if pay_mode == "payg":
-        user_state = await db_get_user_row(db, uid)
-        payg_balance = int(user_state.get("credits", 0) or 0)
-        payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
-
-    msg = "\n".join(lines) + payg_footer
-    await edit_menu_message(update, ctx, msg, main_kb)
 
 
 # ── Callback-кнопки ───────────────────────────────────
@@ -3506,7 +3603,7 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         invoice_message = await ctx.bot.send_invoice(
             chat_id=chat_id,
             title=f"Подписка на {plan.title}",
-            description="Подписка на умный дневник питания с фото и голосом.",
+            description="Подписка на умный дневник питания с фото, голосом и текстом.",
             payload=payload,
             provider_token=YOOKASSA_PROVIDER_TOKEN,
             currency="RUB",
@@ -3904,10 +4001,12 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     req_today = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime')")
     req_today_photo = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND kind='photo'")
     req_today_voice = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND kind='voice'")
+    req_today_text = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND kind='text'")
 
     req_7d = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days')")
     req_7d_photo = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days') AND kind='photo'")
     req_7d_voice = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days') AND kind='voice'")
+    req_7d_text = await q1("SELECT COUNT(*) FROM requests WHERE created_at >= datetime('now','localtime','-7 days') AND kind='text'")
     active_users_7d = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE created_at >= datetime('now','localtime','-7 days')")
 
     avg_req_per_day_7d = req_7d / 7.0
@@ -3928,8 +4027,8 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⭐ Активная подписка: *{premium_active}*\n"
         f"🎁 Активный пробник (24ч): *{trial_active}*\n"
         f"🧪 Платный пробник (1 неделя) использовали: *{paid_trial_used}*\n\n"
-        f"📅 Сегодня запросов: *{req_today}* (фото *{req_today_photo}* / голос *{req_today_voice}*)\n"
-        f"🗓 За 7 дней запросов: *{req_7d}* (фото *{req_7d_photo}* / голос *{req_7d_voice}*)\n"
+        f"📅 Сегодня запросов: *{req_today}* (фото *{req_today_photo}* / голос *{req_today_voice}* / текст *{req_today_text}*)\n"
+        f"🗓 За 7 дней запросов: *{req_7d}* (фото *{req_7d_photo}* / голос *{req_7d_voice}* / текст *{req_7d_text}*)\n"
         f"📈 Среднее (7д): *{avg_req_per_day_7d:.1f}* запрос/день\n"
         f"🙋‍♂️ Среднее на активного (7д): *{avg_req_per_user_per_day_7d:.2f}* запрос/польз/день\n\n"
         "💸 Оплаты:\n"
