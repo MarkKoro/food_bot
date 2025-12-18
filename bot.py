@@ -156,7 +156,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")      # на будущее: текст/голос
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o")           # текст/голос — полноценный gpt-4o
 AUDIO_TRANSCRIBE_MODEL = os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 VISION_DETAIL = os.getenv("VISION_DETAIL", "high").lower()  # low | high | auto (если у тебя поддержано)
 VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1600"))  # макс сторона после ресайза
@@ -445,7 +445,7 @@ def kb_sub() -> InlineKeyboardMarkup:
 def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
     """
     Меню уточнений после фото.
-    extras: dict с ключами 'portion', 'composition', 'plate'.
+    extras: dict с ключами 'portion', 'composition'.
     """
     def label(base: str, key: str) -> str:
         return f"{base} ✅" if extras.get(key) else base
@@ -454,7 +454,7 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    label("📏 Граммовка / порция", "portion"),
+                    label("📏 Размер блюда", "portion"),
                     callback_data="meal_extra_portion",
                 )
             ],
@@ -462,12 +462,6 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     label("🍲 Что за блюдо / состав", "composition"),
                     callback_data="meal_extra_composition",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    label("🍽 Размер тарелки", "plate"),
-                    callback_data="meal_extra_plate",
                 )
             ],
             [
@@ -490,11 +484,9 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
 def meal_extras_info_text(extras: dict) -> str:
     info_lines = ["Фото получено ✅\n"]
     if extras.get("portion"):
-        info_lines.append(f"📏 Граммовка: _{extras['portion']}_")
+        info_lines.append(f"📏 Размер блюда: _{extras['portion']}_")
     if extras.get("composition"):
         info_lines.append(f"🍲 Состав: _{extras['composition']}_")
-    if extras.get("plate"):
-        info_lines.append(f"🍽 Тарелка: _{extras['plate']}_")
     if extras.get("save_template"):
         info_lines.append("💾 Будет сохранено в заготовки")
 
@@ -511,12 +503,12 @@ async def refresh_meal_extras_menu(update: Update, ctx: ContextTypes.DEFAULT_TYP
 # ── Промпт для GPT-Vision ─────────────────────────────
 
 FOOD_SYSTEM_PROMPT = (
-    "Ты — аккуратный ассистент-нутрициолог. По фотографии еды ты примерно оцениваешь "
+    "Ты — внимательный ассистент-нутрициолог. По фотографии еды ты примерно оцениваешь "
     "калорийность и количество белков, жиров и углеводов. "
     "Оценивай реалистично, не завышай и не занижай без причины. "
     "Если еда частично скрыта, всё равно сделай осторожную оценку на основе типичных порций. "
     "Если есть дополнительная информация от пользователя (описание блюда, примерная граммовка, "
-    "размер тарелки), считай её приоритетной и обязательно учитывай в расчётах."
+    "размер блюда), считай её приоритетной и обязательно учитывай в расчётах."
 )
 
 FOOD_USER_INSTRUCTIONS = (
@@ -550,15 +542,19 @@ FOOD_USER_INSTRUCTIONS = (
 )
 
 TEXT_FOOD_SYSTEM_PROMPT = (
-    "Ты — аккуратный ассистент-нутрициолог. Человек описывает голосом или текстом один приём пищи. "
-    "По этому описанию ты примерно оцениваешь калории и количество белков, жиров и углеводов. "
-    "Учитывай размер порций, способ приготовления (жарка, варка, фритюр), соусы и масла. "
-    "Если чего-то не хватает в описании, делай осторожные предположения на основе типичных порций."
+    "Ты — аккуратный и точный ассистент-нутрициолог. Твоя задача — анализировать описания "
+    "приёмов пищи (текстовые сообщения или расшифрованные голосовые заметки) и оценивать "
+    "примерное содержание калорий, белков, жиров и углеводов. Работай на русском языке, думай "
+    "как практикующий нутрициолог: учитывай размер порции, способ приготовления (жарка, варка, "
+    "фритюр), наличие соусов, масел и напитков. Если данных мало, делай осторожные предположения "
+    "на основе типичных порций и блюд, не завышай и не занижай без причины. Всегда возвращай "
+    "строгий JSON без лишнего текста."
 )
 
 TEXT_FOOD_USER_INSTRUCTIONS = (
-    "Человек голосом описал один приём пищи. На основе только этого описания оцени КБЖУ.\n\n"
-    "Нужно вернуть строго JSON того же формата, что и для фото:\n"
+    "Человек описал один приём пищи (сообщение или транскрипт голоса). Используй только это "
+    "описание, чтобы приблизительно оценить КБЖУ.\n\n"
+    "Верни строго JSON в формате:\n"
     "{\n"
     "  \"items\": [\n"
     "    {\n"
@@ -577,7 +573,7 @@ TEXT_FOOD_USER_INSTRUCTIONS = (
     "    \"carbs_g\": 0\n"
     "  }\n"
     "}\n\n"
-    "Если в описании явно указана граммовка или размер порции, обязательно учитывай это."
+    "Если указана граммовка, размер порции или способ приготовления — обязательно учитывай это."
 )
 
 SURVEYS = {
@@ -1027,7 +1023,7 @@ async def require_access(
             await log_request(db, user_id, kind)
         return True
 
-    # дневной лимит только для реальных запросов (photo/voice)
+    # дневной лимит только для реальных запросов (photo/voice/text)
     if kind is not None:
         used_today = await get_today_requests_count(db, user_id)
         if used_today >= DAILY_LIMIT:
@@ -1528,9 +1524,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Как пользоваться ботом 🍽\n\n"
         "1. Пришли *фото* своей тарелки — я оценю калории и БЖУ.\n"
         "2. После фото можно уточнить:\n"
-        "   • примерную граммовку;\n"
-        "   • что именно за блюда на тарелке;\n"
-        "   • размер тарелки.\n"
+        "   • примерный размер/массу порции;\n"
+        "   • что именно за блюда на тарелке.\n"
         "3. Все приёмы пищи копятся в базе, статистику за день и неделю можно посмотреть через «📊 Статистика».\n"
         "4. В «⚙️ Настройки» можно задать дневную цель по КБЖУ.\n\n"
         "В будущем появится:\n"
@@ -1561,6 +1556,42 @@ def format_totals_short(totals: dict) -> str:
     fat = round(float(totals.get("fat_g", 0) or 0))
     carbs = round(float(totals.get("carbs_g", 0) or 0))
     return f"🍽 {kcal} ккал · 🥩 {protein} г · 🧈 {fat} г · 🍞 {carbs} г"
+
+
+def format_recognized_items(items: list | None) -> list[str]:
+    lines: list[str] = []
+    if not isinstance(items, list):
+        return lines
+
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        weight = item.get("weight_g")
+        kcal_total = item.get("kcal_total")
+        parts = [f"• {name}"]
+        if weight:
+            try:
+                weight_val = float(weight)
+                parts.append(f"~{round(weight_val)} г")
+            except Exception:
+                parts.append(str(weight))
+        if kcal_total:
+            try:
+                kcal_val = float(kcal_total)
+                parts.append(f"~{round(kcal_val)} ккал")
+            except Exception:
+                parts.append(f"ккал: {kcal_total}")
+        normalized.append(" — ".join(parts))
+
+    if normalized:
+        lines.append("Что распознано:")
+        lines.extend(normalized)
+
+    return lines
 
 
 def infer_template_name(data: dict, extras: dict) -> str:
@@ -2266,8 +2297,6 @@ async def _process_meal_calculation(
         parts.append(f"- Размер порции: {extras['portion']}")
     if extras.get("composition"):
         parts.append(f"- Описание блюда / состав: {extras['composition']}")
-    if extras.get("plate"):
-        parts.append(f"- Размер тарелки: {extras['plate']}")
     extra_description = "\n".join(parts) if parts else None
 
     # Статус "считаю"
@@ -2393,6 +2422,10 @@ async def _process_meal_calculation(
 
     lines = []
     lines.append("Оценка приёма пищи 🍽\n")
+    recognized_lines = format_recognized_items(data.get("items"))
+    if recognized_lines:
+        lines.extend(recognized_lines)
+        lines.append("")
     lines.append("Этот приём:\n")
     lines.append(f"🍽 Калории: ~*{kcal}* ккал")
     lines.append(f"🥩 Белки: ~*{protein}* г")
@@ -2508,10 +2541,10 @@ async def _handle_image_message(
     text = (
         "Фото получено ✅\n\n"
         "Чтобы расчёт был точнее, можно уточнить детали:\n"
-        "• примерную граммовку порции;\n"
-        "• что именно за блюдо и из чего оно состоит;\n"
-        "• размер тарелки.\n\n"
-        "Выбери, что хочешь уточнить, или сразу жми «✅ Считать как есть / отправить»."
+        "• примерный размер/массу порции;\n"
+        "• что именно за блюдо и из чего оно состоит.\n\n"
+        "Выбери, что хочешь уточнить, или сразу жми «✅ Считать как есть / отправить». "
+        "Можно просто написать текстом, если это удобнее."
     )
     extras = ctx.user_data["pending_meal"]["extras"]
     uid = update.effective_user.id
@@ -2570,6 +2603,10 @@ async def process_meal_description(
 
     lines = []
     lines.append(f"{header}\n")
+    recognized_lines = format_recognized_items(data.get("items"))
+    if recognized_lines:
+        lines.extend(recognized_lines)
+        lines.append("")
     lines.append("Этот приём:")
     lines.append(f"🍽 Калории: ~*{kcal}* ккал")
     lines.append(f"🥩 Белки: ~*{protein}* г")
@@ -2702,15 +2739,39 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     pending = ctx.user_data.get("pending_meal") or {}
     extras = pending.get("extras") or {}
 
-    if state in {"await_extra_portion", "await_extra_composition", "await_extra_plate"}:
+    if state == "await_meal_extras_menu":
+        await delete_user_message(update)
+        cleaned = text.strip()
+        if cleaned:
+            if re.search(r"\d", cleaned) and not extras.get("portion"):
+                extras["portion"] = cleaned
+            else:
+                existing = extras.get("composition") or ""
+                extras["composition"] = (
+                    f"{existing}; {cleaned}" if existing else cleaned
+                )
+            pending["extras"] = extras
+            ctx.user_data["pending_meal"] = pending
+
+        ctx.user_data["state"] = "await_meal_extras_menu"
+
+        # Обновляем меню уточнений
+        chat_id = pending.get("chat_id") or update.effective_chat.id
+        await edit_menu_message(
+            update,
+            ctx,
+            meal_extras_info_text(extras),
+            kb_meal_extras(extras),
+        )
+        return
+
+    if state in {"await_extra_portion", "await_extra_composition"}:
         await delete_user_message(update)
 
         if state == "await_extra_portion":
             extras["portion"] = text
         elif state == "await_extra_composition":
             extras["composition"] = text
-        elif state == "await_extra_plate":
-            extras["plate"] = text
 
         pending["extras"] = extras
         ctx.user_data["pending_meal"] = pending
@@ -3250,16 +3311,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "_«Куриная грудка на гриле, гречка без масла, салат из огурцов и помидоров с ложкой оливкового масла»_",
             kb_back_to_meal_extras(),
         )
-    elif data == "meal_extra_plate":
-        ctx.user_data["state"] = "await_extra_plate"
-        await edit_menu_message(
-            update,
-            ctx,
-            "Опиши размер тарелки или её объём, если знаешь.\n\n"
-            "Например:\n"
-            "_«Глубокая тарелка ~500 мл, заполнена примерно на 2/3»_",
-            kb_back_to_meal_extras(),
-        )
+    
     elif data == "meal_extra_template":
         ctx.user_data["state"] = "await_meal_extras_menu"
         pending = ctx.user_data.get("pending_meal") or {}
