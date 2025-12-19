@@ -335,6 +335,11 @@
     </div>
 
     <script>
+      const tg = window.Telegram?.WebApp;
+      tg?.ready?.();
+      const tgInitData = tg?.initData || "";
+      const tgUserId = tg?.initDataUnsafe?.user?.id || null;
+
       function qs(name) {
         return new URLSearchParams(location.search).get(name);
       }
@@ -369,20 +374,6 @@
         const el = ensureDebugBox();
         el.textContent += `${msg}\n`;
       }
-
-      async function waitTelegramUserId(timeoutMs = 2000, stepMs = 50) {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          const tg = window.Telegram?.WebApp;
-          const id = tg?.initDataUnsafe?.user?.id;
-          if (id) return { tg, id: String(id) };
-          await sleep(stepMs);
-        }
-        return { tg: window.Telegram?.WebApp, id: null };
-      }
-
-      let tg = null;
-      let userId = null;
 
       const todaySummaryEl = document.getElementById("today-summary");
       const todayMacrosEl = document.getElementById("today-macros");
@@ -521,7 +512,9 @@
       }
 
       async function fetchJson(url) {
-        const res = await fetch(url);
+        const headers = {};
+        if (tgInitData) headers["X-Tg-Init-Data"] = tgInitData;
+        const res = await fetch(url, { headers, cache: "no-store" });
         if (!res.ok) {
           const body = await res.text();
           throw new Error(`HTTP ${res.status}: ${body}`);
@@ -620,9 +613,9 @@
       }
 
       async function loadDay(mode, dateIso) {
-        if (!userId) {
+        if (!tgInitData) {
           todayErrorEl.textContent =
-            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
+            "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
           return;
         }
 
@@ -633,17 +626,17 @@
 
         if (mode === "today") {
           effectiveDate = isoToday();
-          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          url = `/api/stats/day?date=${effectiveDate}`;
           title = "Сегодня";
           caption = `Данные за ${formatHuman(effectiveDate)}`;
         } else if (mode === "yesterday") {
           effectiveDate = isoYesterday();
-          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          url = `/api/stats/day?date=${effectiveDate}`;
           title = "Вчера";
           caption = `Данные за ${formatHuman(effectiveDate)}`;
         } else {
           effectiveDate = dateIso || selectedISO || isoToday();
-          url = `/api/stats/day?user_id=${userId}&date=${effectiveDate}`;
+          url = `/api/stats/day?date=${effectiveDate}`;
           title = formatHuman(effectiveDate);
           caption = `Данные за ${formatHuman(effectiveDate)}`;
         }
@@ -749,11 +742,10 @@
       }
 
       async function loadHistory() {
-        if (!userId) return;
         try {
           const [week, month] = await Promise.all([
-            fetchJson(`/api/stats/history?user_id=${userId}&days=7`),
-            fetchJson(`/api/stats/history?user_id=${userId}&days=30`),
+            fetchJson(`/api/stats/history?days=7`),
+            fetchJson(`/api/stats/history?days=30`),
           ]);
 
           buildWeekChart(week.items || []);
@@ -779,22 +771,16 @@
       });
 
       (async function init() {
-        const waited = await waitTelegramUserId();
-        tg = waited.tg;
-
         try {
-          tg?.ready?.();
           tg?.expand?.();
         } catch (err) {
           console.warn("Telegram WebApp ready/expand error", err);
           dlog(err?.stack || String(err));
         }
 
-        const tgUserId = waited.id;
-        userId = tgUserId || qs("user_id");
-        if (!userId) {
+        if (!tgInitData) {
           const errMsg =
-            "Не передан user_id. В Telegram WebApp он подставится автоматически. В браузере добавьте ?user_id=ВАШ_ID к адресу страницы.";
+            "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
           todayErrorEl.textContent = errMsg;
           dlog(errMsg);
           return;

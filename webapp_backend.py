@@ -1,11 +1,26 @@
 import os
+import hmac
+import json
+import time
+import hashlib
 import sqlite3
 import datetime as dt
 from typing import List, Dict, Any, Optional
+from urllib.parse import parse_qsl
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+
+load_dotenv("/srv/food_bot/.env")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    import logging
+
+    logging.error("BOT_TOKEN is not set. Please configure it in the environment or .env file.")
+    raise RuntimeError("BOT_TOKEN is required for Telegram WebApp verification")
 
 DB_PATH = os.getenv("DB_PATH", "data/food_bot.sqlite3")
 
@@ -24,6 +39,63 @@ app.mount(
     StaticFiles(directory="static/webapp", html=True),
     name="webapp",
 )
+
+
+def parse_init_data(init_data: str) -> Dict[str, str]:
+    return {k: v for k, v in parse_qsl(init_data, keep_blank_values=True)}
+
+
+def build_data_check_string(params: Dict[str, str]) -> str:
+    parts = [f"{k}={v}" for k, v in sorted(params.items()) if k != "hash"]
+    return "\n".join(parts)
+
+
+def calc_hash(data_check_string: str, bot_token: str) -> str:
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    return hmac.new(secret, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+
+def verify_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -> Dict[str, Any]:
+    params = parse_init_data(init_data)
+    if "hash" not in params:
+        raise HTTPException(status_code=401, detail="Missing hash in init data")
+
+    received_hash = params["hash"]
+    data_check_string = build_data_check_string(params)
+    expected_hash = calc_hash(data_check_string, bot_token)
+
+    if not hmac.compare_digest(expected_hash, received_hash):
+        raise HTTPException(status_code=401, detail="Invalid init data signature")
+
+    auth_date = params.get("auth_date")
+    if auth_date is not None:
+        try:
+            auth_ts = int(auth_date)
+            if time.time() - auth_ts > max_age_sec:
+                raise HTTPException(status_code=401, detail="Init data expired")
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid auth_date")
+
+    user_raw = params.get("user")
+    if user_raw:
+        try:
+            params["user"] = json.loads(user_raw)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid user payload")
+
+    return params
+
+
+def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> int:
+    if not init_data:
+        raise HTTPException(status_code=401, detail="Missing Telegram init data")
+
+    params = verify_init_data(init_data, BOT_TOKEN)
+    user = params.get("user")
+    if not user or "id" not in user:
+        raise HTTPException(status_code=401, detail="Missing user in init data")
+
+    return int(user["id"])
 
 
 def get_conn() -> sqlite3.Connection:
@@ -210,7 +282,7 @@ def get_history_for_user(user_id: int, days: int) -> List[Dict[str, Any]]:
 
 
 @app.get("/api/stats/today")
-def stats_today(user_id: int = Query(..., description="Telegram user id")) -> Dict[str, Any]:
+def stats_today(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
     """
     Статистика за сегодняшний день:
     - totals: фактические КБЖУ за сегодня
@@ -223,7 +295,7 @@ def stats_today(user_id: int = Query(..., description="Telegram user id")) -> Di
 
 @app.get("/api/stats/day")
 def stats_day(
-    user_id: int = Query(..., description="Telegram user id"),
+    user_id: int = Depends(get_verified_user_id),
     date: Optional[str] = Query(None, description="Day in YYYY-MM-DD"),
 ) -> Dict[str, Any]:
     """
@@ -237,7 +309,7 @@ def stats_day(
 
 @app.get("/api/stats/history")
 def stats_history(
-    user_id: int = Query(..., description="Telegram user id"),
+    user_id: int = Depends(get_verified_user_id),
     days: int = Query(7, ge=1, le=30, description="Number of days including today"),
 ) -> Dict[str, Any]:
     """
@@ -256,3 +328,8 @@ def stats_history(
         "days": days,
         "items": history,
     }
+
+
+@app.get("/whoami")
+def whoami(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
+    return {"user_id": user_id, "ok": True}
