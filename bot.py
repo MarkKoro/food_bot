@@ -231,18 +231,41 @@ def _safe_json_loads(content: str) -> dict:
 
 
 def _is_bad_vision_result(data: dict) -> bool:
+    """
+    Определяет, нужен ли запасной промпт для Vision.
+
+    Фоллбэк включается только при «пустых» ответах (все макроэлементы нули и
+    нет ни одного элемента) или при явном `ok=False`/невалидном формате.
+    Это соответствует сценарию ответа "000", когда модель ничего не распознала.
+    """
+
     if not isinstance(data, dict):
         return True
+
     if data.get("ok") is False:
         return True
-    items = data.get("items") or []
+
+    items = data.get("items")
+    if items is None:
+        items = []
+
     totals = data.get("totals") or {}
-    kcal = totals.get("kcal", 0) or 0
-    try:
-        kcal = float(kcal)
-    except Exception:
-        kcal = 0
-    return (len(items) == 0) and (kcal <= 0)
+
+    def _as_float(val: object) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
+    macro_values = (
+        _as_float(totals.get("kcal", 0)),
+        _as_float(totals.get("protein_g", 0)),
+        _as_float(totals.get("fat_g", 0)),
+        _as_float(totals.get("carbs_g", 0)),
+    )
+    totals_are_zero = all(v == 0.0 for v in macro_values)
+
+    return totals_are_zero and len(items) == 0
 
 
 def emoji_number(n: int) -> str:
