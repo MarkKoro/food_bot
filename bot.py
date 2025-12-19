@@ -230,6 +230,21 @@ def _safe_json_loads(content: str) -> dict:
         raise
 
 
+def _is_bad_vision_result(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return True
+    if data.get("ok") is False:
+        return True
+    items = data.get("items") or []
+    totals = data.get("totals") or {}
+    kcal = totals.get("kcal", 0) or 0
+    try:
+        kcal = float(kcal)
+    except Exception:
+        kcal = 0
+    return (len(items) == 0) and (kcal <= 0)
+
+
 def emoji_number(n: int) -> str:
     if n == 10:
         return "🔟"
@@ -547,6 +562,21 @@ FOOD_SYSTEM_PROMPT = """Ты анализируешь фото еды/напит
 Нельзя:
 - Нельзя задавать вопросы.
 - Нельзя выходить из JSON.
+"""
+
+FOOD_SYSTEM_PROMPT_FALLBACK = """You must return ONLY valid JSON.
+No prose. No markdown. No explanations.
+
+Rules:
+- Analyze the entire image (not only the plate). Include every edible/drinkable item that is clearly visible.
+- Do NOT guess. If you are not sure an item exists, omit it.
+- USER_NOTE is optional. Use it only to refine portions/ingredients.
+- If USER_NOTE mentions an item that is NOT visible, include it ONLY if it is explicitly declared as consumed.
+- Output schema:
+{
+  "items":[{"name":str,"grams":number,"kcal":number,"protein_g":number,"fat_g":number,"carbs_g":number}],
+  "totals":{"kcal":number,"protein_g":number,"fat_g":number,"carbs_g":number}
+}
 """
 
 FOOD_USER_INSTRUCTIONS = """Верни строго JSON-объект такого вида:
@@ -1225,46 +1255,60 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    messages = [
-        {"role": "system", "content": FOOD_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": user_text},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{b64}",
-                        "detail": VISION_DETAIL,
-                    },
+    user_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_text},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64}",
+                    "detail": VISION_DETAIL,
                 },
-            ],
-        },
-    ]
-    payload = {
-        "model": VISION_MODEL,
-        "messages": messages,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
+            },
+        ],
     }
 
-    await _OPENAI_SEM.acquire()
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    finally:
-        _OPENAI_SEM.release()
+    async def _call(system_prompt: str) -> dict:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            user_message,
+        ]
+        payload = {
+            "model": VISION_MODEL,
+            "messages": messages,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
 
-    content = data["choices"][0]["message"]["content"].strip()
-    parsed = _safe_json_loads(content)
-    logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
-    return parsed
+        await _OPENAI_SEM.acquire()
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        finally:
+            _OPENAI_SEM.release()
+
+        content = data["choices"][0]["message"]["content"].strip()
+        try:
+            parsed = _safe_json_loads(content)
+        except Exception:
+            logging.exception("Failed to parse vision JSON")
+            return {}
+        logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+        return parsed
+
+    data = await _call(FOOD_SYSTEM_PROMPT)
+    if _is_bad_vision_result(data):
+        logging.info("Retrying vision analysis with fallback prompt")
+        data = await _call(FOOD_SYSTEM_PROMPT_FALLBACK)
+
+    return data
 
 
 async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
