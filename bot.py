@@ -5,6 +5,7 @@ import os
 import asyncio
 import io
 import json
+from json import JSONDecodeError
 import base64
 import logging
 import math
@@ -200,6 +201,33 @@ KEYCAP_DIGITS = {
     "8": "8️⃣",
     "9": "9️⃣",
 }
+
+_PORTION_UNITS_RE = re.compile(
+    r"(?i)\b(\d+(?:[.,]\d+)?)\s*(г|гр|грамм|кг|kg|мл|ml|л|l|oz|lb)\b"
+)
+_PORTION_WORDS = ("порц", "порция", "кусок", "ломтик", "стакан", "ложк", "тарелк")
+
+
+def _looks_like_portion(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    if _PORTION_UNITS_RE.search(s):
+        return True
+    return any(w in s for w in _PORTION_WORDS)
+
+
+def _safe_json_loads(content: str) -> dict:
+    content = (content or "").strip()
+    try:
+        return json.loads(content)
+    except JSONDecodeError:
+        # попытка “спасти” JSON, если модель добавила мусор вокруг
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(content[start : end + 1])
+        raise
 
 
 def emoji_number(n: int) -> str:
@@ -1237,7 +1265,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         _OPENAI_SEM.release()
 
     content = data["choices"][0]["message"]["content"].strip()
-    parsed = json.loads(content)
+    parsed = _safe_json_loads(content)
     logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
     return parsed
 
@@ -1309,7 +1337,7 @@ async def analyze_food_text(description: str) -> dict:
         _OPENAI_SEM.release()
 
     content = data["choices"][0]["message"]["content"].strip()
-    parsed = json.loads(content)
+    parsed = _safe_json_loads(content)
     logging.debug("Food text JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
     return parsed
 
@@ -2023,7 +2051,7 @@ async def generate_goal_from_survey(answers: dict) -> dict:
         data = resp.json()
 
     content = data["choices"][0]["message"]["content"].strip()
-    parsed = json.loads(content)
+    parsed = _safe_json_loads(content)
     logging.debug("Survey goal JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
     return parsed
 
@@ -2527,12 +2555,26 @@ async def _handle_image_message(
 
     chat = message.chat
 
+    caption = ""
+    try:
+        caption = (message.caption or "").strip()
+    except Exception:
+        caption = ""
+
+    extras = {"save_template": False}
+    if caption:
+        # caption почти всегда “что это за еда”, а не “вес порции”
+        if _looks_like_portion(caption):
+            extras["portion"] = caption
+        else:
+            extras["composition"] = caption
+
     # Сохраняем новую pending_meal, затирая старую
     ctx.user_data["pending_meal"] = {
         "photo_file_id": photo_file_id,
         "photo_msg_id": message.message_id,
         "chat_id": chat.id,
-        "extras": {"save_template": False},
+        "extras": extras,
     }
     ctx.user_data["pending_meal"]["trial_reserved"] = (mode == "trial")
     ctx.user_data["state"] = "await_meal_extras_menu"
@@ -2743,13 +2785,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await delete_user_message(update)
         cleaned = text.strip()
         if cleaned:
-            if re.search(r"\d", cleaned) and not extras.get("portion"):
+            # “3 яйца” — это состав, а “250 г” — это порция
+            if _looks_like_portion(cleaned) and not extras.get("portion"):
                 extras["portion"] = cleaned
             else:
                 existing = extras.get("composition") or ""
-                extras["composition"] = (
-                    f"{existing}; {cleaned}" if existing else cleaned
-                )
+                extras["composition"] = f"{existing}; {cleaned}" if existing else cleaned
             pending["extras"] = extras
             ctx.user_data["pending_meal"] = pending
 
