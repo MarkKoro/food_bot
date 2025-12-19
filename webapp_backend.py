@@ -330,6 +330,6 @@ def stats_history(
     }
 
 
-@app.get("/whoami")
+@app.get("/api/whoami")
 def whoami(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
     return {"user_id": user_id, "ok": True}
