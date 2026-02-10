@@ -331,7 +331,17 @@
         background: rgba(30, 41, 59, 0.6);
       }
       .plan-card h3 { margin: 0 0 6px; }
-      .plan-card p { margin: 0 0 8px; color: #cbd5e1; font-size: 14px; }
+      .plan-card p { margin: 0 0 8px; color: #cbd5e1; font-size: 15px; line-height: 1.5; }
+      .subscription-intro {
+        color:#cbd5e1;
+        margin-top:0;
+        font-size: 15px;
+        line-height: 1.55;
+      }
+      .plan-description {
+        font-size: 15px;
+        line-height: 1.55;
+      }
       .plan-list { margin: 0; padding-left: 18px; color: #e2e8f0; }
       .pay-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
       .metric-filters { display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0 2px; }
@@ -375,7 +385,12 @@
       .pay-modal-header { display:flex; justify-content:space-between; gap:8px; align-items:center; }
       .pay-modal-header h3 { margin:0; }
       .pay-modal-close { background: transparent; border: none; color: #e2e8f0; font-size: 22px; cursor: pointer; }
-      .pay-modal-note { font-size: 13px; color: #cbd5e1; margin: 4px 0 0; }
+      .pay-modal-note {
+        font-size: 14px;
+        line-height: 1.55;
+        color: #cbd5e1;
+        margin: 8px 0 0;
+      }
 
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -505,11 +520,11 @@
       <section id="screen-subscription" class="screen">
         <div class="card">
           <h2>💳 Подписка и оплата</h2>
-          <p style="color:#cbd5e1; margin-top:0;">Вы оплачиваете доступ к анализу питания по фото, голосу и тексту. Можно выбрать фиксированный тариф на срок или Pay-as-you-go — оплату за фактические запросы.</p>
+          <p class="subscription-intro">Вы оплачиваете доступ к анализу питания по фото, голосу и тексту. Можно выбрать фиксированный тариф на срок или Pay-as-you-go с оплатой по фактическому использованию. Ниже коротко объяснили разницу, чтобы было проще выбрать подходящий вариант.</p>
 
           <div class="plan-card">
             <h3>⭐ Подписка (фиксированный срок)</h3>
-            <p>Оплачиваете период и пользуетесь ботом ежедневно в рамках лимита, без отдельного списания за каждый запрос.</p>
+            <p class="plan-description">Оплачиваете выбранный срок и пользуетесь ботом ежедневно в рамках лимита, без отдельного списания за каждый запрос. Это удобно, если вы ведёте питание регулярно и хотите предсказуемый фиксированный платёж.</p>
             <ul class="plan-list">
               <li>Тарифы: 1 неделя, 1/3/6 месяцев, 1 год</li>
               <li>Подходит для регулярного ведения питания</li>
@@ -523,7 +538,7 @@
 
           <div class="plan-card">
             <h3>➕ Pay-as-you-go</h3>
-            <p>Пополняете баланс и платите только за использованные запросы. Удобно при нерегулярном использовании.</p>
+            <p class="plan-description">Пополняете баланс и платите только за использованные запросы. Стоимость одного запроса — 2 ₽ (фото/голос/текст). Подходит, если вы пользуетесь ботом нерегулярно и хотите платить только по факту.</p>
             <ul class="plan-list">
               <li>Списания идут за каждый анализ</li>
               <li>Пополнения: 60 / 100 / 200 / 400 ₽</li>
@@ -543,7 +558,7 @@
           <h3>⭐ Оформление подписки</h3>
           <button class="pay-modal-close" id="sub-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите срок и нажмите «Оплатить». Откроется платёжная страница YooKassa в Telegram.</p>
+        <p class="pay-modal-note">Выберите срок подписки и нажмите «Оплатить подписку». Откроется платёжная страница YooKassa внутри Telegram. После успешной оплаты активируется доступ к выбранному тарифу, и в этом режиме не будет отдельного списания за каждый запрос.</p>
         <div class="plan-controls">
           <label for="sub-plan-select" class="muted">Срок подписки</label>
           <select id="sub-plan-select" class="pill pill-secondary">
@@ -566,7 +581,7 @@
           <h3>➕ Пополнение Pay-as-you-go</h3>
           <button class="pay-modal-close" id="payg-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите сумму. Откроется платёжная страница YooKassa в Telegram.</p>
+        <p class="pay-modal-note">Выберите сумму пополнения и перейдите к оплате. Откроется платёжная страница YooKassa внутри Telegram, после оплаты сумма зачислится на баланс Pay-as-you-go. Далее с баланса будет списываться по 2 ₽ за каждый запрос (фото/голос/текст).</p>
         <div class="pay-actions" id="payg-modal-buttons"></div>
       </div>
     </div>
