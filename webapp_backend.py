@@ -508,6 +508,13 @@ def stats_advanced(
     excess_percent = {k: to_pct(v) for k, v in excess_days.items()}
     norm_percent = {k: to_pct(v) for k, v in norm_days.items()}
 
+    formulas = {
+        "avg_per_day": "avg_macro = total_macro / days",
+        "macro_percent_of_goal": "macro_percent = (fact_macro / goal_macro) * 100",
+        "quality_status": "under: <90% goal, ok: 90-110%, over: >110%",
+        "quality_percent": "quality_percent = quality_days / days * 100",
+    }
+
     return {
         "range": {
             "preset": range,
@@ -527,6 +534,7 @@ def stats_advanced(
         "excess_percent": excess_percent,
         "norm_days": norm_days,
         "norm_percent": norm_percent,
+        "formulas": formulas,
         "items": items,
     }
 

@@ -279,6 +279,8 @@
       }
 
       .topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+      .topbar-title { margin: 0; font-size: 22px; font-weight: 700; }
+      .topbar-title small { display:block; color:#94a3b8; font-size:12px; font-weight:500; margin-top:2px; }
       .burger-btn {
         border: 1px solid rgba(148, 163, 184, 0.35);
         background: rgba(15, 23, 42, 0.95);
@@ -332,6 +334,21 @@
       .plan-card p { margin: 0 0 8px; color: #cbd5e1; font-size: 14px; }
       .plan-list { margin: 0; padding-left: 18px; color: #e2e8f0; }
       .pay-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+      .metric-filters { display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0 2px; }
+      .metric-filters .pill.active-filter { background:#22c55e; color:#052e16; border-color:#22c55e; }
+      .formula-box { margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(15,23,42,0.6); border:1px solid rgba(148,163,184,0.2); font-size:12px; color:#cbd5e1; }
+      .kpi-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(165px,1fr)); gap:8px; margin-top:8px; }
+      .kpi-card { padding:10px; border-radius:12px; background:rgba(2,6,23,0.45); border:1px solid rgba(148,163,184,0.2); }
+      .kpi-card .label { color:#94a3b8; font-size:12px; }
+      .kpi-card .value { margin-top:3px; font-size:18px; font-weight:700; }
+      .quality-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px,1fr)); gap:8px; margin-top:8px; }
+      .quality-card { padding:10px; border-radius:12px; border:1px solid rgba(148,163,184,0.2); background:rgba(2,6,23,0.4); }
+      .quality-card h4 { margin:0 0 6px; font-size:14px; }
+      .quality-line { font-size:13px; margin:2px 0; color:#cbd5e1; }
+      .status-under{ color:#fca5a5; } .status-ok{ color:#86efac; } .status-over{ color:#fde68a; }
+      .plan-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
+      .loading-note { margin-top:8px; font-size:13px; color:#93c5fd; display:none; }
+      .success-note { margin-top:8px; font-size:13px; color:#86efac; display:none; }
 
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -351,10 +368,8 @@
     <div class="app">
       <div class="topbar">
         <button id="burger-btn" class="burger-btn" aria-label="Открыть меню">☰</button>
+        <h1 class="topbar-title">🍽 Грамм — ваша статистика<small>Всё по питанию в одном месте</small></h1>
       </div>
-      <header class="page-header">
-        <h1>🍽 Грамм — ваша статистика</h1>
-      </header>
 
       <section id="screen-today" class="screen active">
 
@@ -422,13 +437,20 @@
             <input type="date" id="analytics-end" class="pill pill-secondary" />
             <button class="pill pill-primary" id="analytics-apply-custom">Применить</button>
           </div>
-          <div class="summary-grid" id="analytics-kpis" style="margin-top:10px;"></div>
+          <div class="kpi-cards" id="analytics-kpis" style="margin-top:10px;"></div>
           <div class="hint" id="analytics-range-caption"></div>
+          <div id="analytics-formulas" class="formula-box"></div>
           <div class="error" id="analytics-error"></div>
         </div>
 
         <div class="card">
           <h2>Динамика по дням</h2>
+          <div class="metric-filters" id="analytics-metric-filters">
+            <button class="pill active-filter" data-metric="kcal">Ккал</button>
+            <button class="pill active-filter" data-metric="protein">Белки</button>
+            <button class="pill active-filter" data-metric="fat">Жиры</button>
+            <button class="pill active-filter" data-metric="carbs">Углеводы</button>
+          </div>
           <canvas id="analytics-chart"></canvas>
         </div>
 
@@ -451,9 +473,21 @@
               <li>Тарифы: 1 неделя, 1/3/6 месяцев, 1 год</li>
               <li>Подходит для регулярного ведения питания</li>
             </ul>
+            <div class="plan-controls">
+              <label for="sub-plan-select" class="muted">Срок подписки</label>
+              <select id="sub-plan-select" class="pill pill-secondary">
+                <option value="w1">1 неделя</option>
+                <option value="m1" selected>1 месяц</option>
+                <option value="m3">3 месяца</option>
+                <option value="m6">6 месяцев</option>
+                <option value="y1">1 год</option>
+              </select>
+            </div>
             <div class="pay-actions">
               <button class="pill pill-primary" id="btn-open-sub">Купить подписку</button>
             </div>
+            <div id="sub-loading" class="loading-note">Открываем оплату в боте…</div>
+            <div id="sub-success" class="success-note">После успешной оплаты здесь появится обновлённый статус ✅</div>
           </div>
 
           <div class="plan-card">
@@ -464,6 +498,7 @@
               <li>Пополнения: 60 / 100 / 200 / 400 ₽</li>
             </ul>
             <div class="pay-actions" id="payg-buttons"></div>
+            <div id="payg-loading" class="loading-note">Открываем счёт в боте…</div>
           </div>
         </div>
       </section>
@@ -543,6 +578,12 @@
       const analyticsRangeCaption = document.getElementById("analytics-range-caption");
       const analyticsError = document.getElementById("analytics-error");
       const analyticsQuality = document.getElementById("analytics-quality");
+      const analyticsMetricFilters = document.getElementById("analytics-metric-filters");
+      const analyticsFormulas = document.getElementById("analytics-formulas");
+      const subPlanSelect = document.getElementById("sub-plan-select");
+      const subLoading = document.getElementById("sub-loading");
+      const subSuccess = document.getElementById("sub-success");
+      const paygLoading = document.getElementById("payg-loading");
 
       let weekChart = null;
       let monthChart = null;
@@ -550,6 +591,7 @@
       let analyticsChart = null;
       let activeAnalyticsRange = "7d";
       let resolvedBotUsername = "";
+      const selectedAnalyticsMetrics = new Set(["kcal", "protein", "fat", "carbs"]);
 
       let activeMode = "today"; // "today" | "yesterday" | "date"
       let selectedISO = null;
@@ -585,15 +627,22 @@
         drawerBackdrop?.classList.remove("show");
       }
 
-      async function openBotPayment(mode) {
+      async function openBotPayment(mode, value = "") {
         const uname = await resolveBotUsername();
         if (!uname) {
           alert("Не удалось открыть оплату: отсутствует username бота. Добавьте BOT_USERNAME на сервере или откройте WebApp по ссылке с параметром ?bot=your_bot_username.");
           return;
         }
 
-        const startPayload = mode === "sub" ? "premium" : "payg";
-        const startUrl = `https://t.me/${uname}?start=${startPayload}`;
+        const payload = mode === "sub" ? `sub_${value || "m1"}` : `payg_${value || "200"}`;
+        const startUrl = `https://t.me/${uname}?start=${payload}`;
+
+        if (mode === "sub") {
+          if (subLoading) subLoading.style.display = "block";
+          if (subSuccess) subSuccess.style.display = "block";
+        } else if (paygLoading) {
+          paygLoading.style.display = "block";
+        }
 
         if (tg?.openTelegramLink) {
           tg.openTelegramLink(startUrl);
@@ -610,7 +659,7 @@
           const btn = document.createElement("button");
           btn.className = "pill pill-secondary";
           btn.textContent = `Пополнить на ${amt} ₽`;
-          btn.addEventListener("click", () => openBotPayment("payg"));
+          btn.addEventListener("click", () => openBotPayment("payg", String(amt)));
           paygButtonsWrap.appendChild(btn);
         }
       }
@@ -995,34 +1044,38 @@ function setActiveAnalyticsPreset(range) {
         const avg = adv?.avg_per_day || {};
         const r = adv?.range || {};
         analyticsKpis.innerHTML = `
-          <div class="macro-item"><span class="label">Дней в периоде</span> <span class="value">${r.days || 0}</span></div>
-          <div class="macro-item"><span class="label">Активных дней</span> <span class="value">${r.active_days || 0}</span></div>
-          <div class="macro-item"><span class="label">Ккал всего</span> <span class="value">${fmt(totals.kcal)}</span></div>
-          <div class="macro-item"><span class="label">Ккал в день</span> <span class="value">${fmt(avg.kcal)}</span></div>
-          <div class="macro-item"><span class="label">Белки в день</span> <span class="value">${fmt(avg.protein,1)} г</span></div>
-          <div class="macro-item"><span class="label">Жиры в день</span> <span class="value">${fmt(avg.fat,1)} г</span></div>
-          <div class="macro-item"><span class="label">Углеводы в день</span> <span class="value">${fmt(avg.carbs,1)} г</span></div>
+          <div class="kpi-card"><div class="label">Дней в периоде</div><div class="value">${r.days || 0}</div></div>
+          <div class="kpi-card"><div class="label">Активных дней</div><div class="value">${r.active_days || 0}</div></div>
+          <div class="kpi-card"><div class="label">Ккал всего</div><div class="value">${fmt(totals.kcal)}</div></div>
+          <div class="kpi-card"><div class="label">Ккал в день</div><div class="value">${fmt(avg.kcal)}</div></div>
+          <div class="kpi-card"><div class="label">Белки в день</div><div class="value">${fmt(avg.protein,1)} г</div></div>
+          <div class="kpi-card"><div class="label">Жиры в день</div><div class="value">${fmt(avg.fat,1)} г</div></div>
+          <div class="kpi-card"><div class="label">Углеводы в день</div><div class="value">${fmt(avg.carbs,1)} г</div></div>
         `;
         analyticsRangeCaption.textContent = `Период: ${r.start || "-"} — ${r.end || "-"}`;
 
-        const mk = (name, key) => `<div class="macro-item"><span class="label">${name}</span> <span class="value">Недобор ${fmt(adv?.deficiency_percent?.[key],1)}% (${adv?.deficiency_days?.[key] || 0} дн.) · Норма ${fmt(adv?.norm_percent?.[key],1)}% · Перебор ${fmt(adv?.excess_percent?.[key],1)}%</span></div>`;
-        analyticsQuality.innerHTML = `<div class="macro-grid">${mk("Белки","protein")}${mk("Жиры","fat")}${mk("Углеводы","carbs")}</div>`;
+        const f = adv?.formulas || {};
+        analyticsFormulas.innerHTML = `<b>Формулы:</b><br>• Среднее за день: <code>${f.avg_per_day || "avg_macro = total_macro / days"}</code><br>• Процент от цели: <code>${f.macro_percent_of_goal || "(fact/goal)*100"}</code><br>• Качество нормы: <code>${f.quality_status || "under<90%, ok 90-110%, over>110%"}</code><br>• Процент по статусу: <code>${f.quality_percent || "quality_days/days*100"}</code>`;
+
+        const mk = (name, key) => `<div class="quality-card"><h4>${name}</h4><div class="quality-line status-under">Недобор: ${fmt(adv?.deficiency_percent?.[key],1)}% (${adv?.deficiency_days?.[key] || 0} дн.)</div><div class="quality-line status-ok">Норма: ${fmt(adv?.norm_percent?.[key],1)}% (${adv?.norm_days?.[key] || 0} дн.)</div><div class="quality-line status-over">Перебор: ${fmt(adv?.excess_percent?.[key],1)}% (${adv?.excess_days?.[key] || 0} дн.)</div></div>`;
+        analyticsQuality.innerHTML = `<div class="quality-grid">${mk("Белки","protein")}${mk("Жиры","fat")}${mk("Углеводы","carbs")}</div>`;
 
         const labels = (adv?.items || []).map((d) => formatDayLabel(d.day));
+        const points = adv?.items || [];
+        const allSets = {
+          kcal: { label: "Ккал", data: points.map((d) => d.kcal || 0), borderColor: "#60a5fa", backgroundColor: "rgba(96,165,250,0.15)", yAxisID: "y" },
+          protein: { label: "Белки", data: points.map((d) => d.protein || 0), borderColor: "#34d399", yAxisID: "y1" },
+          fat: { label: "Жиры", data: points.map((d) => d.fat || 0), borderColor: "#fbbf24", yAxisID: "y1" },
+          carbs: { label: "Углеводы", data: points.map((d) => d.carbs || 0), borderColor: "#f472b6", yAxisID: "y1" },
+        };
+        const datasets = Array.from(selectedAnalyticsMetrics).map((k) => allSets[k]).filter(Boolean);
+
         const ctx = document.getElementById("analytics-chart")?.getContext("2d");
         if (!ctx) return;
         analyticsChart?.destroy?.();
         analyticsChart = new Chart(ctx, {
           type: "line",
-          data: {
-            labels,
-            datasets: [
-              { label: "Ккал", data: (adv?.items || []).map((d) => d.kcal || 0), borderColor: "#60a5fa", backgroundColor: "rgba(96,165,250,0.15)", yAxisID: "y" },
-              { label: "Белки", data: (adv?.items || []).map((d) => d.protein || 0), borderColor: "#34d399", yAxisID: "y1" },
-              { label: "Жиры", data: (adv?.items || []).map((d) => d.fat || 0), borderColor: "#fbbf24", yAxisID: "y1" },
-              { label: "Углеводы", data: (adv?.items || []).map((d) => d.carbs || 0), borderColor: "#f472b6", yAxisID: "y1" },
-            ],
-          },
+          data: { labels, datasets },
           options: { responsive: true, interaction: { mode: "index", intersect: false }, scales: { y: { position: "left", ticks: { color: "#cbd5f5" } }, y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#cbd5f5" } }, x: { ticks: { color: "#cbd5f5", font: { size: 10 } } } } },
         });
       }
@@ -1046,6 +1099,23 @@ function setActiveAnalyticsPreset(range) {
           analyticsError.textContent = "Ошибка загрузки расширенной статистики.";
         }
       }
+
+      analyticsMetricFilters?.addEventListener("click", (e) => {
+        const btn = e.target?.closest?.("[data-metric]");
+        if (!btn) return;
+        const metric = btn.getAttribute("data-metric");
+        if (!metric) return;
+
+        if (selectedAnalyticsMetrics.has(metric)) {
+          if (selectedAnalyticsMetrics.size === 1) return;
+          selectedAnalyticsMetrics.delete(metric);
+          btn.classList.remove("active-filter");
+        } else {
+          selectedAnalyticsMetrics.add(metric);
+          btn.classList.add("active-filter");
+        }
+        loadAdvancedStats(activeAnalyticsRange);
+      });
 
       analyticsPresets?.addEventListener("click", (e) => {
         const btn = e.target?.closest?.("[data-range]");
@@ -1085,7 +1155,7 @@ function setActiveAnalyticsPreset(range) {
         showScreen("analytics");
         loadAdvancedStats(activeAnalyticsRange);
       });
-      btnOpenSub?.addEventListener("click", () => openBotPayment("sub"));
+      btnOpenSub?.addEventListener("click", () => openBotPayment("sub", subPlanSelect?.value || "m1"));
 
       (async function init() {
         try {
