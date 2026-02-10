@@ -4,6 +4,7 @@ import json
 import time
 import hashlib
 import sqlite3
+import httpx
 import datetime as dt
 from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv("/srv/food_bot/.env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN")
 if not BOT_TOKEN:
     import logging
 
@@ -544,6 +546,95 @@ def api_config() -> Dict[str, Any]:
     return {
         "bot_username": os.getenv("BOT_USERNAME", ""),
     }
+
+
+def _telegram_api_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+
+def _create_invoice_link(
+    *,
+    title: str,
+    description: str,
+    payload: str,
+    currency: str,
+    prices: List[Dict[str, Any]],
+    provider_token: Optional[str] = None,
+) -> str:
+    body: Dict[str, Any] = {
+        "title": title,
+        "description": description,
+        "payload": payload,
+        "currency": currency,
+        "prices": json.dumps(prices, ensure_ascii=False),
+        "max_tip_amount": 0,
+    }
+    if provider_token is not None:
+        body["provider_token"] = provider_token
+
+    with httpx.Client(timeout=15.0) as client:
+        res = client.post(_telegram_api_url("createInvoiceLink"), data=body)
+    if res.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Telegram API HTTP {res.status_code}")
+
+    payload = res.json()
+    if not payload.get("ok"):
+        raise HTTPException(status_code=502, detail=f"Telegram API error: {payload.get('description', 'unknown')}" )
+    return str(payload.get("result") or "")
+
+
+@app.get("/api/payments/invoice-link")
+def create_payment_invoice_link(
+    mode: str = Query(..., description="sub|payg"),
+    value: str = Query(..., description="sub plan id or payg amount"),
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    if not YOOKASSA_PROVIDER_TOKEN:
+        raise HTTPException(status_code=503, detail="Card payments are temporarily unavailable")
+
+    if mode == "sub":
+        plans = {
+            "w1": ("Одна неделя", 125),
+            "m1": ("1 месяц", 399),
+            "m3": ("3 месяца", 1000),
+            "m6": ("6 месяцев", 1800),
+            "y1": ("1 год", 3500),
+        }
+        plan = plans.get(value)
+        if not plan:
+            raise HTTPException(status_code=400, detail="Unknown subscription plan")
+
+        title, rub = plan
+        link = _create_invoice_link(
+            title=f"Подписка на {title}",
+            description="Подписка на умный дневник питания с фото, голосом и текстом.",
+            payload=f"sub:{value}:card",
+            currency="RUB",
+            provider_token=YOOKASSA_PROVIDER_TOKEN,
+            prices=[{"label": title, "amount": rub * 100}],
+        )
+        return {"ok": True, "invoice_link": link, "mode": mode, "value": value, "user_id": user_id}
+
+    if mode == "payg":
+        topups = {60, 100, 200, 400}
+        try:
+            rub = int(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid PAYG amount")
+        if rub not in topups:
+            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
+
+        link = _create_invoice_link(
+            title="Грамм — Pay-as-you-go",
+            description=f"Пополнение баланса на +{rub}₽. Списание: 2₽ за запрос.",
+            payload=json.dumps({"type": "payg_topup", "rub": rub, "method": "card", "source": "webapp"}),
+            currency="RUB",
+            provider_token=YOOKASSA_PROVIDER_TOKEN,
+            prices=[{"label": f"PAYG +{rub}₽", "amount": rub * 100}],
+        )
+        return {"ok": True, "invoice_link": link, "mode": mode, "value": rub, "user_id": user_id}
+
+    raise HTTPException(status_code=400, detail="Unsupported mode")
 
 
 @app.get("/api/whoami")
