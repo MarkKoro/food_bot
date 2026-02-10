@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone, date
 import httpx
 import aiosqlite
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from dotenv import load_dotenv
 
 from telegram import (
@@ -501,6 +502,15 @@ def kb_payg_topups():
 
     rows.append([InlineKeyboardButton("⬅ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(rows)
+
+
+def payg_topups_text() -> str:
+    return (
+        "➕ Пополнение PAYG\n\n"
+        "Pay-as-you-go — это оплата по факту: баланс пополняется на выбранную сумму, "
+        "и далее списывается только за выполненные запросы.\n"
+        "Выбери сумму пополнения ниже."
+    )
 
 
 def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
@@ -1627,6 +1637,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if notice:
         ctx.user_data["promo_notice"] = notice
 
+    start_arg = (ctx.args[0].strip().lower() if ctx.args else "")
+    if start_arg in {"premium", "subscription", "sub"}:
+        await on_premium_menu(update, ctx)
+        return
+    if start_arg in {"payg", "pay_as_you_go", "payasyougo"}:
+        await edit_menu_message(update, ctx, payg_topups_text(), kb_payg_topups())
+        return
+
     goal = await get_goal(db, uid)
     if goal is None:
         await show_survey_offer(update, ctx)
@@ -1978,6 +1996,9 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         "💳 **Режим оплаты**\n\n"
+        "Здесь ты выбираешь, как оплачивать доступ к функциям бота: либо фиксированным тарифом на срок, "
+        "либо по факту использования за каждый запрос. В обоих режимах ты платишь за анализ питания "
+        "(фото/голос/текст) и удобный контроль КБЖУ.\n\n"
         f"1) ⭐ **Подписка** {'✅' if mode == 'sub' else ''}\n"
         f"• Статус: **{sub_until_text}**\n"
         "• Лимит: **10 запросов в день** (фото/голос/текст)\n"
@@ -2321,39 +2342,137 @@ def _build_stats_workbook(
     end: date,
     daily_rows: list[dict],
     meal_rows: list[dict],
+    goal: dict | None,
 ) -> io.BytesIO:
     wb = Workbook()
     ws_summary = wb.active
     ws_summary.title = "Сводка"
-    ws_summary.append(["Пользователь", user_id])
-    ws_summary.append(["Период", period_label])
-    ws_summary.append(["Дата начала", start.isoformat()])
-    ws_summary.append(["Дата конца", end.isoformat()])
-    ws_summary.append([])
-    ws_summary.append(["Дата", "Калории", "Белки", "Жиры", "Углеводы"])
+    thin = Side(style="thin", color="334155")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    title_fill = PatternFill("solid", fgColor="1E293B")
+    header_fill = PatternFill("solid", fgColor="0F766E")
+    stat_fill = PatternFill("solid", fgColor="1D4ED8")
 
-    total_kcal = total_p = total_f = total_c = 0.0
-    for row in daily_rows:
-        ws_summary.append([
-            row["date"],
-            round(row["kcal"], 2),
-            round(row["protein"], 2),
-            round(row["fat"], 2),
-            round(row["carbs"], 2),
-        ])
-        total_kcal += row["kcal"]
-        total_p += row["protein"]
-        total_f += row["fat"]
-        total_c += row["carbs"]
+    ws_summary.merge_cells("A1:L1")
+    ws_summary["A1"] = "FoodBot — расширенный отчёт по питанию"
+    ws_summary["A1"].font = Font(bold=True, size=14, color="FFFFFF")
+    ws_summary["A1"].fill = title_fill
+    ws_summary["A1"].alignment = Alignment(horizontal="left", vertical="center")
 
+    ws_summary.append(["Пользователь", user_id, "Период", period_label, "Дата начала", start.isoformat(), "Дата конца", end.isoformat()])
+    ws_summary.append([
+        "Цель ккал/день",
+        float(goal.get("kcal", 0) if goal else 0),
+        "Цель белки/день",
+        float(goal.get("protein", 0) if goal else 0),
+        "Цель жиры/день",
+        float(goal.get("fat", 0) if goal else 0),
+        "Цель углеводы/день",
+        float(goal.get("carbs", 0) if goal else 0),
+    ])
     ws_summary.append([])
     ws_summary.append([
-        "ИТОГО",
-        round(total_kcal, 2),
-        round(total_p, 2),
-        round(total_f, 2),
-        round(total_c, 2),
+        "Дата",
+        "Калории, факт",
+        "Белки, факт",
+        "Жиры, факт",
+        "Углеводы, факт",
+        "Цель ккал",
+        "Цель белки",
+        "Цель жиры",
+        "Цель углеводы",
+        "Выполнение ккал, %",
+        "Выполнение БЖУ, %",
+        "Статус дня",
     ])
+
+    by_day = {row["date"]: row for row in daily_rows}
+    days_count = (end - start).days + 1
+    date_list = [start + timedelta(days=i) for i in range(days_count)]
+    day_start_row = 6
+    goal_kcal = float(goal.get("kcal", 0) if goal else 0)
+    goal_p = float(goal.get("protein", 0) if goal else 0)
+    goal_f = float(goal.get("fat", 0) if goal else 0)
+    goal_c = float(goal.get("carbs", 0) if goal else 0)
+
+    for idx, d in enumerate(date_list):
+        excel_row = day_start_row + idx
+        d_key = d.isoformat()
+        row = by_day.get(d_key, {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0})
+        ws_summary.append([
+            d_key,
+            round(float(row["kcal"]), 2),
+            round(float(row["protein"]), 2),
+            round(float(row["fat"]), 2),
+            round(float(row["carbs"]), 2),
+            goal_kcal,
+            goal_p,
+            goal_f,
+            goal_c,
+            f"=IF(F{excel_row}>0,B{excel_row}/F{excel_row},0)",
+            f"=IF(AVERAGE(G{excel_row}:I{excel_row})>0,AVERAGE(C{excel_row}/G{excel_row},D{excel_row}/H{excel_row},E{excel_row}/I{excel_row}),0)",
+            f'=IF(AND(J{excel_row}>=0.9,J{excel_row}<=1.1,K{excel_row}>=0.9,K{excel_row}<=1.1),"✅ Норма","⚠️ Отклонение")',
+        ])
+
+    stat_title_row = day_start_row + days_count + 2
+    ws_summary.merge_cells(start_row=stat_title_row, start_column=1, end_row=stat_title_row, end_column=6)
+    ws_summary.cell(stat_title_row, 1).value = "Общая статистика за период"
+    ws_summary.cell(stat_title_row, 1).font = Font(bold=True, color="FFFFFF")
+    ws_summary.cell(stat_title_row, 1).fill = stat_fill
+
+    stat_rows = [
+        ("Дней в отчёте", f"=COUNTA(A{day_start_row}:A{day_start_row + days_count - 1})"),
+        ("Дней с выполненной нормой", f"=COUNTIF(L{day_start_row}:L{day_start_row + days_count - 1},""✅ Норма"")"),
+        ("Дней с отклонением", f"=COUNTIF(L{day_start_row}:L{day_start_row + days_count - 1},""⚠️ Отклонение"")"),
+        ("Среднее выполнение калорий", f"=AVERAGE(J{day_start_row}:J{day_start_row + days_count - 1})"),
+        ("Среднее выполнение БЖУ", f"=AVERAGE(K{day_start_row}:K{day_start_row + days_count - 1})"),
+        ("Средние калории в день", f"=AVERAGE(B{day_start_row}:B{day_start_row + days_count - 1})"),
+        ("Сумма калорий за период", f"=SUM(B{day_start_row}:B{day_start_row + days_count - 1})"),
+    ]
+
+    for i, (label, formula) in enumerate(stat_rows, start=stat_title_row + 1):
+        ws_summary.cell(i, 1).value = label
+        ws_summary.cell(i, 2).value = formula
+
+    ws_summary.column_dimensions["A"].width = 13
+    for col in "BCDEFGHI":
+        ws_summary.column_dimensions[col].width = 14
+    ws_summary.column_dimensions["J"].width = 18
+    ws_summary.column_dimensions["K"].width = 16
+    ws_summary.column_dimensions["L"].width = 18
+
+    for row in ws_summary.iter_rows(min_row=5, max_row=5, min_col=1, max_col=12):
+        for cell in row:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in ws_summary.iter_rows(min_row=day_start_row, max_row=day_start_row + days_count - 1, min_col=1, max_col=12):
+        for cell in row:
+            cell.border = border
+            if cell.column in (10, 11):
+                cell.number_format = "0%"
+            elif cell.column != 1 and cell.column != 12:
+                cell.number_format = "0.00"
+
+    for row in ws_summary.iter_rows(min_row=2, max_row=3, min_col=1, max_col=8):
+        for cell in row:
+            cell.border = border
+            if cell.row == 2 and cell.column in (1, 3, 5, 7):
+                cell.font = Font(bold=True)
+            if cell.row == 3 and cell.column in (1, 3, 5, 7):
+                cell.font = Font(bold=True)
+
+    for row in ws_summary.iter_rows(min_row=stat_title_row + 1, max_row=stat_title_row + len(stat_rows), min_col=1, max_col=2):
+        for cell in row:
+            cell.border = border
+            if cell.column == 1:
+                cell.font = Font(bold=True)
+            if cell.column == 2 and cell.row in (stat_title_row + 4, stat_title_row + 5):
+                cell.number_format = "0%"
+            elif cell.column == 2:
+                cell.number_format = "0.00"
 
     ws_meals = wb.create_sheet("Приёмы пищи")
     ws_meals.append([
@@ -2383,6 +2502,35 @@ def _build_stats_workbook(
             round(row["carbs"], 2),
             row.get("raw_json") or "",
         ])
+
+    ws_meals.freeze_panes = "A2"
+    for col, width in {
+        "A": 12,
+        "B": 10,
+        "C": 12,
+        "D": 10,
+        "E": 10,
+        "F": 12,
+        "G": 90,
+    }.items():
+        ws_meals.column_dimensions[col].width = width
+
+    for row in ws_meals.iter_rows(min_row=1, max_row=1, min_col=1, max_col=7):
+        for cell in row:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for row in ws_meals.iter_rows(min_row=2, max_row=max(2, ws_meals.max_row), min_col=1, max_col=7):
+        for cell in row:
+            cell.border = border
+            if cell.column in (3, 4, 5, 6):
+                cell.number_format = "0.00"
+            if cell.column == 7:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws_summary.freeze_panes = "A6"
 
     out = io.BytesIO()
     wb.save(out)
@@ -2532,6 +2680,7 @@ async def export_stats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pe
         end_date,
         daily_rows,
         meal_rows,
+        await get_goal(db, uid),
     )
     filename = f"food_stats_{period_key}_{start_str}_{end_str}.xlsx"
 
@@ -3360,7 +3509,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
         ctx.chat_data.pop("last_invoice_message_id", None)
-        await edit_menu_message(update, ctx, "➕ Выбери сумму пополнения PAYG:", kb_payg_topups())
+        await edit_menu_message(update, ctx, payg_topups_text(), kb_payg_topups())
         return
 
     if data == "chk_sub":
@@ -3381,7 +3530,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if data == "payg_topups":
-        await edit_menu_message(update, ctx, "➕ Выбери сумму пополнения PAYG:", kb_payg_topups())
+        await edit_menu_message(update, ctx, payg_topups_text(), kb_payg_topups())
         return
 
     # backward-compat (если остались старые кнопки)
@@ -3653,6 +3802,8 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "⭐ Подписка\n\n"
+        "Подписка — это фиксированная оплата за выбранный срок. Пока она активна, "
+        "ты используешь бота каждый день в рамках лимита и не платишь отдельно за каждый запрос.\n\n"
         "Есть одноразовый вариант «Одна неделя» (если ещё не покупал), "
         "и обычные подписки.\n\n"
         "Выбери тариф:"
