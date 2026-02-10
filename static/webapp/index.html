@@ -336,7 +336,6 @@
       .pay-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
       .metric-filters { display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0 2px; }
       .metric-filters .pill.active-filter { background:#22c55e; color:#052e16; border-color:#22c55e; }
-      .formula-box { margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(15,23,42,0.6); border:1px solid rgba(148,163,184,0.2); font-size:12px; color:#cbd5e1; }
       .kpi-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(165px,1fr)); gap:8px; margin-top:8px; }
       .kpi-card { padding:10px; border-radius:12px; background:rgba(2,6,23,0.45); border:1px solid rgba(148,163,184,0.2); }
       .kpi-card .label { color:#94a3b8; font-size:12px; }
@@ -349,6 +348,34 @@
       .plan-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
       .loading-note { margin-top:8px; font-size:13px; color:#93c5fd; display:none; }
       .success-note { margin-top:8px; font-size:13px; color:#86efac; display:none; }
+
+      .quality-range-controls { margin: 8px 0 10px; }
+      .quality-range-controls .row { margin-top: 0; }
+      .quality-range-controls .date-controls { margin-top: 8px; }
+
+      .pay-modal {
+        position: fixed;
+        inset: 0;
+        z-index: 35;
+        background: rgba(2, 6, 23, 0.7);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+      }
+      .pay-modal.open { display: flex; }
+      .pay-modal-card {
+        width: min(560px, 100%);
+        background: rgba(15, 23, 42, 0.98);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 16px;
+        padding: 14px;
+        box-shadow: 0 10px 40px rgba(2, 6, 23, 0.7);
+      }
+      .pay-modal-header { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+      .pay-modal-header h3 { margin:0; }
+      .pay-modal-close { background: transparent; border: none; color: #e2e8f0; font-size: 22px; cursor: pointer; }
+      .pay-modal-note { font-size: 13px; color: #cbd5e1; margin: 4px 0 0; }
 
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -439,7 +466,6 @@
           </div>
           <div class="kpi-cards" id="analytics-kpis" style="margin-top:10px;"></div>
           <div class="hint" id="analytics-range-caption"></div>
-          <div id="analytics-formulas" class="formula-box"></div>
           <div class="error" id="analytics-error"></div>
         </div>
 
@@ -456,6 +482,21 @@
 
         <div class="card">
           <h2>Качество выполнения норм</h2>
+          <div class="quality-range-controls">
+            <div class="row" id="quality-presets">
+              <button class="pill pill-primary" data-range="7d">7 дней</button>
+              <button class="pill pill-secondary" data-range="30d">30 дней</button>
+              <button class="pill pill-secondary" data-range="90d">90 дней</button>
+              <button class="pill pill-secondary" data-range="365d">1 год</button>
+              <button class="pill pill-secondary" data-range="all">Всё время</button>
+              <button class="pill pill-secondary" data-range="custom">Свой период</button>
+            </div>
+            <div class="date-controls" id="quality-custom" style="display:none;">
+              <input type="date" id="quality-start" class="pill pill-secondary" />
+              <input type="date" id="quality-end" class="pill pill-secondary" />
+              <button class="pill pill-primary" id="quality-apply-custom">Применить</button>
+            </div>
+          </div>
           <div id="analytics-quality"></div>
           <div class="hint">Недобор: меньше 90% цели. Норма: 90–110%. Перебор: выше 110%.</div>
         </div>
@@ -473,21 +514,11 @@
               <li>Тарифы: 1 неделя, 1/3/6 месяцев, 1 год</li>
               <li>Подходит для регулярного ведения питания</li>
             </ul>
-            <div class="plan-controls">
-              <label for="sub-plan-select" class="muted">Срок подписки</label>
-              <select id="sub-plan-select" class="pill pill-secondary">
-                <option value="w1">1 неделя</option>
-                <option value="m1" selected>1 месяц</option>
-                <option value="m3">3 месяца</option>
-                <option value="m6">6 месяцев</option>
-                <option value="y1">1 год</option>
-              </select>
-            </div>
             <div class="pay-actions">
-              <button class="pill pill-primary" id="btn-open-sub">Купить подписку</button>
+              <button class="pill pill-primary" id="btn-open-sub-modal">Открыть оформление подписки</button>
             </div>
-            <div id="sub-loading" class="loading-note">Открываем оплату в боте…</div>
-            <div id="sub-success" class="success-note">После успешной оплаты здесь появится обновлённый статус ✅</div>
+            <div id="sub-loading" class="loading-note">Открываем счёт…</div>
+            <div id="sub-success" class="success-note">Если оплата прошла, статус подписки обновится в боте ✅</div>
           </div>
 
           <div class="plan-card">
@@ -497,11 +528,47 @@
               <li>Списания идут за каждый анализ</li>
               <li>Пополнения: 60 / 100 / 200 / 400 ₽</li>
             </ul>
-            <div class="pay-actions" id="payg-buttons"></div>
+            <div class="pay-actions"><button class="pill pill-primary" id="btn-open-payg-modal">Пополнить Pay-as-you-go</button></div>
+            <div class="pay-actions" id="payg-buttons" style="display:none;"></div>
             <div id="payg-loading" class="loading-note">Открываем счёт в боте…</div>
           </div>
         </div>
       </section>
+    </div>
+
+    
+    <div id="sub-modal" class="pay-modal" aria-hidden="true">
+      <div class="pay-modal-card">
+        <div class="pay-modal-header">
+          <h3>⭐ Оформление подписки</h3>
+          <button class="pay-modal-close" id="sub-modal-close" aria-label="Закрыть">×</button>
+        </div>
+        <p class="pay-modal-note">Выберите срок и нажмите «Оплатить». Откроется платёжная страница YooKassa в Telegram.</p>
+        <div class="plan-controls">
+          <label for="sub-plan-select" class="muted">Срок подписки</label>
+          <select id="sub-plan-select" class="pill pill-secondary">
+            <option value="w1">1 неделя</option>
+            <option value="m1" selected>1 месяц</option>
+            <option value="m3">3 месяца</option>
+            <option value="m6">6 месяцев</option>
+            <option value="y1">1 год</option>
+          </select>
+        </div>
+        <div class="pay-actions">
+          <button class="pill pill-primary" id="btn-open-sub">Оплатить подписку</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="payg-modal" class="pay-modal" aria-hidden="true">
+      <div class="pay-modal-card">
+        <div class="pay-modal-header">
+          <h3>➕ Пополнение Pay-as-you-go</h3>
+          <button class="pay-modal-close" id="payg-modal-close" aria-label="Закрыть">×</button>
+        </div>
+        <p class="pay-modal-note">Выберите сумму. Откроется платёжная страница YooKassa в Telegram.</p>
+        <div class="pay-actions" id="payg-modal-buttons"></div>
+      </div>
     </div>
 
     <script>
@@ -568,7 +635,10 @@
       const screenSubscription = document.getElementById("screen-subscription");
       const screenAnalytics = document.getElementById("screen-analytics");
       const btnOpenSub = document.getElementById("btn-open-sub");
+      const btnOpenSubModal = document.getElementById("btn-open-sub-modal");
+      const btnOpenPaygModal = document.getElementById("btn-open-payg-modal");
       const paygButtonsWrap = document.getElementById("payg-buttons");
+      const paygModalButtonsWrap = document.getElementById("payg-modal-buttons");
       const analyticsPresets = document.getElementById("analytics-presets");
       const analyticsCustom = document.getElementById("analytics-custom");
       const analyticsStart = document.getElementById("analytics-start");
@@ -579,37 +649,30 @@
       const analyticsError = document.getElementById("analytics-error");
       const analyticsQuality = document.getElementById("analytics-quality");
       const analyticsMetricFilters = document.getElementById("analytics-metric-filters");
-      const analyticsFormulas = document.getElementById("analytics-formulas");
+      const qualityPresets = document.getElementById("quality-presets");
+      const qualityCustom = document.getElementById("quality-custom");
+      const qualityStart = document.getElementById("quality-start");
+      const qualityEnd = document.getElementById("quality-end");
+      const qualityApplyCustom = document.getElementById("quality-apply-custom");
       const subPlanSelect = document.getElementById("sub-plan-select");
       const subLoading = document.getElementById("sub-loading");
       const subSuccess = document.getElementById("sub-success");
       const paygLoading = document.getElementById("payg-loading");
+      const subModal = document.getElementById("sub-modal");
+      const paygModal = document.getElementById("payg-modal");
+      const subModalClose = document.getElementById("sub-modal-close");
+      const paygModalClose = document.getElementById("payg-modal-close");
 
       let weekChart = null;
       let monthChart = null;
       let todayRing = null;
       let analyticsChart = null;
       let activeAnalyticsRange = "7d";
-      let resolvedBotUsername = "";
       const selectedAnalyticsMetrics = new Set(["kcal", "protein", "fat", "carbs"]);
 
       let activeMode = "today"; // "today" | "yesterday" | "date"
       let selectedISO = null;
       let lastLoadedDateIso = null;
-
-      async function resolveBotUsername() {
-        if (resolvedBotUsername) return resolvedBotUsername;
-        const byQuery = qs("bot");
-        if (byQuery) { resolvedBotUsername = byQuery.replace(/^@/, ""); return resolvedBotUsername; }
-        try {
-          const cfg = await fetchJson("/api/config");
-          if (cfg?.bot_username) {
-            resolvedBotUsername = String(cfg.bot_username).replace(/^@/, "");
-            return resolvedBotUsername;
-          }
-        } catch (_) {}
-        return "";
-      }
 
       function showScreen(name) {
         screenToday?.classList.toggle("active", name === "today");
@@ -628,39 +691,50 @@
       }
 
       async function openBotPayment(mode, value = "") {
-        const uname = await resolveBotUsername();
-        if (!uname) {
-          alert("Не удалось открыть оплату: отсутствует username бота. Добавьте BOT_USERNAME на сервере или откройте WebApp по ссылке с параметром ?bot=your_bot_username.");
-          return;
-        }
+        try {
+          if (mode === "sub") {
+            if (subLoading) subLoading.style.display = "block";
+            if (subSuccess) subSuccess.style.display = "block";
+          } else if (paygLoading) {
+            paygLoading.style.display = "block";
+          }
 
-        const payload = mode === "sub" ? `sub_${value || "m1"}` : `payg_${value || "200"}`;
-        const startUrl = `https://t.me/${uname}?start=${payload}`;
+          const params = new URLSearchParams({ mode, value: String(value || "") });
+          const data = await fetchJson(`/api/payments/invoice-link?${params.toString()}`);
+          const invoiceLink = data?.invoice_link;
+          if (!invoiceLink) throw new Error("Не удалось получить ссылку на оплату.");
 
-        if (mode === "sub") {
-          if (subLoading) subLoading.style.display = "block";
-          if (subSuccess) subSuccess.style.display = "block";
-        } else if (paygLoading) {
-          paygLoading.style.display = "block";
-        }
+          setModalOpen(subModal, false);
+          setModalOpen(paygModal, false);
 
-        if (tg?.openTelegramLink) {
-          tg.openTelegramLink(startUrl);
-        } else {
-          window.open(startUrl, "_blank");
+          if (tg?.openInvoice) {
+            tg.openInvoice(invoiceLink, (status) => dlog(`Invoice status: ${status || "unknown"}`));
+          } else if (tg?.openTelegramLink) {
+            tg.openTelegramLink(invoiceLink);
+          } else {
+            window.open(invoiceLink, "_blank");
+          }
+        } catch (err) {
+          console.error(err);
+          alert(String(err?.message || "Не удалось открыть оплату. Попробуйте ещё раз.").replace(/^HTTP \d+:\s*/, ""));
+        } finally {
+          if (subLoading) subLoading.style.display = "none";
+          if (paygLoading) paygLoading.style.display = "none";
         }
       }
 
       function initPaymentButtons() {
         const amounts = [60, 100, 200, 400];
-        if (!paygButtonsWrap) return;
-        paygButtonsWrap.innerHTML = "";
-        for (const amt of amounts) {
-          const btn = document.createElement("button");
-          btn.className = "pill pill-secondary";
-          btn.textContent = `Пополнить на ${amt} ₽`;
-          btn.addEventListener("click", () => openBotPayment("payg", String(amt)));
-          paygButtonsWrap.appendChild(btn);
+        for (const wrap of [paygButtonsWrap, paygModalButtonsWrap]) {
+          if (!wrap) continue;
+          wrap.innerHTML = "";
+          for (const amt of amounts) {
+            const btn = document.createElement("button");
+            btn.className = "pill pill-secondary";
+            btn.textContent = `Пополнить на ${amt} ₽`;
+            btn.addEventListener("click", () => openBotPayment("payg", String(amt)));
+            wrap.appendChild(btn);
+          }
         }
       }
 
@@ -1029,14 +1103,19 @@
 
 function setActiveAnalyticsPreset(range) {
         activeAnalyticsRange = range;
-        analyticsPresets?.querySelectorAll("[data-range]")?.forEach((btn) => {
-          const active = btn.getAttribute("data-range") === range;
-          btn.classList.toggle("pill-primary", active);
-          btn.classList.toggle("pill-secondary", !active);
-        });
-        if (analyticsCustom) {
-          analyticsCustom.style.display = range === "custom" ? "flex" : "none";
-        }
+        const syncPresets = (container) => {
+          container?.querySelectorAll("[data-range]")?.forEach((btn) => {
+            const active = btn.getAttribute("data-range") === range;
+            btn.classList.toggle("pill-primary", active);
+            btn.classList.toggle("pill-secondary", !active);
+          });
+        };
+        syncPresets(analyticsPresets);
+        syncPresets(qualityPresets);
+
+        const isCustom = range === "custom";
+        if (analyticsCustom) analyticsCustom.style.display = isCustom ? "flex" : "none";
+        if (qualityCustom) qualityCustom.style.display = isCustom ? "flex" : "none";
       }
 
       function renderAnalytics(adv) {
@@ -1044,8 +1123,7 @@ function setActiveAnalyticsPreset(range) {
         const avg = adv?.avg_per_day || {};
         const r = adv?.range || {};
         analyticsKpis.innerHTML = `
-          <div class="kpi-card"><div class="label">Дней в периоде</div><div class="value">${r.days || 0}</div></div>
-          <div class="kpi-card"><div class="label">Активных дней</div><div class="value">${r.active_days || 0}</div></div>
+                    <div class="kpi-card"><div class="label">Активных дней</div><div class="value">${r.active_days || 0}</div></div>
           <div class="kpi-card"><div class="label">Ккал всего</div><div class="value">${fmt(totals.kcal)}</div></div>
           <div class="kpi-card"><div class="label">Ккал в день</div><div class="value">${fmt(avg.kcal)}</div></div>
           <div class="kpi-card"><div class="label">Белки в день</div><div class="value">${fmt(avg.protein,1)} г</div></div>
@@ -1054,10 +1132,7 @@ function setActiveAnalyticsPreset(range) {
         `;
         analyticsRangeCaption.textContent = `Период: ${r.start || "-"} — ${r.end || "-"}`;
 
-        const f = adv?.formulas || {};
-        analyticsFormulas.innerHTML = `<b>Формулы:</b><br>• Среднее за день: <code>${f.avg_per_day || "avg_macro = total_macro / days"}</code><br>• Процент от цели: <code>${f.macro_percent_of_goal || "(fact/goal)*100"}</code><br>• Качество нормы: <code>${f.quality_status || "under<90%, ok 90-110%, over>110%"}</code><br>• Процент по статусу: <code>${f.quality_percent || "quality_days/days*100"}</code>`;
-
-        const mk = (name, key) => `<div class="quality-card"><h4>${name}</h4><div class="quality-line status-under">Недобор: ${fmt(adv?.deficiency_percent?.[key],1)}% (${adv?.deficiency_days?.[key] || 0} дн.)</div><div class="quality-line status-ok">Норма: ${fmt(adv?.norm_percent?.[key],1)}% (${adv?.norm_days?.[key] || 0} дн.)</div><div class="quality-line status-over">Перебор: ${fmt(adv?.excess_percent?.[key],1)}% (${adv?.excess_days?.[key] || 0} дн.)</div></div>`;
+        const mk = (name, key) => `<div class="quality-card"><h4>${name}</h4><div class="quality-line status-under">Недобор: ${fmt(adv?.deficiency_percent?.[key],1)}% (${adv?.deficiency_days?.[key] || 0})</div><div class="quality-line status-ok">Норма: ${fmt(adv?.norm_percent?.[key],1)}% (${adv?.norm_days?.[key] || 0})</div><div class="quality-line status-over">Перебор: ${fmt(adv?.excess_percent?.[key],1)}% (${adv?.excess_days?.[key] || 0})</div></div>`;
         analyticsQuality.innerHTML = `<div class="quality-grid">${mk("Белки","protein")}${mk("Жиры","fat")}${mk("Углеводы","carbs")}</div>`;
 
         const labels = (adv?.items || []).map((d) => formatDayLabel(d.day));
@@ -1084,12 +1159,18 @@ function setActiveAnalyticsPreset(range) {
         analyticsError.textContent = "";
         const params = new URLSearchParams({ range });
         if (range === "custom") {
-          if (!analyticsStart?.value || !analyticsEnd?.value) {
+          const startVal = analyticsStart?.value || qualityStart?.value;
+          const endVal = analyticsEnd?.value || qualityEnd?.value;
+          if (!startVal || !endVal) {
             analyticsError.textContent = "Выберите начальную и конечную даты.";
             return;
           }
-          params.set("start_date", analyticsStart.value);
-          params.set("end_date", analyticsEnd.value);
+          if (analyticsStart) analyticsStart.value = startVal;
+          if (analyticsEnd) analyticsEnd.value = endVal;
+          if (qualityStart) qualityStart.value = startVal;
+          if (qualityEnd) qualityEnd.value = endVal;
+          params.set("start_date", startVal);
+          params.set("end_date", endVal);
         }
         try {
           const data = await fetchJson(`/api/stats/advanced?${params.toString()}`);
@@ -1130,6 +1211,27 @@ function setActiveAnalyticsPreset(range) {
         loadAdvancedStats("custom");
       });
 
+      qualityPresets?.addEventListener("click", (e) => {
+        const btn = e.target?.closest?.("[data-range]");
+        if (!btn) return;
+        const range = btn.getAttribute("data-range");
+        setActiveAnalyticsPreset(range);
+        if (range !== "custom") loadAdvancedStats(range);
+      });
+
+      qualityApplyCustom?.addEventListener("click", () => {
+        if (analyticsStart && qualityStart?.value) analyticsStart.value = qualityStart.value;
+        if (analyticsEnd && qualityEnd?.value) analyticsEnd.value = qualityEnd.value;
+        setActiveAnalyticsPreset("custom");
+        loadAdvancedStats("custom");
+      });
+
+      function setModalOpen(modalEl, isOpen) {
+        if (!modalEl) return;
+        modalEl.classList.toggle("open", isOpen);
+        modalEl.setAttribute("aria-hidden", isOpen ? "false" : "true");
+      }
+
             btnToday?.addEventListener("click", () => {
         setActiveMode("today");
         loadDay("today");
@@ -1156,6 +1258,12 @@ function setActiveAnalyticsPreset(range) {
         loadAdvancedStats(activeAnalyticsRange);
       });
       btnOpenSub?.addEventListener("click", () => openBotPayment("sub", subPlanSelect?.value || "m1"));
+      btnOpenSubModal?.addEventListener("click", () => setModalOpen(subModal, true));
+      btnOpenPaygModal?.addEventListener("click", () => setModalOpen(paygModal, true));
+      subModalClose?.addEventListener("click", () => setModalOpen(subModal, false));
+      paygModalClose?.addEventListener("click", () => setModalOpen(paygModal, false));
+      subModal?.addEventListener("click", (e) => { if (e.target === subModal) setModalOpen(subModal, false); });
+      paygModal?.addEventListener("click", (e) => { if (e.target === paygModal) setModalOpen(paygModal, false); });
 
       (async function init() {
         try {
@@ -1177,7 +1285,6 @@ function setActiveAnalyticsPreset(range) {
         showScreen("today");
         initPaymentButtons();
         setActiveAnalyticsPreset("7d");
-        await resolveBotUsername();
         await loadDay("today");
         await loadHistory();
         await loadAdvancedStats("7d");
