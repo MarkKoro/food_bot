@@ -281,6 +281,99 @@ def get_history_for_user(user_id: int, days: int) -> List[Dict[str, Any]]:
     return result
 
 
+def get_meals_date_bounds_for_user(user_id: int) -> Dict[str, Optional[str]]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT MIN(date) AS min_date, MAX(date) AS max_date
+            FROM meals
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    return {
+        "min_date": row["min_date"] if row and row["min_date"] else None,
+        "max_date": row["max_date"] if row and row["max_date"] else None,
+    }
+
+
+def get_history_for_user_between(user_id: int, start_date: dt.date, end_date: dt.date) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT date,
+                   COALESCE(SUM(kcal), 0) AS kcal,
+                   COALESCE(SUM(protein), 0) AS protein,
+                   COALESCE(SUM(fat), 0) AS fat,
+                   COALESCE(SUM(carbs), 0) AS carbs
+            FROM meals
+            WHERE user_id = ?
+              AND date BETWEEN ? AND ?
+            GROUP BY date
+            """,
+            (user_id, start_date.isoformat(), end_date.isoformat()),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    by_day = {
+        row["date"]: {
+            "kcal": float(row["kcal"]),
+            "protein": float(row["protein"]),
+            "fat": float(row["fat"]),
+            "carbs": float(row["carbs"]),
+        }
+        for row in rows
+    }
+
+    result: List[Dict[str, Any]] = []
+    current = start_date
+    while current <= end_date:
+        key = current.isoformat()
+        totals = by_day.get(
+            key,
+            {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0},
+        )
+        result.append(
+            {
+                "day": key,
+                "kcal": totals["kcal"],
+                "protein": totals["protein"],
+                "fat": totals["fat"],
+                "carbs": totals["carbs"],
+            }
+        )
+        current += dt.timedelta(days=1)
+
+    return result
+
+
+def _macro_ratio(value: float, target: float) -> Optional[float]:
+    if not target or target <= 0:
+        return None
+    return value / target
+
+
+def _macro_state(value: float, target: float) -> str:
+    ratio = _macro_ratio(value, target)
+    if ratio is None:
+        return "unknown"
+    if ratio < 0.9:
+        return "under"
+    if ratio > 1.1:
+        return "over"
+    return "ok"
+
+
 @app.get("/api/stats/today")
 def stats_today(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
     """
@@ -327,6 +420,121 @@ def stats_history(
     return {
         "days": days,
         "items": history,
+    }
+
+
+@app.get("/api/stats/advanced")
+def stats_advanced(
+    user_id: int = Depends(get_verified_user_id),
+    range: str = Query("30d", description="Range: 7d|30d|90d|365d|all|custom"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD for custom range"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD for custom range"),
+) -> Dict[str, Any]:
+    today = dt.date.today()
+    bounds = get_meals_date_bounds_for_user(user_id)
+
+    try:
+        if range == "7d":
+            start = today - dt.timedelta(days=6)
+            end = today
+        elif range == "30d":
+            start = today - dt.timedelta(days=29)
+            end = today
+        elif range == "90d":
+            start = today - dt.timedelta(days=89)
+            end = today
+        elif range == "365d":
+            start = today - dt.timedelta(days=364)
+            end = today
+        elif range == "all":
+            if bounds["min_date"]:
+                start = dt.date.fromisoformat(bounds["min_date"])
+            else:
+                start = today
+            end = today
+        elif range == "custom":
+            if not start_date or not end_date:
+                raise HTTPException(status_code=400, detail="start_date and end_date are required for custom range")
+            start = dt.date.fromisoformat(start_date)
+            end = dt.date.fromisoformat(end_date)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported range")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+
+    items = get_history_for_user_between(user_id, start, end)
+    goal = get_goal_for_user(user_id)
+
+    totals = {
+        "kcal": float(sum(i["kcal"] for i in items)),
+        "protein": float(sum(i["protein"] for i in items)),
+        "fat": float(sum(i["fat"] for i in items)),
+        "carbs": float(sum(i["carbs"] for i in items)),
+    }
+    days_count = len(items)
+    active_days = sum(
+        1
+        for i in items
+        if (i["kcal"] + i["protein"] + i["fat"] + i["carbs"]) > 0
+    )
+
+    avg_per_day = {
+        "kcal": (totals["kcal"] / days_count) if days_count else 0.0,
+        "protein": (totals["protein"] / days_count) if days_count else 0.0,
+        "fat": (totals["fat"] / days_count) if days_count else 0.0,
+        "carbs": (totals["carbs"] / days_count) if days_count else 0.0,
+    }
+
+    deficiency_days = {"protein": 0, "fat": 0, "carbs": 0}
+    excess_days = {"protein": 0, "fat": 0, "carbs": 0}
+    norm_days = {"protein": 0, "fat": 0, "carbs": 0}
+
+    if goal:
+        for i in items:
+            for macro in ("protein", "fat", "carbs"):
+                state = _macro_state(i[macro], goal[macro])
+                if state == "under":
+                    deficiency_days[macro] += 1
+                elif state == "over":
+                    excess_days[macro] += 1
+                elif state == "ok":
+                    norm_days[macro] += 1
+
+    to_pct = lambda v: (v / days_count * 100.0) if days_count else 0.0
+    deficiency_percent = {k: to_pct(v) for k, v in deficiency_days.items()}
+    excess_percent = {k: to_pct(v) for k, v in excess_days.items()}
+    norm_percent = {k: to_pct(v) for k, v in norm_days.items()}
+
+    return {
+        "range": {
+            "preset": range,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "days": days_count,
+            "active_days": active_days,
+            "available_from": bounds["min_date"],
+            "available_to": bounds["max_date"],
+        },
+        "goal": goal,
+        "totals": totals,
+        "avg_per_day": avg_per_day,
+        "deficiency_days": deficiency_days,
+        "deficiency_percent": deficiency_percent,
+        "excess_days": excess_days,
+        "excess_percent": excess_percent,
+        "norm_days": norm_days,
+        "norm_percent": norm_percent,
+        "items": items,
+    }
+
+
+@app.get("/api/config")
+def api_config() -> Dict[str, Any]:
+    return {
+        "bot_username": os.getenv("BOT_USERNAME", ""),
     }
 
 
