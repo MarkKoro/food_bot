@@ -659,14 +659,93 @@ async def add_meal(
         (telegram_id, date_str, kcal, protein, fat, carbs, raw_json),
     )
 
-    # Чистим всё, что старше 30 дней
-    cutoff = (today - timedelta(days=30)).isoformat()
-    await db.execute(
-        "DELETE FROM meals WHERE date < ?",
-        (cutoff,),
-    )
-
     await db.commit()
+
+
+async def get_meals_date_bounds(
+    db: aiosqlite.Connection,
+    telegram_id: int,
+) -> tuple[str, str] | None:
+    cur = await db.execute(
+        "SELECT MIN(date), MAX(date) FROM meals WHERE user_id = ?",
+        (telegram_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+
+    if not row or not row[0] or not row[1]:
+        return None
+
+    return row[0], row[1]
+
+
+async def get_daily_totals_in_range(
+    db: aiosqlite.Connection,
+    telegram_id: int,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    cur = await db.execute(
+        """
+        SELECT
+            date,
+            COALESCE(SUM(kcal), 0),
+            COALESCE(SUM(protein), 0),
+            COALESCE(SUM(fat), 0),
+            COALESCE(SUM(carbs), 0)
+        FROM meals
+        WHERE user_id = ? AND date BETWEEN ? AND ?
+        GROUP BY date
+        ORDER BY date ASC
+        """,
+        (telegram_id, start_date, end_date),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+
+    return [
+        {
+            "date": row[0],
+            "kcal": float(row[1] or 0.0),
+            "protein": float(row[2] or 0.0),
+            "fat": float(row[3] or 0.0),
+            "carbs": float(row[4] or 0.0),
+        }
+        for row in rows
+    ]
+
+
+async def get_meals_in_range(
+    db: aiosqlite.Connection,
+    telegram_id: int,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    cur = await db.execute(
+        """
+        SELECT id, date, created_at, kcal, protein, fat, carbs, raw_json
+        FROM meals
+        WHERE user_id = ? AND date BETWEEN ? AND ?
+        ORDER BY date ASC, created_at ASC, id ASC
+        """,
+        (telegram_id, start_date, end_date),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+
+    return [
+        {
+            "id": int(row[0]),
+            "date": row[1],
+            "created_at": row[2],
+            "kcal": float(row[3] or 0.0),
+            "protein": float(row[4] or 0.0),
+            "fat": float(row[5] or 0.0),
+            "carbs": float(row[6] or 0.0),
+            "raw_json": row[7],
+        }
+        for row in rows
+    ]
 
 
 async def get_daily_totals(
