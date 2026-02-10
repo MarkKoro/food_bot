@@ -13,10 +13,11 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import httpx
 import aiosqlite
+from openpyxl import Workbook
 from dotenv import load_dotenv
 
 from telegram import (
@@ -46,6 +47,9 @@ from db import (
     add_meal,
     get_daily_totals,
     get_last_days_totals,
+    get_daily_totals_in_range,
+    get_meals_date_bounds,
+    get_meals_in_range,
     get_goal,
     set_goal,
     add_invite,
@@ -412,6 +416,28 @@ def kb_back_to_main() -> InlineKeyboardMarkup:
     )
 
 
+def kb_stats() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🖨 Распечатать за промежуток", callback_data="stats_export")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="main")],
+        ]
+    )
+
+
+def kb_stats_export_periods() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📅 За месяц", callback_data="stats_export:month")],
+            [InlineKeyboardButton("🗓 За 3 месяца", callback_data="stats_export:3months")],
+            [InlineKeyboardButton("🧾 За полгода", callback_data="stats_export:6months")],
+            [InlineKeyboardButton("📘 За год", callback_data="stats_export:year")],
+            [InlineKeyboardButton("♾ За всё время", callback_data="stats_export:all")],
+            [InlineKeyboardButton("⬅️ Назад к статистике", callback_data="stats")],
+        ]
+    )
+
+
 def kb_back_to_meal_extras() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ Назад", callback_data="meal_extra_back")]]
@@ -421,7 +447,7 @@ def kb_back_to_meal_extras() -> InlineKeyboardMarkup:
 def kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎯 Цель КБЖУ", callback_data="set_goal")],
+            [InlineKeyboardButton("🎯 Задать цель КБЖУ вручную", callback_data="set_goal")],
             [
                 InlineKeyboardButton(
                     "🧮 Подобрать цель по опросу", callback_data="survey_start"
@@ -1632,7 +1658,7 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data["state"] = None
     text = (
         "⚙️ Настройки\n\n"
-        "• 🎯 Цель КБЖУ — дневная норма по калориям и БЖУ.\n"
+        "• 🎯 Задать цель КБЖУ вручную — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
         "• 💳 Режим оплаты — управление подпиской и PAYG внутри настроек.\n"
     )
@@ -2272,6 +2298,98 @@ def _perc(current: float, target: float) -> int:
     return int(round(current / target * 100))
 
 
+def _resolve_export_period(period_key: str, today: date) -> tuple[date | None, date, str]:
+    mapping = {
+        "month": (30, "месяц"),
+        "3months": (90, "3 месяца"),
+        "6months": (180, "полгода"),
+        "year": (365, "год"),
+        "all": (None, "всё время"),
+    }
+    days, label = mapping.get(period_key, (30, "месяц"))
+
+    if days is None:
+        return None, today, label
+
+    return today - timedelta(days=days - 1), today, label
+
+
+def _build_stats_workbook(
+    user_id: int,
+    period_label: str,
+    start: date,
+    end: date,
+    daily_rows: list[dict],
+    meal_rows: list[dict],
+) -> io.BytesIO:
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Сводка"
+    ws_summary.append(["Пользователь", user_id])
+    ws_summary.append(["Период", period_label])
+    ws_summary.append(["Дата начала", start.isoformat()])
+    ws_summary.append(["Дата конца", end.isoformat()])
+    ws_summary.append([])
+    ws_summary.append(["Дата", "Калории", "Белки", "Жиры", "Углеводы"])
+
+    total_kcal = total_p = total_f = total_c = 0.0
+    for row in daily_rows:
+        ws_summary.append([
+            row["date"],
+            round(row["kcal"], 2),
+            round(row["protein"], 2),
+            round(row["fat"], 2),
+            round(row["carbs"], 2),
+        ])
+        total_kcal += row["kcal"]
+        total_p += row["protein"]
+        total_f += row["fat"]
+        total_c += row["carbs"]
+
+    ws_summary.append([])
+    ws_summary.append([
+        "ИТОГО",
+        round(total_kcal, 2),
+        round(total_p, 2),
+        round(total_f, 2),
+        round(total_c, 2),
+    ])
+
+    ws_meals = wb.create_sheet("Приёмы пищи")
+    ws_meals.append([
+        "Дата",
+        "Время",
+        "Калории",
+        "Белки",
+        "Жиры",
+        "Углеводы",
+        "Детали (raw_json)",
+    ])
+
+    for row in meal_rows:
+        created_at = row.get("created_at") or ""
+        meal_time = ""
+        if created_at:
+            try:
+                meal_time = datetime.fromisoformat(created_at).strftime("%H:%M:%S")
+            except Exception:
+                meal_time = created_at
+        ws_meals.append([
+            row["date"],
+            meal_time,
+            round(row["kcal"], 2),
+            round(row["protein"], 2),
+            round(row["fat"], 2),
+            round(row["carbs"], 2),
+            row.get("raw_json") or "",
+        ])
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+
 async def show_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
@@ -2350,10 +2468,90 @@ async def show_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         text_lines.append(
             "\n🎯 Цель пока не задана.\n"
-            "Зайди в «⚙️ Настройки» → «🎯 Цель КБЖУ», чтобы я мог считать проценты."
+            "Зайди в «⚙️ Настройки» → «🎯 Задать цель КБЖУ вручную», чтобы я мог считать проценты."
         )
 
-    await edit_menu_message(update, ctx, "\n".join(text_lines), kb_back_to_main())
+    await edit_menu_message(update, ctx, "\n".join(text_lines), kb_stats())
+
+
+async def show_stats_export_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await edit_menu_message(
+        update,
+        ctx,
+        "Выбери период, за который сформировать Excel-файл со статистикой.",
+        kb_stats_export_periods(),
+    )
+
+
+async def export_stats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE, period_key: str) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+
+    db = get_db(ctx)
+    uid = user.id
+    today = datetime.now().date()
+    start_date, end_date, period_label = _resolve_export_period(period_key, today)
+
+    if period_key == "all":
+        bounds = await get_meals_date_bounds(db, uid)
+        if not bounds:
+            await edit_menu_message(
+                update,
+                ctx,
+                "Пока нет данных для выгрузки. Добавь хотя бы один приём пищи.",
+                kb_stats_export_periods(),
+            )
+            return
+        start_date = datetime.fromisoformat(bounds[0]).date()
+        end_date = datetime.fromisoformat(bounds[1]).date()
+
+    if start_date is None:
+        start_date = today
+
+    start_str = start_date.isoformat()
+    end_str = end_date.isoformat()
+
+    daily_rows = await get_daily_totals_in_range(db, uid, start_str, end_str)
+    meal_rows = await get_meals_in_range(db, uid, start_str, end_str)
+
+    if not meal_rows:
+        await edit_menu_message(
+            update,
+            ctx,
+            f"За период «{period_label}» нет данных для выгрузки.",
+            kb_stats_export_periods(),
+        )
+        return
+
+    workbook = _build_stats_workbook(
+        uid,
+        period_label,
+        start_date,
+        end_date,
+        daily_rows,
+        meal_rows,
+    )
+    filename = f"food_stats_{period_key}_{start_str}_{end_str}.xlsx"
+
+    await ctx.bot.send_document(
+        chat_id=chat.id,
+        document=workbook,
+        filename=filename,
+        caption=(
+            f"Готово ✅\nПериод: {period_label}\n"
+            f"Даты: {start_str} — {end_str}\n"
+            f"Дней: {(end_date - start_date).days + 1}"
+        ),
+    )
+
+    await edit_menu_message(
+        update,
+        ctx,
+        "Файл отправлен. Можешь выбрать другой период или вернуться назад.",
+        kb_stats_export_periods(),
+    )
 
 
 # ── Обработка приёма пищи (общий helper) ─────────────-
@@ -3335,6 +3533,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_set_goal_screen(update, ctx)
     elif data == "stats":
         await show_stats(update, ctx)
+    elif data == "stats_export":
+        await show_stats_export_menu(update, ctx)
+    elif data.startswith("stats_export:"):
+        period_key = data.split(":", 1)[1]
+        await export_stats_period(update, ctx, period_key)
     elif data == "survey_start":
         await start_survey(update, ctx)
     elif data.startswith("survey_mode:"):
