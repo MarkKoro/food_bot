@@ -345,6 +345,7 @@
       <div class="drawer-menu">
         <button class="drawer-item" id="nav-today">Сегодня</button>
         <button class="drawer-item" id="nav-subscription">Подписка</button>
+        <button class="drawer-item" id="nav-analytics">Статистика</button>
       </div>
     </aside>
     <div class="app">
@@ -401,6 +402,41 @@
         <canvas id="month-chart"></canvas>
         <div class="error" id="month-error"></div>
       </div>
+      </section>
+
+
+      <section id="screen-analytics" class="screen">
+        <div class="card">
+          <h2>📊 Расширенная статистика</h2>
+          <p class="card-subtitle">Выберите период и анализируйте прогресс по калориям и БЖУ.</p>
+          <div class="row" id="analytics-presets">
+            <button class="pill pill-primary" data-range="7d">7 дней</button>
+            <button class="pill pill-secondary" data-range="30d">30 дней</button>
+            <button class="pill pill-secondary" data-range="90d">90 дней</button>
+            <button class="pill pill-secondary" data-range="365d">1 год</button>
+            <button class="pill pill-secondary" data-range="all">Всё время</button>
+            <button class="pill pill-secondary" data-range="custom">Свой период</button>
+          </div>
+          <div class="date-controls" id="analytics-custom" style="display:none; margin-top:10px;">
+            <input type="date" id="analytics-start" class="pill pill-secondary" />
+            <input type="date" id="analytics-end" class="pill pill-secondary" />
+            <button class="pill pill-primary" id="analytics-apply-custom">Применить</button>
+          </div>
+          <div class="summary-grid" id="analytics-kpis" style="margin-top:10px;"></div>
+          <div class="hint" id="analytics-range-caption"></div>
+          <div class="error" id="analytics-error"></div>
+        </div>
+
+        <div class="card">
+          <h2>Динамика по дням</h2>
+          <canvas id="analytics-chart"></canvas>
+        </div>
+
+        <div class="card">
+          <h2>Качество выполнения норм</h2>
+          <div id="analytics-quality"></div>
+          <div class="hint">Недобор: меньше 90% цели. Норма: 90–110%. Перебор: выше 110%.</div>
+        </div>
       </section>
 
       <section id="screen-subscription" class="screen">
@@ -492,26 +528,51 @@
       const burgerBtn = document.getElementById("burger-btn");
       const navToday = document.getElementById("nav-today");
       const navSubscription = document.getElementById("nav-subscription");
+      const navAnalytics = document.getElementById("nav-analytics");
       const screenToday = document.getElementById("screen-today");
       const screenSubscription = document.getElementById("screen-subscription");
+      const screenAnalytics = document.getElementById("screen-analytics");
       const btnOpenSub = document.getElementById("btn-open-sub");
       const paygButtonsWrap = document.getElementById("payg-buttons");
+      const analyticsPresets = document.getElementById("analytics-presets");
+      const analyticsCustom = document.getElementById("analytics-custom");
+      const analyticsStart = document.getElementById("analytics-start");
+      const analyticsEnd = document.getElementById("analytics-end");
+      const analyticsApplyCustom = document.getElementById("analytics-apply-custom");
+      const analyticsKpis = document.getElementById("analytics-kpis");
+      const analyticsRangeCaption = document.getElementById("analytics-range-caption");
+      const analyticsError = document.getElementById("analytics-error");
+      const analyticsQuality = document.getElementById("analytics-quality");
 
       let weekChart = null;
       let monthChart = null;
       let todayRing = null;
+      let analyticsChart = null;
+      let activeAnalyticsRange = "7d";
+      let resolvedBotUsername = "";
 
       let activeMode = "today"; // "today" | "yesterday" | "date"
       let selectedISO = null;
       let lastLoadedDateIso = null;
 
-      function botUsername() {
-        return qs("bot") || "";
+      async function resolveBotUsername() {
+        if (resolvedBotUsername) return resolvedBotUsername;
+        const byQuery = qs("bot");
+        if (byQuery) { resolvedBotUsername = byQuery.replace(/^@/, ""); return resolvedBotUsername; }
+        try {
+          const cfg = await fetchJson("/api/config");
+          if (cfg?.bot_username) {
+            resolvedBotUsername = String(cfg.bot_username).replace(/^@/, "");
+            return resolvedBotUsername;
+          }
+        } catch (_) {}
+        return "";
       }
 
       function showScreen(name) {
         screenToday?.classList.toggle("active", name === "today");
         screenSubscription?.classList.toggle("active", name === "subscription");
+        screenAnalytics?.classList.toggle("active", name === "analytics");
       }
 
       function openDrawer() {
@@ -524,19 +585,20 @@
         drawerBackdrop?.classList.remove("show");
       }
 
-      function openBotPayment(mode) {
-        const uname = botUsername();
+      async function openBotPayment(mode) {
+        const uname = await resolveBotUsername();
         if (!uname) {
-          alert("Не удалось открыть оплату: отсутствует username бота. Откройте WebApp по ссылке с параметром ?bot=your_bot_username.");
+          alert("Не удалось открыть оплату: отсутствует username бота. Добавьте BOT_USERNAME на сервере или откройте WebApp по ссылке с параметром ?bot=your_bot_username.");
           return;
         }
 
         const startPayload = mode === "sub" ? "premium" : "payg";
-        const url = `https://t.me/${uname}?start=${startPayload}`;
+        const startUrl = `https://t.me/${uname}?start=${startPayload}`;
+
         if (tg?.openTelegramLink) {
-          tg.openTelegramLink(url);
+          tg.openTelegramLink(startUrl);
         } else {
-          window.open(url, "_blank");
+          window.open(startUrl, "_blank");
         }
       }
 
@@ -916,7 +978,89 @@
         }
       }
 
-      btnToday?.addEventListener("click", () => {
+function setActiveAnalyticsPreset(range) {
+        activeAnalyticsRange = range;
+        analyticsPresets?.querySelectorAll("[data-range]")?.forEach((btn) => {
+          const active = btn.getAttribute("data-range") === range;
+          btn.classList.toggle("pill-primary", active);
+          btn.classList.toggle("pill-secondary", !active);
+        });
+        if (analyticsCustom) {
+          analyticsCustom.style.display = range === "custom" ? "flex" : "none";
+        }
+      }
+
+      function renderAnalytics(adv) {
+        const totals = adv?.totals || {};
+        const avg = adv?.avg_per_day || {};
+        const r = adv?.range || {};
+        analyticsKpis.innerHTML = `
+          <div class="macro-item"><span class="label">Дней в периоде</span> <span class="value">${r.days || 0}</span></div>
+          <div class="macro-item"><span class="label">Активных дней</span> <span class="value">${r.active_days || 0}</span></div>
+          <div class="macro-item"><span class="label">Ккал всего</span> <span class="value">${fmt(totals.kcal)}</span></div>
+          <div class="macro-item"><span class="label">Ккал в день</span> <span class="value">${fmt(avg.kcal)}</span></div>
+          <div class="macro-item"><span class="label">Белки в день</span> <span class="value">${fmt(avg.protein,1)} г</span></div>
+          <div class="macro-item"><span class="label">Жиры в день</span> <span class="value">${fmt(avg.fat,1)} г</span></div>
+          <div class="macro-item"><span class="label">Углеводы в день</span> <span class="value">${fmt(avg.carbs,1)} г</span></div>
+        `;
+        analyticsRangeCaption.textContent = `Период: ${r.start || "-"} — ${r.end || "-"}`;
+
+        const mk = (name, key) => `<div class="macro-item"><span class="label">${name}</span> <span class="value">Недобор ${fmt(adv?.deficiency_percent?.[key],1)}% (${adv?.deficiency_days?.[key] || 0} дн.) · Норма ${fmt(adv?.norm_percent?.[key],1)}% · Перебор ${fmt(adv?.excess_percent?.[key],1)}%</span></div>`;
+        analyticsQuality.innerHTML = `<div class="macro-grid">${mk("Белки","protein")}${mk("Жиры","fat")}${mk("Углеводы","carbs")}</div>`;
+
+        const labels = (adv?.items || []).map((d) => formatDayLabel(d.day));
+        const ctx = document.getElementById("analytics-chart")?.getContext("2d");
+        if (!ctx) return;
+        analyticsChart?.destroy?.();
+        analyticsChart = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              { label: "Ккал", data: (adv?.items || []).map((d) => d.kcal || 0), borderColor: "#60a5fa", backgroundColor: "rgba(96,165,250,0.15)", yAxisID: "y" },
+              { label: "Белки", data: (adv?.items || []).map((d) => d.protein || 0), borderColor: "#34d399", yAxisID: "y1" },
+              { label: "Жиры", data: (adv?.items || []).map((d) => d.fat || 0), borderColor: "#fbbf24", yAxisID: "y1" },
+              { label: "Углеводы", data: (adv?.items || []).map((d) => d.carbs || 0), borderColor: "#f472b6", yAxisID: "y1" },
+            ],
+          },
+          options: { responsive: true, interaction: { mode: "index", intersect: false }, scales: { y: { position: "left", ticks: { color: "#cbd5f5" } }, y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#cbd5f5" } }, x: { ticks: { color: "#cbd5f5", font: { size: 10 } } } } },
+        });
+      }
+
+      async function loadAdvancedStats(range = activeAnalyticsRange) {
+        analyticsError.textContent = "";
+        const params = new URLSearchParams({ range });
+        if (range === "custom") {
+          if (!analyticsStart?.value || !analyticsEnd?.value) {
+            analyticsError.textContent = "Выберите начальную и конечную даты.";
+            return;
+          }
+          params.set("start_date", analyticsStart.value);
+          params.set("end_date", analyticsEnd.value);
+        }
+        try {
+          const data = await fetchJson(`/api/stats/advanced?${params.toString()}`);
+          renderAnalytics(data);
+        } catch (err) {
+          console.error(err);
+          analyticsError.textContent = "Ошибка загрузки расширенной статистики.";
+        }
+      }
+
+      analyticsPresets?.addEventListener("click", (e) => {
+        const btn = e.target?.closest?.("[data-range]");
+        if (!btn) return;
+        const range = btn.getAttribute("data-range");
+        setActiveAnalyticsPreset(range);
+        if (range !== "custom") loadAdvancedStats(range);
+      });
+
+      analyticsApplyCustom?.addEventListener("click", () => {
+        setActiveAnalyticsPreset("custom");
+        loadAdvancedStats("custom");
+      });
+
+            btnToday?.addEventListener("click", () => {
         setActiveMode("today");
         loadDay("today");
       });
@@ -935,6 +1079,11 @@
       navSubscription?.addEventListener("click", () => {
         closeDrawer();
         showScreen("subscription");
+      });
+      navAnalytics?.addEventListener("click", () => {
+        closeDrawer();
+        showScreen("analytics");
+        loadAdvancedStats(activeAnalyticsRange);
       });
       btnOpenSub?.addEventListener("click", () => openBotPayment("sub"));
 
@@ -957,8 +1106,11 @@
         setActiveMode("today");
         showScreen("today");
         initPaymentButtons();
+        setActiveAnalyticsPreset("7d");
+        await resolveBotUsername();
         await loadDay("today");
         await loadHistory();
+        await loadAdvancedStats("7d");
       })();
     </script>
   </body>
