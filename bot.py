@@ -1638,6 +1638,26 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data["promo_notice"] = notice
 
     start_arg = (ctx.args[0].strip().lower() if ctx.args else "")
+    if start_arg.startswith("sub_"):
+        plan_id = start_arg.split("_", 1)[1]
+        if plan_id in SUB_PLANS:
+            await send_subscription_invoice_for_plan(update, ctx, plan_id)
+            return
+
+    if start_arg.startswith("payg_"):
+        raw_amount = start_arg.split("_", 1)[1]
+        try:
+            amount = int(raw_amount)
+        except ValueError:
+            amount = 0
+
+        if amount in PAYG_TOPUPS_RUB:
+            if YOOKASSA_PROVIDER_TOKEN:
+                await send_payg_invoice_card(update, ctx, amount)
+            else:
+                await send_payg_invoice_stars(update, ctx, amount)
+            return
+
     if start_arg in {"premium", "subscription", "sub"}:
         await on_premium_menu(update, ctx)
         return
@@ -4077,24 +4097,42 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     _, plan_id = data.split(":", 1)
-    ctx.chat_data["selected_plan_id"] = plan_id
-    db = get_db(ctx)
-    user_id = update.effective_user.id
-    _, _, paid_trial_used = await get_trial_info(db, user_id)
+    sent_ok = await send_subscription_invoice_for_plan(update, ctx, plan_id)
+    if sent_ok:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await delete_menu_message(ctx, chat_id)
+        except Exception:
+            pass
+
+
+async def send_subscription_invoice_for_plan(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, plan_id: str
+) -> bool:
     plan = SUB_PLANS.get(plan_id)
     if not plan:
-        await query.edit_message_text("Неизвестный план подписки.")
-        return
+        if update.callback_query:
+            await update.callback_query.edit_message_text("Неизвестный план подписки.")
+        else:
+            await update.effective_chat.send_message("Неизвестный план подписки.")
+        return False
 
     if not YOOKASSA_PROVIDER_TOKEN:
-        await query.edit_message_text(
-            "Оплата картой появится чуть позже. Сейчас можно оформить подписку за Stars."
-        )
-        return
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                "Оплата картой появится чуть позже. Сейчас можно оформить подписку за Stars."
+            )
+        else:
+            await on_premium_menu(update, ctx)
+        return False
 
+    chat_id = update.effective_chat.id
+    ctx.chat_data["selected_plan_id"] = plan_id
     payload = f"sub:{plan.id}:card"
 
-    # удалить старый invoice (если висит)
     old = ctx.chat_data.pop("last_invoice_message_id", None)
     if old:
         try:
@@ -4102,7 +4140,6 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # ВАЖНО: для RUB-инвойса нельзя слать reply_markup без pay=True
     invoice_kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Оплатить 💳", pay=True)],
@@ -4124,25 +4161,22 @@ async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             max_tip_amount=0,
         )
     except Exception:
-        # ничего не удаляем — просто оставляем меню на месте
         logging.exception("Failed to send RUB subscription invoice")
-        await query.edit_message_text(
-            "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
-            reply_markup=kb_premium_plans(paid_trial_used=bool(paid_trial_used)),
-        )
-        return
+        if update.callback_query:
+            db = get_db(ctx)
+            _, _, paid_trial_used = await get_trial_info(db, update.effective_user.id)
+            await update.callback_query.edit_message_text(
+                "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
+                reply_markup=kb_premium_plans(paid_trial_used=bool(paid_trial_used)),
+            )
+        else:
+            await update.effective_chat.send_message(
+                "Не удалось создать счёт на оплату. Попробуйте снова чуть позже."
+            )
+        return False
 
     ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
-
-    # Инвойс создан — теперь можно убрать старое меню (чтобы чат не оставался пустым при ошибке выше)
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    try:
-        await delete_menu_message(ctx, chat_id)
-    except Exception:
-        pass
+    return True
 
 
 def format_payment_success_notice(
