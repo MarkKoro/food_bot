@@ -244,6 +244,26 @@
         flex-wrap: wrap;
         margin: 10px 0;
       }
+      .meals-table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      .meals-table th,
+      .meals-table td {
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        padding: 8px 6px;
+        text-align: left;
+        vertical-align: top;
+        font-size: 13px;
+      }
+      .meals-table th {
+        color: #e2e8f0;
+        font-weight: 600;
+      }
+      .meal-items-line {
+        margin: 2px 0;
+        color: #cbd5e1;
+      }
 
       .ring-wrapper {
         display: flex;
@@ -446,6 +466,11 @@
         <canvas id="today-ring"></canvas>
       </div>
 
+      <div class="card" id="card-today-meals">
+        <h2>Что съедено за день</h2>
+        <div id="today-meals"></div>
+      </div>
+
       <div class="card" id="card-week">
         <h2>Последние 7 дней</h2>
         <div id="week-summary"></div>
@@ -631,6 +656,7 @@
       const todayMacrosEl = document.getElementById("today-macros");
       const todayHintEl = document.getElementById("today-hint");
       const todayErrorEl = document.getElementById("today-error");
+      const todayMealsEl = document.getElementById("today-meals");
       const weekErrorEl = document.getElementById("week-error");
       const monthErrorEl = document.getElementById("month-error");
       const todayTitleEl = document.getElementById("today-title");
@@ -921,6 +947,29 @@
             </div>
           </div>
         `;
+
+        const meals = Array.isArray(day?.meals) ? day.meals : [];
+        if (todayMealsEl) {
+          if (!meals.length) {
+            todayMealsEl.innerHTML = '<div class="hint">За выбранную дату приёмы пищи ещё не добавлены.</div>';
+          } else {
+            todayMealsEl.innerHTML = `
+              <table class="meals-table">
+                <thead><tr><th>Время</th><th>Блюдо</th><th>КБЖУ</th></tr></thead>
+                <tbody>
+                  ${meals
+                    .map((meal) => {
+                      const itemLines = Array.isArray(meal.items) && meal.items.length
+                        ? meal.items.map((it) => `<div class="meal-items-line">${it.name}${it.grams ? ` — ${fmt(it.grams, 0)} г` : ""} (К ${fmt(it.kcal,0)}, Б ${fmt(it.protein,0)}, Ж ${fmt(it.fat,0)}, У ${fmt(it.carbs,0)})</div>`).join("")
+                        : '<div class="meal-items-line">Без детализации блюда</div>';
+                      return `<tr><td>${meal.time || "—"}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
+                    })
+                    .join("")}
+                </tbody>
+              </table>
+            `;
+          }
+        }
 
         todayErrorEl.textContent = "";
 
