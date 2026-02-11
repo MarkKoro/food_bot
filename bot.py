@@ -354,7 +354,7 @@ def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
-        # обычно хранится как 'YYYY-MM-DD HH:MM:SS'
+        # обычно хранится как '    msg = "\n".join(lines) + payg_footerY-MM-DD HH:MM:SS'
         return datetime.fromisoformat(s)
     except Exception:
         return None
@@ -568,12 +568,6 @@ def kb_meal_extras(extras: dict) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    label("💾 Добавить в шаблоны", "save_template"),
-                    callback_data="meal_extra_template",
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     "✅ Считать как есть / отправить",
                     callback_data="meal_extra_send",
                 )
@@ -589,9 +583,6 @@ def meal_extras_info_text(extras: dict) -> str:
         info_lines.append(f"📏 Размер блюда: _{extras['portion']}_")
     if extras.get("composition"):
         info_lines.append(f"🍲 Состав: _{extras['composition']}_")
-    if extras.get("save_template"):
-        info_lines.append("💾 Будет сохранено в заготовки")
-
     info_lines.append("\nМожно добавить ещё детали или сразу отправить на подсчёт.")
     return "\n".join(info_lines)
 
@@ -648,6 +639,7 @@ FOOD_USER_INSTRUCTIONS = """Верни строго JSON-объект таког
 
 Требования:
 - items: список всех распознанных съедобных объектов на фото (и на тарелке, и рядом), но только если объект распознаваем.
+- name обязательно на русском языке (человеческое понятное название блюда).
 - grams — оценка массы/объёма в граммах (для напитков можно оценить через мл≈г).
 - Числа могут быть float.
 - totals — сумма по items.
@@ -687,7 +679,8 @@ TEXT_FOOD_USER_INSTRUCTIONS = (
     "    \"carbs_g\": 0\n"
     "  }\n"
     "}\n\n"
-    "Если указана граммовка, размер порции или способ приготовления — обязательно учитывай это."
+    "Если указана граммовка, размер порции или способ приготовления — обязательно учитывай это.\n"
+    "Название каждого блюда (поле name) пиши только на русском и понятно для человека."
 )
 
 SURVEYS = {
@@ -1750,6 +1743,76 @@ def format_recognized_items(items: list | None) -> list[str]:
     return lines
 
 
+def _float_or_zero(value) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _item_weight_g(item: dict) -> float:
+    return _float_or_zero(item.get("grams") or item.get("weight_g") or item.get("weight"))
+
+
+def _item_total(item: dict, keys: tuple[str, ...]) -> float:
+    for key in keys:
+        if key in item and item.get(key) is not None:
+            return _float_or_zero(item.get(key))
+    return 0.0
+
+
+def _item_summary_human(item: dict) -> str | None:
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return None
+
+    grams = _item_weight_g(item)
+    kcal = _item_total(item, ("kcal_total", "kcal"))
+    protein = _item_total(item, ("protein_g", "protein"))
+    fat = _item_total(item, ("fat_g", "fat"))
+    carbs = _item_total(item, ("carbs_g", "carbs"))
+
+    line = f"{name}"
+    if grams > 0:
+        line += f" — {round(grams)} г"
+
+    line += (
+        f" (в этом количестве: {round(kcal)} ккал, Б {round(protein)} г, "
+        f"Ж {round(fat)} г, У {round(carbs)} г)"
+    )
+
+    if grams > 0:
+        factor = 100.0 / grams
+        line += (
+            f"\n   на 100 г: {round(kcal * factor)} ккал, Б {round(protein * factor)} г, "
+            f"Ж {round(fat * factor)} г, У {round(carbs * factor)} г"
+        )
+
+    return line
+
+
+def format_meal_items_human(items: list | None) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        row = _item_summary_human(item)
+        if row:
+            lines.append(f"• {row}")
+    return lines
+
+
+def kb_save_template_after_meal() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💾 Сохранить как шаблон", callback_data="save_result_template")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="main")],
+        ]
+    )
+
+
 def infer_template_name(data: dict, extras: dict) -> str:
     if extras.get("composition"):
         return extras["composition"].strip()
@@ -2355,6 +2418,32 @@ def _resolve_export_period(period_key: str, today: date) -> tuple[date | None, d
     return today - timedelta(days=days - 1), today, label
 
 
+def _humanize_meal_raw_json(raw_json: str) -> str:
+    if not raw_json:
+        return ""
+    try:
+        payload = _safe_json_loads(raw_json)
+    except Exception:
+        return raw_json
+
+    if not isinstance(payload, dict):
+        return raw_json
+
+    items = payload.get("items")
+    lines = format_meal_items_human(items)
+    if lines:
+        return "\n".join(line[2:] if line.startswith("• ") else line for line in lines)
+
+    template_name = payload.get("template_name")
+    if template_name:
+        portion = payload.get("portion")
+        if portion:
+            return f"Шаблон «{template_name}», порция x{portion}"
+        return f"Шаблон «{template_name}»"
+
+    return raw_json
+
+
 def _build_stats_workbook(
     user_id: int,
     period_label: str,
@@ -2406,9 +2495,24 @@ def _build_stats_workbook(
         "Статус дня",
     ])
 
-    by_day = {row["date"]: row for row in daily_rows}
-    days_count = (end - start).days + 1
-    date_list = [start + timedelta(days=i) for i in range(days_count)]
+    active_daily_rows = [
+        row
+        for row in daily_rows
+        if float(row.get("kcal", 0) or 0) > 0
+        or float(row.get("protein", 0) or 0) > 0
+        or float(row.get("fat", 0) or 0) > 0
+        or float(row.get("carbs", 0) or 0) > 0
+    ]
+    active_daily_rows.sort(key=lambda row: row.get("date") or "")
+    if not active_daily_rows:
+        for row in meal_rows:
+            d = row.get("date")
+            if d:
+                active_daily_rows.append({"date": d, "kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0})
+                break
+
+    by_day = {row["date"]: row for row in active_daily_rows}
+    date_list = [datetime.fromisoformat(row["date"]).date() for row in active_daily_rows]
     day_start_row = 6
     goal_kcal = float(goal.get("kcal", 0) if goal else 0)
     goal_p = float(goal.get("protein", 0) if goal else 0)
@@ -2434,20 +2538,20 @@ def _build_stats_workbook(
             f'=IF(AND(J{excel_row}>=0.9,J{excel_row}<=1.1,K{excel_row}>=0.9,K{excel_row}<=1.1),"✅ Норма","⚠️ Отклонение")',
         ])
 
-    stat_title_row = day_start_row + days_count + 2
+    stat_title_row = day_start_row + len(date_list) + 2
     ws_summary.merge_cells(start_row=stat_title_row, start_column=1, end_row=stat_title_row, end_column=6)
     ws_summary.cell(stat_title_row, 1).value = "Общая статистика за период"
     ws_summary.cell(stat_title_row, 1).font = Font(bold=True, color="FFFFFF")
     ws_summary.cell(stat_title_row, 1).fill = stat_fill
 
     stat_rows = [
-        ("Дней в отчёте", f"=COUNTA(A{day_start_row}:A{day_start_row + days_count - 1})"),
-        ("Дней с выполненной нормой", f"=COUNTIF(L{day_start_row}:L{day_start_row + days_count - 1},""✅ Норма"")"),
-        ("Дней с отклонением", f"=COUNTIF(L{day_start_row}:L{day_start_row + days_count - 1},""⚠️ Отклонение"")"),
-        ("Среднее выполнение калорий", f"=AVERAGE(J{day_start_row}:J{day_start_row + days_count - 1})"),
-        ("Среднее выполнение БЖУ", f"=AVERAGE(K{day_start_row}:K{day_start_row + days_count - 1})"),
-        ("Средние калории в день", f"=AVERAGE(B{day_start_row}:B{day_start_row + days_count - 1})"),
-        ("Сумма калорий за период", f"=SUM(B{day_start_row}:B{day_start_row + days_count - 1})"),
+        ("Дней в отчёте", f"=COUNTA(A{day_start_row}:A{day_start_row + len(date_list) - 1})"),
+        ("Дней с выполненной нормой", f'=COUNTIF(L{day_start_row}:L{day_start_row + len(date_list) - 1},"✅ Норма")'),
+        ("Дней с отклонением", f'=COUNTIF(L{day_start_row}:L{day_start_row + len(date_list) - 1},"⚠️ Отклонение")'),
+        ("Среднее выполнение калорий", f"=AVERAGE(J{day_start_row}:J{day_start_row + len(date_list) - 1})"),
+        ("Среднее выполнение БЖУ", f"=AVERAGE(K{day_start_row}:K{day_start_row + len(date_list) - 1})"),
+        ("Средние калории в день", f"=AVERAGE(B{day_start_row}:B{day_start_row + len(date_list) - 1})"),
+        ("Сумма калорий за период", f"=SUM(B{day_start_row}:B{day_start_row + len(date_list) - 1})"),
     ]
 
     for i, (label, formula) in enumerate(stat_rows, start=stat_title_row + 1):
@@ -2468,7 +2572,7 @@ def _build_stats_workbook(
             cell.border = border
             cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for row in ws_summary.iter_rows(min_row=day_start_row, max_row=day_start_row + days_count - 1, min_col=1, max_col=12):
+    for row in ws_summary.iter_rows(min_row=day_start_row, max_row=day_start_row + len(date_list) - 1, min_col=1, max_col=12):
         for cell in row:
             cell.border = border
             if cell.column in (10, 11):
@@ -2502,7 +2606,7 @@ def _build_stats_workbook(
         "Белки",
         "Жиры",
         "Углеводы",
-        "Детали (raw_json)",
+        "Что съедено",
     ])
 
     for row in meal_rows:
@@ -2520,7 +2624,7 @@ def _build_stats_workbook(
             round(row["protein"], 2),
             round(row["fat"], 2),
             round(row["carbs"], 2),
-            row.get("raw_json") or "",
+            _humanize_meal_raw_json(row.get("raw_json") or ""),
         ])
 
     ws_meals.freeze_panes = "A2"
@@ -2881,9 +2985,10 @@ async def _process_meal_calculation(
 
     lines = []
     lines.append("Оценка приёма пищи 🍽\n")
-    recognized_lines = format_recognized_items(data.get("items"))
-    if recognized_lines:
-        lines.extend(recognized_lines)
+    meal_lines = format_meal_items_human(data.get("items"))
+    if meal_lines:
+        lines.append("Что съедено:")
+        lines.extend(meal_lines)
         lines.append("")
     lines.append("Этот приём:\n")
     lines.append(f"🍽 Калории: ~*{kcal}* ккал")
@@ -2927,8 +3032,12 @@ async def _process_meal_calculation(
     )
 
     msg = "\n".join(lines)
-    main_kb = await build_main_keyboard(ctx, uid)
-    await edit_menu_message(update, ctx, msg, main_kb)
+    ctx.user_data["last_meal_for_template"] = {
+        "data": data,
+        "totals": totals,
+        "extras": extras,
+    }
+    await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
 
 
 # ── Фото еды ─────────────────────────────────────────
@@ -3076,9 +3185,10 @@ async def process_meal_description(
 
     lines = []
     lines.append(f"{header}\n")
-    recognized_lines = format_recognized_items(data.get("items"))
-    if recognized_lines:
-        lines.extend(recognized_lines)
+    meal_lines = format_meal_items_human(data.get("items"))
+    if meal_lines:
+        lines.append("Что съедено:")
+        lines.extend(meal_lines)
         lines.append("")
     lines.append("Этот приём:")
     lines.append(f"🍽 Калории: ~*{kcal}* ккал")
@@ -3123,7 +3233,12 @@ async def process_meal_description(
         payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
 
     msg = "\n".join(lines) + payg_footer
-    await edit_menu_message(update, ctx, msg, main_kb)
+    ctx.user_data["last_meal_for_template"] = {
+        "data": data,
+        "totals": totals,
+        "extras": {},
+    }
+    await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
@@ -3789,14 +3904,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             kb_back_to_meal_extras(),
         )
     
-    elif data == "meal_extra_template":
-        ctx.user_data["state"] = "await_meal_extras_menu"
-        pending = ctx.user_data.get("pending_meal") or {}
-        extras = pending.get("extras") or {}
-        extras["save_template"] = not extras.get("save_template")
-        pending["extras"] = extras
-        ctx.user_data["pending_meal"] = pending
-        await refresh_meal_extras_menu(update, ctx)
+    elif data == "save_result_template":
+        db = get_db(ctx)
+        uid = update.effective_user.id
+        payload = ctx.user_data.get("last_meal_for_template") or {}
+        data_for_tpl = payload.get("data") or {}
+        totals_for_tpl = payload.get("totals") or {}
+        extras_for_tpl = payload.get("extras") or {}
+
+        if not totals_for_tpl:
+            await show_main_menu(update, ctx)
+            return
+
+        template_name = infer_template_name(data_for_tpl, extras_for_tpl)
+        template_raw = json.dumps({"analysis": data_for_tpl, "extras": extras_for_tpl}, ensure_ascii=False)
+        await add_template(db, uid, template_name, totals_for_tpl, template_raw)
+        await show_main_menu(update, ctx, notice=f"💾 Сохранено как шаблон: «{escape_md(template_name)}».", notice_at_bottom=True)
     elif data == "meal_extra_send":
         await _process_meal_calculation(update, ctx)
     elif data == "meal_extra_cancel":

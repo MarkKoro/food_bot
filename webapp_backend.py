@@ -110,6 +110,83 @@ def _today_str() -> str:
     return dt.date.today().isoformat()
 
 
+
+
+def _safe_json_loads(value: str) -> Dict[str, Any]:
+    value = (value or "").strip()
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except Exception:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(value[start:end+1])
+            except Exception:
+                return {}
+    return {}
+
+
+def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT created_at, kcal, protein, fat, carbs, raw_json
+            FROM meals
+            WHERE user_id = ? AND date = ?
+            ORDER BY datetime(created_at) ASC, id ASC
+            """,
+            (user_id, day),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    meals: List[Dict[str, Any]] = []
+    for row in rows:
+        created_at = row["created_at"] or ""
+        meal_time = ""
+        if created_at:
+            try:
+                meal_time = dt.datetime.fromisoformat(created_at).strftime("%H:%M")
+            except Exception:
+                meal_time = str(created_at)[11:16]
+
+        payload = _safe_json_loads(row["raw_json"] or "")
+        items = payload.get("items") if isinstance(payload, dict) else []
+        meal_items = []
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                grams = float(item.get("grams") or item.get("weight_g") or 0)
+                meal_items.append({
+                    "name": name,
+                    "grams": grams,
+                    "kcal": float(item.get("kcal_total") or item.get("kcal") or 0),
+                    "protein": float(item.get("protein_g") or item.get("protein") or 0),
+                    "fat": float(item.get("fat_g") or item.get("fat") or 0),
+                    "carbs": float(item.get("carbs_g") or item.get("carbs") or 0),
+                })
+
+        meals.append({
+            "time": meal_time,
+            "kcal": float(row["kcal"] or 0),
+            "protein": float(row["protein"] or 0),
+            "fat": float(row["fat"] or 0),
+            "carbs": float(row["carbs"] or 0),
+            "items": meal_items,
+        })
+
+    return meals
+
 def _build_stats_for_day(user_id: int, day: str) -> Dict[str, Any]:
     totals = get_daily_totals_for_user(user_id, day)
     goal = get_goal_for_user(user_id)
@@ -131,6 +208,7 @@ def _build_stats_for_day(user_id: int, day: str) -> Dict[str, Any]:
         "totals": totals,
         "goal": goal,
         "percent": percent,
+        "meals": get_meals_for_user_day(user_id, day),
     }
 
 
