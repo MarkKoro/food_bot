@@ -1026,7 +1026,10 @@ async def _get_access_flags(
 
 
 def kb_payment_offer(
-    show_switch_to_modes: bool = False, *, show_subscription_button: bool = True
+    show_switch_to_modes: bool = False,
+    *,
+    show_subscription_button: bool = True,
+    show_templates_button: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -1040,6 +1043,11 @@ def kb_payment_offer(
         )
 
     rows.append([InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")])
+
+    if show_templates_button:
+        rows.append([
+            InlineKeyboardButton("📁 Добавить из шаблона", callback_data="templates")
+        ])
 
     if show_subscription_button:
         rows.append(
@@ -1070,11 +1078,19 @@ async def send_payment_block_notice(
 
     balance_text = f"Баланс PAYG: {payg_balance}₽"
 
+    has_saved_templates = await has_templates(get_db(ctx), update.effective_user.id)
+
     if payg_balance < PAYG_COST_RUB and not has_subscription:
         lines.append(
             "Сейчас нет активной подписки и нет средств на Pay-as-you-go."\
             " Пополните баланс или оформите подписку."
         )
+        if has_saved_templates:
+            lines.append(
+                ""
+                "Можно продолжать вести статистику без оплаты: "
+                "добавляйте сохранённые блюда через «Добавить из шаблона»."
+            )
     elif pay_mode == "payg" and payg_balance < PAYG_COST_RUB:
         lines.append(
             f"Выбран Pay-as-you-go, но баланс пуст. {balance_text}."
@@ -1107,6 +1123,7 @@ async def send_payment_block_notice(
         kb_payment_offer(
             show_switch_to_modes=show_switch,
             show_subscription_button=not has_subscription,
+            show_templates_button=has_saved_templates,
         ),
     )
 
