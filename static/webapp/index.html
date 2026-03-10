@@ -415,6 +415,7 @@
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://yookassa.ru/checkout-widget/v1/checkout-widget.js"></script>
   </head>
   <body>
     <div id="drawer-backdrop" class="backdrop"></div>
@@ -542,6 +543,22 @@
         </div>
       </section>
 
+
+      <section id="screen-payment" class="screen">
+        <div class="card">
+          <h2 id="payment-title">Оплата</h2>
+          <p id="payment-description" class="subscription-intro"></p>
+          <div class="plan-card">
+            <h3 id="payment-amount">Сумма: —</h3>
+            <p id="payment-kind" class="plan-description"></p>
+            <div class="pay-actions">
+              <button class="pill pill-primary" id="btn-widget-pay">Оплатить</button>
+            </div>
+            <div id="payment-status" class="hint"></div>
+            <div id="payment-widget-container"></div>
+          </div>
+        </div>
+      </section>
       <section id="screen-subscription" class="screen">
         <div class="card">
           <h2>💳 Подписка и оплата</h2>
@@ -675,6 +692,7 @@
       const screenToday = document.getElementById("screen-today");
       const screenSubscription = document.getElementById("screen-subscription");
       const screenAnalytics = document.getElementById("screen-analytics");
+      const screenPayment = document.getElementById("screen-payment");
       const btnOpenSub = document.getElementById("btn-open-sub");
       const btnOpenSubModal = document.getElementById("btn-open-sub-modal");
       const btnOpenPaygModal = document.getElementById("btn-open-payg-modal");
@@ -703,6 +721,13 @@
       const paygModal = document.getElementById("payg-modal");
       const subModalClose = document.getElementById("sub-modal-close");
       const paygModalClose = document.getElementById("payg-modal-close");
+      const paymentTitleEl = document.getElementById("payment-title");
+      const paymentDescriptionEl = document.getElementById("payment-description");
+      const paymentAmountEl = document.getElementById("payment-amount");
+      const paymentKindEl = document.getElementById("payment-kind");
+      const paymentStatusEl = document.getElementById("payment-status");
+      const btnWidgetPay = document.getElementById("btn-widget-pay");
+      const paymentWidgetContainer = document.getElementById("payment-widget-container");
 
       let weekChart = null;
       let monthChart = null;
@@ -719,6 +744,7 @@
         screenToday?.classList.toggle("active", name === "today");
         screenSubscription?.classList.toggle("active", name === "subscription");
         screenAnalytics?.classList.toggle("active", name === "analytics");
+        screenPayment?.classList.toggle("active", name === "payment");
       }
 
       function openDrawer() {
@@ -731,6 +757,103 @@
         drawerBackdrop?.classList.remove("show");
       }
 
+
+
+      function paymentQueryConfig() {
+        const params = new URLSearchParams(location.search);
+        if (params.get("screen") !== "payment") return null;
+        const kind = params.get("kind") || "";
+        if (kind === "subscription") {
+          const planId = params.get("plan_id") || "";
+          if (!planId) return null;
+          return { kind, plan_id: planId };
+        }
+        if (kind === "payg_topup") {
+          const rub = Number(params.get("rub") || 0);
+          if (!rub) return null;
+          return { kind, rub };
+        }
+        return null;
+      }
+
+      function describePaymentConfig(cfg) {
+        if (!cfg) return { title: "Оплата", amount: "", description: "" };
+        if (cfg.kind === "subscription") {
+          const map = { w1: ["Одна неделя", 125], m1: ["1 месяц", 399], m3: ["3 месяца", 1000], m6: ["6 месяцев", 1800], y1: ["1 год", 3500] };
+          const val = map[cfg.plan_id] || [cfg.plan_id, 0];
+          return { title: `Подписка ${val[0]}`, amount: `${val[1]} ₽`, description: "Оплата подписки через YooKassa Widget" };
+        }
+        return { title: "Пополнение PAYG", amount: `${cfg.rub} ₽`, description: "Пополнение баланса PAYG через YooKassa Widget" };
+      }
+
+      async function pollWidgetStatus(paymentId) {
+        for (let i = 0; i < 8; i += 1) {
+          const status = await fetchJson(`/api/payments/widget/status?payment_id=${encodeURIComponent(paymentId)}`);
+          if (status?.status === "succeeded" && status?.finalized) {
+            return { ok: true, message: status?.message || "Оплата успешно завершена" };
+          }
+          if (status?.status === "canceled") {
+            return { ok: false, message: "Оплата отменена" };
+          }
+          await sleep(1500);
+        }
+        return { ok: false, timeout: true, message: "Статус ещё обновляется, проверь чуть позже" };
+      }
+
+      async function startWidgetPayment(config) {
+        if (!config) return;
+        if (paymentStatusEl) paymentStatusEl.textContent = "Создаём платёж...";
+        const created = await fetch(`/api/payments/widget/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
+          },
+          body: JSON.stringify(config),
+        }).then(async (r) => {
+          if (!r.ok) throw new Error(await r.text());
+          return r.json();
+        });
+
+        const token = created?.confirmation_token;
+        const paymentId = created?.payment_id;
+        if (!token || !paymentId) throw new Error("Не удалось получить токен оплаты");
+
+        const checkout = new window.YooMoneyCheckoutWidget({
+          confirmation_token: token,
+          customization: { modal: true },
+          error_callback: function() {
+            if (paymentStatusEl) paymentStatusEl.textContent = "Не удалось открыть виджет оплаты";
+          },
+        });
+
+        let completed = false;
+        checkout.on("complete", async () => {
+          completed = true;
+          checkout.destroy();
+          if (paymentStatusEl) paymentStatusEl.textContent = "Проверяем статус оплаты...";
+          const result = await pollWidgetStatus(paymentId);
+          if (paymentStatusEl) paymentStatusEl.textContent = result.message;
+          if (result.ok) {
+            await sleep(1200);
+            try { tg?.close?.(); } catch (_) {}
+          }
+        });
+
+        checkout.on("modal_close", () => {
+          if (!completed && paymentStatusEl) {
+            paymentStatusEl.textContent = "Окно оплаты закрыто. Оплата не завершена.";
+          }
+        });
+
+        if (paymentWidgetContainer) paymentWidgetContainer.innerHTML = "";
+        checkout.render("#payment-widget-container");
+        setTimeout(() => {
+          if (!completed && paymentStatusEl && !paymentStatusEl.textContent.includes("Проверяем")) {
+            paymentStatusEl.textContent = "Если вы закрыли окно, оплата не завершена";
+          }
+        }, 1200);
+      }
       async function openBotPayment(mode, value = "") {
         try {
           if (mode === "sub") {
@@ -1330,6 +1453,7 @@ function setActiveAnalyticsPreset(range) {
       paygModal?.addEventListener("click", (e) => { if (e.target === paygModal) setModalOpen(paygModal, false); });
 
       (async function init() {
+        const queryPayment = paymentQueryConfig();
         try {
           tg?.expand?.();
         } catch (err) {
@@ -1342,6 +1466,26 @@ function setActiveAnalyticsPreset(range) {
             "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
           todayErrorEl.textContent = errMsg;
           dlog(errMsg);
+          return;
+        }
+
+        if (queryPayment) {
+          const desc = describePaymentConfig(queryPayment);
+          showScreen("payment");
+          paymentTitleEl.textContent = desc.title;
+          paymentAmountEl.textContent = `Сумма: ${desc.amount}`;
+          paymentDescriptionEl.textContent = desc.description;
+          paymentKindEl.textContent = queryPayment.kind === "subscription" ? "Тариф будет активирован сразу после подтверждения оплаты." : "Баланс PAYG пополнится после подтверждения оплаты.";
+          btnWidgetPay?.addEventListener("click", async () => {
+            btnWidgetPay.disabled = true;
+            try {
+              await startWidgetPayment(queryPayment);
+            } catch (err) {
+              paymentStatusEl.textContent = String(err?.message || "Ошибка оплаты").replace(/^HTTP \d+:\s*/, "");
+            } finally {
+              btnWidgetPay.disabled = false;
+            }
+          });
           return;
         }
 

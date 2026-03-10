@@ -5,6 +5,7 @@ import time
 import hashlib
 import sqlite3
 import httpx
+import logging
 import datetime as dt
 from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
@@ -18,6 +19,9 @@ load_dotenv("/srv/food_bot/.env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN")
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "").strip()
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "").strip()
+YOOKASSA_WIDGET_ENABLED = os.getenv("YOOKASSA_WIDGET_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 if not BOT_TOKEN:
     import logging
 
@@ -25,6 +29,16 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required for Telegram WebApp verification")
 
 DB_PATH = os.getenv("DB_PATH", "data/food_bot.sqlite3")
+logger = logging.getLogger(__name__)
+
+SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
+    "w1": {"title": "Одна неделя", "price_rub": 125, "days": 7},
+    "m1": {"title": "1 месяц", "price_rub": 399, "days": 30},
+    "m3": {"title": "3 месяца", "price_rub": 1000, "days": 90},
+    "m6": {"title": "6 месяцев", "price_rub": 1800, "days": 180},
+    "y1": {"title": "1 год", "price_rub": 3500, "days": 365},
+}
+PAYG_TOPUPS_RUB = {60, 100, 200, 400}
 
 app = FastAPI(title="FoodBot WebApp API")
 
@@ -112,6 +126,202 @@ def _today_str() -> str:
 
 
 
+
+
+def _widget_config_valid() -> bool:
+    return bool(YOOKASSA_WIDGET_ENABLED and YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
+
+
+def _widget_guard() -> None:
+    if not YOOKASSA_WIDGET_ENABLED:
+        raise HTTPException(status_code=503, detail="YooKassa Widget payments are disabled")
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        logger.error("YooKassa widget misconfigured: missing shop credentials")
+        raise HTTPException(status_code=503, detail="YooKassa Widget is not configured")
+
+
+def _yookassa_headers(idempotence_key: Optional[str] = None) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if idempotence_key:
+        headers["Idempotence-Key"] = idempotence_key
+    return headers
+
+
+def _payment_amount_value(rub: int) -> str:
+    return f"{rub:.2f}"
+
+
+def _add_days_iso(base: Optional[str], days: int) -> str:
+    now = dt.datetime.now()
+    base_dt = now
+    if base:
+        try:
+            parsed = dt.datetime.fromisoformat(base)
+            if parsed > now:
+                base_dt = parsed
+        except Exception:
+            pass
+    return (base_dt + dt.timedelta(days=days)).isoformat()
+
+
+def _create_widget_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int) -> Dict[str, Any]:
+    _widget_guard()
+
+    title = ""
+    description = ""
+    metadata: Dict[str, Any] = {
+        "user_id": str(user_id),
+        "kind": kind,
+        "source": "telegram_webapp",
+    }
+
+    if kind == "subscription":
+        plan = SUBSCRIPTION_PLANS.get(plan_id or "")
+        if not plan:
+            raise HTTPException(status_code=400, detail="Unknown subscription plan")
+        rub = int(plan["price_rub"])
+        title = f"Подписка: {plan['title']}"
+        description = f"Оплата подписки «{plan['title']}»"
+        metadata["plan_id"] = plan_id
+    elif kind == "payg_topup":
+        if rub not in PAYG_TOPUPS_RUB:
+            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
+        title = f"PAYG пополнение: {rub}₽"
+        description = f"Пополнение PAYG баланса на {rub}₽"
+        metadata["rub"] = str(rub)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported payment kind")
+
+    payload = {
+        "amount": {"value": _payment_amount_value(rub), "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "embedded"},
+        "description": description,
+        "metadata": metadata,
+    }
+
+    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    idem = f"widget-{user_id}-{kind}-{plan_id or rub}-{int(time.time() * 1000)}"
+    try:
+        with httpx.Client(timeout=20.0, auth=auth) as client:
+            res = client.post(
+                "https://api.yookassa.ru/v3/payments",
+                headers=_yookassa_headers(idem),
+                json=payload,
+            )
+    except Exception as exc:
+        logger.exception("YooKassa create payment failed")
+        raise HTTPException(status_code=502, detail="YooKassa create payment failed") from exc
+
+    if res.status_code >= 400:
+        logger.error("YooKassa create payment HTTP %s: %s", res.status_code, res.text)
+        raise HTTPException(status_code=502, detail="YooKassa create payment error")
+
+    data = res.json()
+    payment_id = data.get("id")
+    confirmation_token = (data.get("confirmation") or {}).get("confirmation_token")
+    if not payment_id or not confirmation_token:
+        logger.error("YooKassa create payment malformed response: %s", data)
+        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
+
+    return {
+        "ok": True,
+        "payment_id": payment_id,
+        "confirmation_token": confirmation_token,
+        "amount_rub": rub,
+        "title": title,
+    }
+
+
+def _fetch_yookassa_payment(payment_id: str) -> Dict[str, Any]:
+    _widget_guard()
+    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    try:
+        with httpx.Client(timeout=20.0, auth=auth) as client:
+            res = client.get(f"https://api.yookassa.ru/v3/payments/{payment_id}")
+    except Exception as exc:
+        logger.exception("YooKassa fetch payment failed: %s", payment_id)
+        raise HTTPException(status_code=502, detail="YooKassa status request failed") from exc
+
+    if res.status_code >= 400:
+        logger.error("YooKassa status HTTP %s for %s: %s", res.status_code, payment_id, res.text)
+        raise HTTPException(status_code=502, detail="YooKassa status request error")
+
+    return res.json()
+
+
+def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[bool, str, str]:
+    payment_id = str(payment.get("id") or "")
+    if not payment_id:
+        raise HTTPException(status_code=502, detail="Missing payment id in YooKassa response")
+
+    metadata = payment.get("metadata") or {}
+    kind = str(metadata.get("kind") or "")
+    amount_rub = int(round(float((payment.get("amount") or {}).get("value") or 0)))
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM payments WHERE provider_charge_id = ? LIMIT 1",
+            (payment_id,),
+        )
+        existed = cur.fetchone() is not None
+        if existed:
+            return False, kind or "unknown", "Платёж уже обработан ранее"
+
+        now_ts = int(time.time())
+        raw = json.dumps(payment, ensure_ascii=False)
+
+        if kind == "subscription":
+            plan_id = str(metadata.get("plan_id") or "")
+            plan = SUBSCRIPTION_PLANS.get(plan_id)
+            if not plan:
+                raise HTTPException(status_code=400, detail="Unknown subscription plan in metadata")
+
+            cur.execute("SELECT premium_until FROM users WHERE telegram_id = ?", (user_id,))
+            row = cur.fetchone()
+            premium_until = row[0] if row else None
+            new_until = _add_days_iso(premium_until, int(plan["days"]))
+
+            cur.execute(
+                "UPDATE users SET is_premium = 1, premium_until = ? WHERE telegram_id = ?",
+                (new_until, user_id),
+            )
+            if plan_id == "w1":
+                cur.execute("UPDATE users SET paid_trial_used = 1 WHERE telegram_id = ?", (user_id,))
+
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO payments
+                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+                """,
+                (user_id, now_ts, "yookassa_widget", json.dumps({"kind": kind, "plan_id": plan_id}, ensure_ascii=False), amount_rub, raw, payment_id),
+            )
+            conn.commit()
+            return True, "subscription", f"Подписка {plan['title']} активирована"
+
+        if kind == "payg_topup":
+            rub = int(metadata.get("rub") or amount_rub)
+            cur.execute(
+                "UPDATE users SET credits = COALESCE(credits,0) + ? WHERE telegram_id = ?",
+                (rub, user_id),
+            )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO payments
+                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+                """,
+                (user_id, now_ts, "yookassa_widget", json.dumps({"kind": kind, "rub": rub}, ensure_ascii=False), rub, raw, payment_id),
+            )
+            conn.commit()
+            return True, "payg_topup", f"Баланс пополнен на {rub}₽"
+
+        raise HTTPException(status_code=400, detail="Unsupported payment kind in metadata")
+    finally:
+        conn.close()
 def _safe_json_loads(value: str) -> Dict[str, Any]:
     value = (value or "").strip()
     if not value:
@@ -661,6 +871,56 @@ def _create_invoice_link(
     return str(payload.get("result") or "")
 
 
+
+
+@app.post("/api/payments/widget/create")
+def create_widget_payment(
+    body: Dict[str, Any],
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    kind = str((body or {}).get("kind") or "").strip()
+
+    if kind == "subscription":
+        plan_id = str((body or {}).get("plan_id") or "").strip()
+        if not plan_id:
+            raise HTTPException(status_code=400, detail="plan_id is required")
+        return _create_widget_payment(user_id=user_id, kind=kind, plan_id=plan_id, rub=0)
+
+    if kind == "payg_topup":
+        rub_raw = (body or {}).get("rub")
+        try:
+            rub = int(rub_raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="rub must be integer")
+        return _create_widget_payment(user_id=user_id, kind=kind, plan_id=None, rub=rub)
+
+    raise HTTPException(status_code=400, detail="Unsupported payment kind")
+
+
+@app.get("/api/payments/widget/status")
+def widget_payment_status(
+    payment_id: str = Query(..., min_length=3),
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    payment = _fetch_yookassa_payment(payment_id)
+    status = str(payment.get("status") or "unknown")
+
+    metadata = payment.get("metadata") or {}
+    if str(metadata.get("user_id") or "") != str(user_id):
+        raise HTTPException(status_code=403, detail="Payment does not belong to this user")
+
+    if status != "succeeded":
+        return {"ok": True, "status": status, "finalized": False}
+
+    finalized, effect, message = _finalize_widget_payment(user_id=user_id, payment=payment)
+    return {
+        "ok": True,
+        "status": status,
+        "finalized": True,
+        "effect": effect,
+        "message": message,
+        "already_finalized": not finalized,
+    }
 @app.get("/api/payments/invoice-link")
 def create_payment_invoice_link(
     mode: str = Query(..., description="sub|payg"),
