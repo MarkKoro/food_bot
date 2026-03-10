@@ -4580,6 +4580,34 @@ async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await show_main_menu(update, ctx, notice=notice)
 
+
+async def on_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    user = update.effective_user
+    if not msg or not user or not msg.web_app_data:
+        return
+
+    raw = msg.web_app_data.data or ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logging.warning("Invalid web_app_data payload: %s", raw)
+        return
+
+    if data.get("type") != "webapp_widget_paid":
+        return
+
+    kind = (data.get("kind") or "").strip()
+    message = (data.get("message") or "").strip()
+    if not message:
+        if kind == "subscription":
+            message = "✅ Поздравляем! Подписка успешно оплачена."
+        else:
+            rub = int(data.get("rub") or 0)
+            message = f"✅ Поздравляем! Баланс пополнен на {rub}₽." if rub > 0 else "✅ Поздравляем! Баланс успешно пополнен."
+
+    await show_main_menu(update, ctx, notice=message)
+
 # ── Админ и прочее (минимальный каркас) ──────────────
 
 async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5086,6 +5114,9 @@ def main() -> None:
     application.add_handler(PreCheckoutQueryHandler(on_precheckout_query))
     application.add_handler(
         MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment)
+    )
+    application.add_handler(
+        MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data)
     )
 
     # Фото еды
