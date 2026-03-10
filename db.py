@@ -175,6 +175,10 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "ON payments(telegram_charge_id) WHERE telegram_charge_id IS NOT NULL"
     )
     await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_charge_id "
+        "ON payments(provider_charge_id) WHERE provider_charge_id IS NOT NULL"
+    )
+    await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_payments_user_ts ON payments(user_id, ts)"
     )
     await db.commit()

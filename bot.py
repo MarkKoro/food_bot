@@ -483,22 +483,29 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_t
     return InlineKeyboardMarkup(rows)
 
 
+def build_webapp_payment_url(*, kind: str, plan_id: str | None = None, rub: int | None = None) -> str:
+    base = FOOD_WEBAPP_URL.rstrip("/") + "/"
+    params = {"screen": "payment", "kind": kind}
+    if kind == "subscription" and plan_id:
+        params["plan_id"] = plan_id
+    if kind == "payg_topup" and rub is not None:
+        params["rub"] = str(int(rub))
+    from urllib.parse import urlencode
+    return f"{base}?{urlencode(params)}"
+
+
 def kb_payg_topups():
     rows = []
-    has_card = bool(YOOKASSA_PROVIDER_TOKEN)
 
     for rub in PAYG_TOPUPS_RUB:
         stars = rub_to_stars(rub)
-
-        if has_card:
-            rows.append([
-                InlineKeyboardButton(f"💳 {rub}₽", callback_data=f"payg_buy_card:{rub}"),
-                InlineKeyboardButton(f"{stars}⭐", callback_data=f"payg_buy_stars:{rub}"),
-            ])
-        else:
-            rows.append([
-                InlineKeyboardButton(f"{stars}⭐", callback_data=f"payg_buy_stars:{rub}")
-            ])
+        rows.append([
+            InlineKeyboardButton(
+                f"💳/СБП {rub}₽",
+                web_app=WebAppInfo(url=build_webapp_payment_url(kind="payg_topup", rub=rub)),
+            ),
+            InlineKeyboardButton(f"{stars}⭐", callback_data=f"payg_buy_stars:{rub}"),
+        ])
 
     rows.append([InlineKeyboardButton("⬅ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(rows)
@@ -521,8 +528,8 @@ def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
 
         row = [
             InlineKeyboardButton(
-                f"💳 {plan.title} — {plan.price_rub}₽",
-                callback_data=f"buy_card:{plan_id}",
+                f"🧾 {plan.title} — {plan.price_rub}₽",
+                web_app=WebAppInfo(url=build_webapp_payment_url(kind="subscription", plan_id=plan_id)),
             ),
             InlineKeyboardButton(
                 f"⭐ {plan.title} — {plan.price_stars}⭐",
