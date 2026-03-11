@@ -3831,6 +3831,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await on_premium_menu(update, ctx)
     elif data == "premium_menu_stars":
         await on_premium_menu_stars(update, ctx)
+    elif data == "sub_stars:invoice_back":
+        old_invoice_id = ctx.chat_data.pop("last_invoice_message_id", None)
+        if old_invoice_id:
+            try:
+                await ctx.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=old_invoice_id,
+                )
+            except BadRequest:
+                pass
+        elif query and query.message:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+        await on_premium_menu_stars(update, ctx)
+        return
     elif data == "premium_plans":
         # Назад к списку всех тарифов (из любого места)
         if query and query.message:
@@ -4100,7 +4117,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     invoice_keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Оплатить подписку ⭐", pay=True)],
-            [InlineKeyboardButton("← Назад", callback_data="premium_menu_stars")],
+            [InlineKeyboardButton("← Назад", callback_data="sub_stars:invoice_back")],
         ]
     )
 
