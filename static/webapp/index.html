@@ -415,7 +415,6 @@
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="https://yookassa.ru/checkout-widget/v1/checkout-widget.js"></script>
   </head>
   <body>
     <div id="drawer-backdrop" class="backdrop"></div>
@@ -552,10 +551,10 @@
             <h3 id="payment-amount">Сумма: —</h3>
             <p id="payment-kind" class="plan-description"></p>
             <div class="pay-actions">
-              <button class="pill pill-primary" id="btn-widget-pay">Оплатить</button>
+              <button class="pill pill-primary" id="btn-prepare-payment">Подготовить оплату</button>
+              <button class="pill pill-secondary" id="btn-open-payment" style="display:none;">Открыть оплату в браузере</button>
             </div>
             <div id="payment-status" class="hint"></div>
-            <div id="payment-widget-container"></div>
           </div>
         </div>
       </section>
@@ -738,8 +737,8 @@
       const paymentAmountEl = document.getElementById("payment-amount");
       const paymentKindEl = document.getElementById("payment-kind");
       const paymentStatusEl = document.getElementById("payment-status");
-      const btnWidgetPay = document.getElementById("btn-widget-pay");
-      const paymentWidgetContainer = document.getElementById("payment-widget-container");
+      const btnPreparePayment = document.getElementById("btn-prepare-payment");
+      const btnOpenPayment = document.getElementById("btn-open-payment");
       const paymentSuccessModal = document.getElementById("payment-success-modal");
       const paymentSuccessText = document.getElementById("payment-success-text");
       const paymentSuccessOk = document.getElementById("payment-success-ok");
@@ -774,6 +773,17 @@
 
 
 
+      const PENDING_KEYS = {
+        paymentId: "pending_payment_id",
+        kind: "pending_payment_kind",
+        planId: "pending_payment_plan_id",
+        rub: "pending_payment_rub",
+        createdAt: "pending_payment_created_at",
+        projectKey: "pending_project_key",
+        confirmationUrl: "pending_confirmation_url",
+      };
+      let currentProjectKey = "";
+
       function paymentQueryConfig() {
         const params = new URLSearchParams(location.search);
         if (params.get("screen") !== "payment") return null;
@@ -796,68 +806,43 @@
         if (cfg.kind === "subscription") {
           const map = { w1: ["Одна неделя", 125], m1: ["1 месяц", 399], m3: ["3 месяца", 1000], m6: ["6 месяцев", 1800], y1: ["1 год", 3500] };
           const val = map[cfg.plan_id] || [cfg.plan_id, 0];
-          return { title: `Подписка ${val[0]}`, amount: `${val[1]} ₽`, description: "Оплата подписки через YooKassa Widget" };
+          return { title: `Подписка ${val[0]}`, amount: `${val[1]} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
         }
-        return { title: "Пополнение PAYG", amount: `${cfg.rub} ₽`, description: "Пополнение баланса PAYG через YooKassa Widget" };
+        return { title: "Пополнение PAYG", amount: `${cfg.rub} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
       }
 
-      async function pollWidgetStatus(paymentId) {
-        for (let i = 0; i < 8; i += 1) {
-          const status = await fetchJson(`/api/payments/widget/status?payment_id=${encodeURIComponent(paymentId)}`);
-          if (status?.status === "succeeded" && status?.finalized) {
-            return { ok: true, message: status?.message || "Оплата успешно завершена" };
-          }
-          if (status?.status === "canceled") {
-            return { ok: false, message: "Оплата отменена" };
-          }
-          await sleep(1500);
-        }
-        return { ok: false, timeout: true, message: "Статус ещё обновляется, проверь чуть позже" };
+      function savePendingPayment(data) {
+        if (!data?.payment_id) return;
+        localStorage.setItem(PENDING_KEYS.paymentId, String(data.payment_id));
+        localStorage.setItem(PENDING_KEYS.kind, String(data.kind || ""));
+        localStorage.setItem(PENDING_KEYS.planId, String(data.plan_id || ""));
+        localStorage.setItem(PENDING_KEYS.rub, String(data.rub || ""));
+        localStorage.setItem(PENDING_KEYS.createdAt, String(data.created_at || Date.now()));
+        localStorage.setItem(PENDING_KEYS.projectKey, String(data.project_key || ""));
+        localStorage.setItem(PENDING_KEYS.confirmationUrl, String(data.confirmation_url || ""));
       }
 
-      function paymentSuccessMessage(config) {
-        if (config?.kind === "subscription") {
-          const map = { w1: ["1 неделю", 125], m1: ["1 месяц", 399], m3: ["3 месяца", 1000], m6: ["6 месяцев", 1800], y1: ["1 год", 3500] };
-          const [title, rub] = map[config?.plan_id] || ["выбранный период", 0];
-          return rub
-            ? `Поздравляем! Вы оформили подписку на ${title} за ${rub} ₽.`
-            : `Поздравляем! Вы оформили подписку на ${title}.`;
-        }
-        return `Поздравляем! Вы пополнили баланс на ${config?.rub || 0} ₽.`;
+      function readPendingPayment() {
+        const payment_id = localStorage.getItem(PENDING_KEYS.paymentId);
+        if (!payment_id) return null;
+        return {
+          payment_id,
+          kind: localStorage.getItem(PENDING_KEYS.kind) || "",
+          plan_id: localStorage.getItem(PENDING_KEYS.planId) || "",
+          rub: localStorage.getItem(PENDING_KEYS.rub) || "",
+          created_at: localStorage.getItem(PENDING_KEYS.createdAt) || "",
+          project_key: localStorage.getItem(PENDING_KEYS.projectKey) || "",
+          confirmation_url: localStorage.getItem(PENDING_KEYS.confirmationUrl) || "",
+        };
       }
 
-      function notifyBotPaymentSuccess(config, message) {
-        if (!tg?.sendData) return;
-        try {
-          tg.sendData(JSON.stringify({
-            type: "webapp_widget_paid",
-            kind: config?.kind,
-            plan_id: config?.plan_id || null,
-            rub: config?.rub || null,
-            message,
-          }));
-        } catch (_) {}
+      function clearPendingPayment() {
+        Object.values(PENDING_KEYS).forEach((k) => localStorage.removeItem(k));
+        if (btnOpenPayment) btnOpenPayment.style.display = "none";
       }
 
-      async function handleWidgetSuccess(config, { closeOnSuccess = false } = {}) {
-        const message = paymentSuccessMessage(config);
-        if (closeOnSuccess) {
-          notifyBotPaymentSuccess(config, message);
-          await sleep(500);
-          try { tg?.close?.(); } catch (_) {}
-          return;
-        }
-
-        if (paymentSuccessText) paymentSuccessText.textContent = message;
-        setModalOpen(subModal, false);
-        setModalOpen(paygModal, false);
-        setModalOpen(paymentSuccessModal, true);
-      }
-
-      async function startWidgetPayment(config, options = {}) {
-        if (!config) return;
-        if (paymentStatusEl) paymentStatusEl.textContent = "Создаём платёж...";
-        const created = await fetch(`/api/payments/widget/create`, {
+      async function createRedirectPayment(config) {
+        const created = await fetch(`/api/payments/redirect/create`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -868,45 +853,77 @@
           if (!r.ok) throw new Error(await r.text());
           return r.json();
         });
-
-        const token = created?.confirmation_token;
-        const paymentId = created?.payment_id;
-        if (!token || !paymentId) throw new Error("Не удалось получить токен оплаты");
-
-        const checkout = new window.YooMoneyCheckoutWidget({
-          confirmation_token: token,
-          customization: { modal: true },
-          error_callback: function() {
-            if (paymentStatusEl) paymentStatusEl.textContent = "Не удалось открыть виджет оплаты";
-          },
-        });
-
-        let completed = false;
-        checkout.on("complete", async () => {
-          completed = true;
-          checkout.destroy();
-          if (paymentStatusEl) paymentStatusEl.textContent = "Проверяем статус оплаты...";
-          const result = await pollWidgetStatus(paymentId);
-          if (paymentStatusEl) paymentStatusEl.textContent = result.message;
-          if (result.ok) {
-            await handleWidgetSuccess(config, options);
-          }
-        });
-
-        checkout.on("modal_close", () => {
-          if (!completed && paymentStatusEl) {
-            paymentStatusEl.textContent = "Окно оплаты закрыто. Оплата не завершена.";
-          }
-        });
-
-        if (paymentWidgetContainer) paymentWidgetContainer.innerHTML = "";
-        checkout.render("#payment-widget-container");
-        setTimeout(() => {
-          if (!completed && paymentStatusEl && !paymentStatusEl.textContent.includes("Проверяем")) {
-            paymentStatusEl.textContent = "Если вы закрыли окно, оплата не завершена";
-          }
-        }, 1200);
+        return created;
       }
+
+      function openExternalPayment(url) {
+        if (!url) return;
+        try {
+          if (tg?.openLink) {
+            tg.openLink(url);
+            return;
+          }
+        } catch (_) {}
+        window.open(url, "_blank");
+      }
+
+      async function checkPendingPaymentStatus({ silent = false } = {}) {
+        const pending = readPendingPayment();
+        if (!pending?.payment_id) return;
+        if (pending.project_key && currentProjectKey && pending.project_key !== currentProjectKey) return;
+
+        try {
+          const status = await fetchJson(`/api/payments/yookassa/status?payment_id=${encodeURIComponent(pending.payment_id)}`);
+          const st = String(status?.status || "unknown");
+          if (st === "succeeded" && status?.finalized) {
+            const msg = pending.kind === "subscription"
+              ? "Поздравляем! Подписка успешно активирована."
+              : `Поздравляем! Баланс пополнен на ${pending.rub || 0} ₽.`;
+            if (paymentSuccessText) paymentSuccessText.textContent = msg;
+            setModalOpen(paymentSuccessModal, true);
+            clearPendingPayment();
+            if (paymentStatusEl) paymentStatusEl.textContent = "Оплата подтверждена ✅";
+            return;
+          }
+          if (st === "canceled") {
+            clearPendingPayment();
+            if (paymentStatusEl) paymentStatusEl.textContent = "Оплата отменена.";
+            return;
+          }
+          if (!silent && paymentStatusEl) {
+            paymentStatusEl.textContent = "Платёж ещё обрабатывается.";
+          }
+        } catch (err) {
+          if (!silent && paymentStatusEl) {
+            paymentStatusEl.textContent = "Не удалось проверить статус платежа.";
+          }
+        }
+      }
+
+      async function startRedirectPayment(config) {
+        if (!config) return;
+        if (paymentStatusEl) paymentStatusEl.textContent = "Подготавливаем счёт...";
+        const created = await createRedirectPayment(config);
+        const confirmationUrl = created?.confirmation_url;
+        const paymentId = created?.payment_id;
+        if (!confirmationUrl || !paymentId) throw new Error("Не удалось подготовить счёт");
+
+        savePendingPayment({
+          payment_id: paymentId,
+          confirmation_url: confirmationUrl,
+          kind: config.kind,
+          plan_id: config.plan_id || "",
+          rub: config.rub || "",
+          created_at: Date.now(),
+          project_key: created.project_key || currentProjectKey,
+        });
+        if (btnOpenPayment) {
+          btnOpenPayment.style.display = "inline-flex";
+          btnOpenPayment.dataset.confirmationUrl = confirmationUrl;
+        }
+        if (paymentStatusEl) paymentStatusEl.textContent = "Счёт подготовлен. Теперь откройте оплату в браузере.";
+      }
+
       async function openInWebappWidget(config) {
         try {
           if (config?.kind === "subscription") {
@@ -916,10 +933,12 @@
             paygLoading.style.display = "block";
           }
 
-          await startWidgetPayment(config);
+          await startRedirectPayment(config);
+          const pending = readPendingPayment();
+          openExternalPayment(pending?.confirmation_url || "");
         } catch (err) {
           console.error(err);
-          const cleanMessage = String(err?.message || "Не удалось открыть оплату. Попробуйте ещё раз.").replace(/^HTTP \d+:\s*/, "");
+          const cleanMessage = String(err?.message || "Не удалось подготовить оплату. Попробуйте ещё раз.").replace(/^HTTP \d+:\s*/, "");
           if (paymentStatusEl) paymentStatusEl.textContent = cleanMessage;
           alert(cleanMessage);
         } finally {
@@ -942,7 +961,6 @@
           }
         }
       }
-
       // --- режимы ---
       function setActiveMode(mode) {
         activeMode = mode;
@@ -1518,24 +1536,40 @@ function setActiveAnalyticsPreset(range) {
           return;
         }
 
+        try {
+          const cfg = await fetchJson("/api/config");
+          currentProjectKey = String(cfg?.project_key || "");
+        } catch (_) {}
+
         if (queryPayment) {
           const desc = describePaymentConfig(queryPayment);
           paymentTitleEl.textContent = desc.title;
           paymentAmountEl.textContent = `Сумма: ${desc.amount}`;
           paymentDescriptionEl.textContent = desc.description;
-          paymentKindEl.textContent = queryPayment.kind === "subscription" ? "Тариф будет активирован сразу после подтверждения оплаты." : "Баланс PAYG пополнится после подтверждения оплаты.";
+          paymentKindEl.textContent = queryPayment.kind === "subscription"
+            ? "После оплаты подписка активируется автоматически."
+            : "После оплаты баланс PAYG пополнится автоматически.";
           forcePaymentScreen = true;
-          btnWidgetPay?.addEventListener("click", async () => {
-            btnWidgetPay.disabled = true;
+          btnPreparePayment?.addEventListener("click", async () => {
+            btnPreparePayment.disabled = true;
             try {
-              await startWidgetPayment(queryPayment, { closeOnSuccess: true });
+              await startRedirectPayment(queryPayment);
             } catch (err) {
               paymentStatusEl.textContent = String(err?.message || "Ошибка оплаты").replace(/^HTTP \d+:\s*/, "");
             } finally {
-              btnWidgetPay.disabled = false;
+              btnPreparePayment.disabled = false;
             }
           });
+          btnOpenPayment?.addEventListener("click", () => {
+            const pending = readPendingPayment();
+            openExternalPayment(btnOpenPayment.dataset.confirmationUrl || pending?.confirmation_url || "");
+          });
         }
+
+        document.addEventListener("visibilitychange", () => {
+          if (!document.hidden) checkPendingPaymentStatus({ silent: false });
+        });
+        window.addEventListener("focus", () => checkPendingPaymentStatus({ silent: false }));
 
         setActiveMode("today");
         showScreen(forcePaymentScreen ? "payment" : "today");
@@ -1544,6 +1578,7 @@ function setActiveAnalyticsPreset(range) {
         await loadDay("today");
         await loadHistory();
         await loadAdvancedStats("7d");
+        await checkPendingPaymentStatus({ silent: true });
       })();
     </script>
   </body>
