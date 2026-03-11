@@ -22,6 +22,16 @@ YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN")
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "").strip()
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "").strip()
 YOOKASSA_WIDGET_ENABLED = os.getenv("YOOKASSA_WIDGET_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+PROJECT_KEY = os.getenv("PROJECT_KEY", "food_bot").strip() or "food_bot"
+WEBAPP_PUBLIC_PATH = os.getenv("WEBAPP_PUBLIC_PATH", "/webapp").strip() or "/webapp"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()
+PAYMENTS_EXTERNAL_ONLY = os.getenv("PAYMENTS_EXTERNAL_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+YOOKASSA_RETURN_URL = os.getenv("YOOKASSA_RETURN_URL", "").strip()
+if not YOOKASSA_RETURN_URL:
+    YOOKASSA_RETURN_URL = f"{PUBLIC_BASE_URL.rstrip('/')}{WEBAPP_PUBLIC_PATH.rstrip('/')}/payment-return.html"
+if not WEBAPP_PUBLIC_PATH.startswith("/"):
+    WEBAPP_PUBLIC_PATH = "/" + WEBAPP_PUBLIC_PATH
 if not BOT_TOKEN:
     import logging
 
@@ -51,7 +61,7 @@ app.add_middleware(
 )
 
 app.mount(
-    "/webapp",
+    WEBAPP_PUBLIC_PATH,
     StaticFiles(directory="static/webapp", html=True),
     name="webapp",
 )
@@ -138,6 +148,14 @@ def _widget_guard() -> None:
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         logger.error("YooKassa widget misconfigured: missing shop credentials")
         raise HTTPException(status_code=503, detail="YooKassa Widget is not configured")
+
+
+def _yookassa_guard() -> None:
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        logger.error("YooKassa misconfigured: missing shop credentials")
+        raise HTTPException(status_code=503, detail="YooKassa is not configured")
+    if not YOOKASSA_RETURN_URL:
+        raise HTTPException(status_code=503, detail="YooKassa return URL is not configured")
 
 
 def _yookassa_headers(idempotence_key: Optional[str] = None) -> Dict[str, str]:
@@ -233,8 +251,80 @@ def _create_widget_payment(user_id: int, kind: str, plan_id: Optional[str], rub:
     }
 
 
+def _create_redirect_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int) -> Dict[str, Any]:
+    _yookassa_guard()
+
+    title = ""
+    description = ""
+    metadata: Dict[str, Any] = {
+        "project_key": PROJECT_KEY,
+        "bot_username": BOT_USERNAME,
+        "user_id": str(user_id),
+        "kind": kind,
+        "source": "telegram_webapp",
+    }
+
+    if kind == "subscription":
+        plan = SUBSCRIPTION_PLANS.get(plan_id or "")
+        if not plan:
+            raise HTTPException(status_code=400, detail="Unknown subscription plan")
+        rub = int(plan["price_rub"])
+        title = f"Подписка: {plan['title']}"
+        description = f"Оплата подписки «{plan['title']}»"
+        metadata["plan_id"] = str(plan_id)
+    elif kind == "payg_topup":
+        if rub not in PAYG_TOPUPS_RUB:
+            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
+        title = f"PAYG пополнение: {rub}₽"
+        description = f"Пополнение PAYG баланса на {rub}₽"
+        metadata["rub"] = str(rub)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported payment kind")
+
+    payload = {
+        "amount": {"value": _payment_amount_value(rub), "currency": "RUB"},
+        "capture": True,
+        "confirmation": {"type": "redirect", "return_url": YOOKASSA_RETURN_URL},
+        "description": description,
+        "metadata": metadata,
+    }
+
+    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
+    idem = f"redirect-{PROJECT_KEY}-{user_id}-{kind}-{plan_id or rub}-{int(time.time() * 1000)}"
+    try:
+        with httpx.Client(timeout=20.0, auth=auth) as client:
+            res = client.post(
+                "https://api.yookassa.ru/v3/payments",
+                headers=_yookassa_headers(idem),
+                json=payload,
+            )
+    except Exception as exc:
+        logger.exception("YooKassa create redirect payment failed")
+        raise HTTPException(status_code=502, detail="YooKassa create payment failed") from exc
+
+    if res.status_code >= 400:
+        logger.error("YooKassa create redirect payment HTTP %s: %s", res.status_code, res.text)
+        raise HTTPException(status_code=502, detail="YooKassa create payment error")
+
+    data = res.json()
+    payment_id = data.get("id")
+    confirmation_url = (data.get("confirmation") or {}).get("confirmation_url")
+    if not payment_id or not confirmation_url:
+        logger.error("YooKassa create redirect malformed response: %s", data)
+        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
+
+    return {
+        "ok": True,
+        "payment_id": payment_id,
+        "confirmation_url": confirmation_url,
+        "amount_rub": rub,
+        "title": title,
+        "project_key": PROJECT_KEY,
+    }
+
+
 def _fetch_yookassa_payment(payment_id: str) -> Dict[str, Any]:
-    _widget_guard()
+    _yookassa_guard()
     auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
     try:
         with httpx.Client(timeout=20.0, auth=auth) as client:
@@ -256,6 +346,8 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
         raise HTTPException(status_code=502, detail="Missing payment id in YooKassa response")
 
     metadata = payment.get("metadata") or {}
+    if str(metadata.get("project_key") or "") != PROJECT_KEY:
+        return False, "foreign_project", "Платёж относится к другому проекту"
     kind = str(metadata.get("kind") or "")
     amount_rub = int(round(float((payment.get("amount") or {}).get("value") or 0)))
 
@@ -832,7 +924,9 @@ def stats_advanced(
 @app.get("/api/config")
 def api_config() -> Dict[str, Any]:
     return {
-        "bot_username": os.getenv("BOT_USERNAME", ""),
+        "bot_username": BOT_USERNAME,
+        "project_key": PROJECT_KEY,
+        "payments_external_only": PAYMENTS_EXTERNAL_ONLY,
     }
 
 
@@ -873,11 +967,76 @@ def _create_invoice_link(
 
 
 
+
+
+@app.post("/api/payments/redirect/create")
+def create_redirect_payment(
+    body: Dict[str, Any],
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    kind = str((body or {}).get("kind") or "").strip()
+
+    if kind == "subscription":
+        plan_id = str((body or {}).get("plan_id") or "").strip()
+        if not plan_id:
+            raise HTTPException(status_code=400, detail="plan_id is required")
+        return _create_redirect_payment(user_id=user_id, kind=kind, plan_id=plan_id, rub=0)
+
+    if kind == "payg_topup":
+        rub_raw = (body or {}).get("rub")
+        try:
+            rub = int(rub_raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="rub must be integer")
+        return _create_redirect_payment(user_id=user_id, kind=kind, plan_id=None, rub=rub)
+
+    raise HTTPException(status_code=400, detail="Unsupported payment kind")
+
+
+@app.get("/api/payments/yookassa/status")
+def yookassa_payment_status(
+    payment_id: str = Query(..., min_length=3),
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    payment = _fetch_yookassa_payment(payment_id)
+    status = str(payment.get("status") or "unknown")
+
+    metadata = payment.get("metadata") or {}
+    if str(metadata.get("user_id") or "") != str(user_id):
+        raise HTTPException(status_code=403, detail="Payment does not belong to this user")
+
+    payment_project_key = str(metadata.get("project_key") or "")
+    if payment_project_key != PROJECT_KEY:
+        return {
+            "ok": True,
+            "status": status,
+            "finalized": False,
+            "project_key": PROJECT_KEY,
+            "message": "Платёж относится к другому проекту",
+        }
+
+    if status != "succeeded":
+        return {"ok": True, "status": status, "finalized": False, "project_key": PROJECT_KEY}
+
+    finalized, effect, message = _finalize_widget_payment(user_id=user_id, payment=payment)
+    return {
+        "ok": True,
+        "status": status,
+        "finalized": effect != "foreign_project",
+        "effect": effect,
+        "message": message,
+        "project_key": PROJECT_KEY,
+        "already_finalized": not finalized,
+    }
 @app.post("/api/payments/widget/create")
 def create_widget_payment(
     body: Dict[str, Any],
     user_id: int = Depends(get_verified_user_id),
 ) -> Dict[str, Any]:
+    # deprecated: redirect flow is the primary RUB path
+    if PAYMENTS_EXTERNAL_ONLY:
+        raise HTTPException(status_code=410, detail="Deprecated: use /api/payments/redirect/create")
+
     kind = str((body or {}).get("kind") or "").strip()
 
     if kind == "subscription":
