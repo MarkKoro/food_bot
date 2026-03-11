@@ -867,6 +867,19 @@
         window.open(url, "_blank");
       }
 
+      function notifyBotAboutWebappPayment(kind, payload = {}) {
+        try {
+          if (!tg?.sendData) return;
+          tg.sendData(JSON.stringify({
+            type: "webapp_widget_paid",
+            kind,
+            ...payload,
+          }));
+        } catch (err) {
+          console.warn("Telegram WebApp sendData error", err);
+        }
+      }
+
       async function checkPendingPaymentStatus({ silent = false } = {}) {
         const pending = readPendingPayment();
         if (!pending?.payment_id) return;
@@ -879,6 +892,11 @@
             const msg = pending.kind === "subscription"
               ? "Поздравляем! Подписка успешно активирована."
               : `Поздравляем! Баланс пополнен на ${pending.rub || 0} ₽.`;
+            notifyBotAboutWebappPayment(pending.kind, {
+              rub: Number(pending.rub || 0),
+              payment_id: String(pending.payment_id || ""),
+              message: msg,
+            });
             if (paymentSuccessText) paymentSuccessText.textContent = msg;
             setModalOpen(paymentSuccessModal, true);
             clearPendingPayment();

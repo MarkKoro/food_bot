@@ -521,25 +521,47 @@ def payg_topups_text() -> str:
     )
 
 
-def kb_premium_plans(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
-    buttons = []
+def _available_subscription_plans(*, paid_trial_used: bool) -> list[tuple[str, SubscriptionPlan]]:
+    plans: list[tuple[str, SubscriptionPlan]] = []
     for plan_id, plan in SUB_PLANS.items():
         if plan_id == "w1" and paid_trial_used:
             continue
+        plans.append((plan_id, plan))
+    return plans
 
-        row = [
-            InlineKeyboardButton(
-                f"🧾 {plan.title} — {plan.price_rub}₽",
-                web_app=WebAppInfo(url=build_webapp_payment_url(kind="subscription", plan_id=plan_id)),
-            ),
-            InlineKeyboardButton(
-                f"⭐ {plan.title} — {plan.price_stars}⭐",
-                callback_data=f"buy_stars:{plan_id}",
-            ),
-        ]
-        buttons.append(row)
 
+def kb_premium_plans_rub(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    for plan_id, plan in _available_subscription_plans(paid_trial_used=paid_trial_used):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"🧾 {plan.title} — {plan.price_rub}₽",
+                    web_app=WebAppInfo(
+                        url=build_webapp_payment_url(kind="subscription", plan_id=plan_id)
+                    ),
+                )
+            ]
+        )
+
+    buttons.append([InlineKeyboardButton("⭐ Купить за звезды", callback_data="premium_menu_stars")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="pay_mode")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def kb_premium_plans_stars(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    for plan_id, plan in _available_subscription_plans(paid_trial_used=paid_trial_used):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"⭐ {plan.title} — {plan.price_stars}⭐",
+                    callback_data=f"buy_stars:{plan_id}",
+                )
+            ]
+        )
+
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="premium_menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1183,7 +1205,7 @@ async def require_access(
             await log_request(db, user_id, kind)
         return "trial"
 
-    kb = kb_premium_plans(paid_trial_used=bool(paid_trial_used))
+    kb = kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used))
 
     if trial_until and trial_until <= now:
         text = (
@@ -1222,7 +1244,7 @@ async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool
         "Хочешь оформить подписку?"
     )
     await edit_menu_message(
-        update, ctx, text, kb_premium_plans(paid_trial_used=bool(paid_trial_used))
+        update, ctx, text, kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used))
     )
     return False
 
@@ -3807,6 +3829,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_settings(update, ctx)
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
+    elif data == "premium_menu_stars":
+        await on_premium_menu_stars(update, ctx)
     elif data == "premium_plans":
         # Назад к списку всех тарифов (из любого места)
         if query and query.message:
@@ -3976,10 +4000,29 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Оплата Stars остаётся отдельным способом внутри Telegram.\n\n"
         "Есть одноразовый вариант «Одна неделя» (если ещё не покупал), "
         "и обычные подписки.\n\n"
+        "Выбери тариф в рублях:"
+    )
+    await edit_menu_message(
+        update, ctx, text, kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used))
+    )
+
+
+async def on_premium_menu_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db = get_db(ctx)
+    user_id = update.effective_user.id
+
+    _, _, paid_trial_used = await get_trial_info(db, user_id)
+
+    text = (
+        "⭐ Подписка за звёзды\n\n"
+        "Здесь доступны те же тарифы, но оплата проходит внутри Telegram Stars.\n\n"
         "Выбери тариф:"
     )
     await edit_menu_message(
-        update, ctx, text, kb_premium_plans(paid_trial_used=bool(paid_trial_used))
+        update,
+        ctx,
+        text,
+        kb_premium_plans_stars(paid_trial_used=bool(paid_trial_used)),
     )
 
 
@@ -4022,7 +4065,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
             ctx,
             "⛔️ Тариф «Одна неделя» доступен только один раз.\n\n"
             "Выбери обычную подписку:",
-            kb_premium_plans(paid_trial_used=True),
+            kb_premium_plans_stars(paid_trial_used=True),
         )
         return
 
@@ -4057,7 +4100,7 @@ async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     invoice_keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Оплатить подписку ⭐", pay=True)],
-            [InlineKeyboardButton("← Назад", callback_data="premium_plans")],
+            [InlineKeyboardButton("← Назад", callback_data="premium_menu_stars")],
         ]
     )
 
@@ -4317,7 +4360,7 @@ async def send_subscription_invoice_for_plan(
             _, _, paid_trial_used = await get_trial_info(db, update.effective_user.id)
             await update.callback_query.edit_message_text(
                 "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
-                reply_markup=kb_premium_plans(paid_trial_used=bool(paid_trial_used)),
+                reply_markup=kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used)),
             )
         else:
             await update.effective_chat.send_message(
