@@ -187,6 +187,7 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "receipt_status": "TEXT DEFAULT 'pending'",
         "receipt_sent_at": "TEXT",
         "receipt_note": "TEXT",
+        "wants_receipt": "INTEGER DEFAULT 0",
     }
     for col, definition in required_pcols.items():
         if col not in pcols:
@@ -1161,8 +1162,8 @@ async def list_rub_receipt_payments(
         where.append("COALESCE(receipt_status, 'pending') = 'pending'")
     elif filter_key == "receipt_sent":
         where.append("COALESCE(receipt_status, 'pending') = 'sent'")
-    elif filter_key == "ready":
-        where.append("COALESCE(receipt_email, '') <> ''")
+    elif filter_key == "wants_receipt":
+        where.append("COALESCE(wants_receipt, 0) = 1")
         where.append("COALESCE(receipt_status, 'pending') = 'pending'")
 
     sql = f"""
@@ -1171,7 +1172,8 @@ async def list_rub_receipt_payments(
                payment_created_at, payment_succeeded_at, project_key,
                receipt_email, COALESCE(receipt_email_status, 'missing') AS receipt_email_status,
                receipt_email_source, receipt_email_collected_at,
-               COALESCE(receipt_status, 'pending') AS receipt_status, receipt_sent_at, receipt_note
+               COALESCE(receipt_status, 'pending') AS receipt_status, receipt_sent_at, receipt_note,
+               COALESCE(wants_receipt, 0) AS wants_receipt
         FROM payments
         WHERE {' AND '.join(where)}
         ORDER BY COALESCE(payment_succeeded_at, datetime(ts, 'unixepoch')) DESC, id DESC
@@ -1201,6 +1203,7 @@ async def list_rub_receipt_payments(
             "receipt_status": row[16],
             "receipt_sent_at": row[17],
             "receipt_note": row[18],
+            "wants_receipt": int(row[19] or 0),
         })
     return result
 
