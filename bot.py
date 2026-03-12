@@ -932,12 +932,20 @@ async def edit_menu_message(
         except BadRequest:
             pass
 
-    msg = await ctx.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-    )
+    try:
+        msg = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    except BadRequest as e:
+        logger.warning("send_message Markdown fallback in edit_menu_message: %s", e)
+        msg = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
     if msg_id:
         try:
             await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
@@ -962,12 +970,20 @@ async def send_new_menu_message(
     if uid and not old_id:
         old_id = await get_last_menu_message_id(db, uid)
 
-    msg = await ctx.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
-    )
+    try:
+        msg = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    except BadRequest as e:
+        logger.warning("send_message Markdown fallback in send_new_menu_message: %s", e)
+        msg = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
 
     if old_id:
         try:
