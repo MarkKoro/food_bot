@@ -674,6 +674,23 @@
       </div>
     </div>
 
+    <div id="email-required-modal" class="pay-modal" aria-hidden="true">
+      <div class="pay-modal-card">
+        <div class="pay-modal-header">
+          <h3>📩 Email для чека</h3>
+          <button class="pay-modal-close" id="email-required-close" aria-label="Закрыть">×</button>
+        </div>
+        <p class="pay-modal-note">Перед оплатой нужен email для отправки чека. Введите его один раз — дальше сможете оплачивать без этого шага.</p>
+        <div class="email-collect-row">
+          <input id="email-required-input" class="email-input" type="email" placeholder="example@mail.com" autocomplete="email" />
+        </div>
+        <div id="email-required-error" class="field-error"></div>
+        <div class="pay-actions">
+          <button class="pill pill-primary" id="email-required-save">Сохранить и продолжить</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       const tg = window.Telegram?.WebApp;
       tg?.ready?.();
@@ -777,6 +794,11 @@
       const paymentSuccessModal = document.getElementById("payment-success-modal");
       const paymentSuccessText = document.getElementById("payment-success-text");
       const paymentSuccessOk = document.getElementById("payment-success-ok");
+      const emailRequiredModal = document.getElementById("email-required-modal");
+      const emailRequiredClose = document.getElementById("email-required-close");
+      const emailRequiredInput = document.getElementById("email-required-input");
+      const emailRequiredError = document.getElementById("email-required-error");
+      const emailRequiredSave = document.getElementById("email-required-save");
       const emailCollectCard = document.getElementById("email-collect-card");
       const emailInput = document.getElementById("receipt-email-input");
       const emailError = document.getElementById("email-error");
@@ -785,6 +807,7 @@
       const emailSavedCaption = document.getElementById("email-saved-caption");
       const emailInputRow = document.getElementById("email-input-row");
       const emailEditRow = document.getElementById("email-edit-row");
+      let deferredPaymentConfig = null;
 
       let receiptEmailState = { ready: false, email: "", status: "missing" };
 
@@ -946,6 +969,31 @@
         syncPaymentEmailGate();
       }
 
+      async function saveReceiptEmail(email) {
+        await fetch("/api/payments/receipt-email", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
+          },
+          body: JSON.stringify({ email }),
+        }).then(async (r) => {
+          if (!r.ok) throw new Error(await r.text());
+          return r.json();
+        });
+        await fetchReceiptEmail();
+      }
+
+      function requestEmailBeforePayment(config) {
+        deferredPaymentConfig = config;
+        if (emailRequiredInput) {
+          emailRequiredInput.value = receiptEmailState.email || String(emailInput?.value || "").trim();
+          emailRequiredInput.focus({ preventScroll: true });
+        }
+        if (emailRequiredError) emailRequiredError.textContent = "";
+        setModalOpen(emailRequiredModal, true);
+      }
+
       function openExternalPayment(url) {
         if (!url) return;
         try {
@@ -1037,6 +1085,12 @@
 
       async function openInWebappWidget(config) {
         try {
+          await fetchReceiptEmail();
+          if (!receiptEmailState.ready) {
+            requestEmailBeforePayment(config);
+            return;
+          }
+
           if (config?.kind === "subscription") {
             if (subLoading) subLoading.style.display = "block";
             if (subSuccess) subSuccess.style.display = "block";
@@ -1629,22 +1683,44 @@ function setActiveAnalyticsPreset(range) {
         if (emailError) emailError.textContent = "";
         btnSaveEmail.disabled = true;
         try {
-          await fetch("/api/payments/receipt-email", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
-            },
-            body: JSON.stringify({ email }),
-          }).then(async (r) => {
-            if (!r.ok) throw new Error(await r.text());
-            return r.json();
-          });
-          await fetchReceiptEmail();
+          await saveReceiptEmail(email);
         } catch (err) {
           if (emailError) emailError.textContent = String(err?.message || "Не удалось сохранить email").replace(/^HTTP \d+:\s*/, "");
         } finally {
           btnSaveEmail.disabled = false;
+        }
+      });
+      emailRequiredClose?.addEventListener("click", () => {
+        setModalOpen(emailRequiredModal, false);
+        deferredPaymentConfig = null;
+      });
+      emailRequiredModal?.addEventListener("click", (e) => {
+        if (e.target !== emailRequiredModal) return;
+        setModalOpen(emailRequiredModal, false);
+        deferredPaymentConfig = null;
+      });
+      emailRequiredSave?.addEventListener("click", async () => {
+        const email = String(emailRequiredInput?.value || "").trim();
+        if (!validateEmail(email)) {
+          if (emailRequiredError) emailRequiredError.textContent = "Введите корректный email.";
+          emailRequiredInput?.focus({ preventScroll: true });
+          return;
+        }
+        if (emailRequiredError) emailRequiredError.textContent = "";
+        emailRequiredSave.disabled = true;
+        try {
+          await saveReceiptEmail(email);
+          if (emailInput) emailInput.value = email;
+          setModalOpen(emailRequiredModal, false);
+          const nextConfig = deferredPaymentConfig;
+          deferredPaymentConfig = null;
+          if (nextConfig) await openInWebappWidget(nextConfig);
+        } catch (err) {
+          if (emailRequiredError) {
+            emailRequiredError.textContent = String(err?.message || "Не удалось сохранить email").replace(/^HTTP \d+:\s*/, "");
+          }
+        } finally {
+          emailRequiredSave.disabled = false;
         }
       });
       btnChangeEmail?.addEventListener("click", () => {
