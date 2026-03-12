@@ -3906,7 +3906,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "stats":
         await show_stats(update, ctx)
     elif data == "admin:paychecks":
-        ctx.user_data["paychecks_filter"] = "ready"
+        ctx.user_data["paychecks_filter"] = "wants_receipt"
         ctx.user_data["paychecks_index"] = 0
         await _show_paychecks_view(update, ctx, reset_index=True)
     elif data.startswith("paychecks:filter:"):
@@ -4471,7 +4471,7 @@ PAYCHECK_FILTERS = [
     ("with_email", "С email"),
     ("receipt_pending", "Чек не отправлен"),
     ("receipt_sent", "Чек отправлен"),
-    ("ready", "Готово к чеку"),
+    ("wants_receipt", "Хочет чека"),
 ]
 
 
@@ -4540,7 +4540,7 @@ async def _show_paychecks_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *
         return
 
     db = get_db(ctx)
-    filter_key = ctx.user_data.get("paychecks_filter", "ready")
+    filter_key = ctx.user_data.get("paychecks_filter", "wants_receipt")
     items = await list_rub_receipt_payments(db, filter_key=filter_key)
     if not items:
         text = f"🧾 Нет успешных RUB-платежей по фильтру: {_paychecks_filter_title(filter_key)}"
@@ -4570,7 +4570,7 @@ async def cmd_paychecks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if update.message:
             await update.message.reply_text("Нет доступа.")
         return
-    ctx.user_data["paychecks_filter"] = "ready"
+    ctx.user_data["paychecks_filter"] = "wants_receipt"
     ctx.user_data["paychecks_index"] = 0
     await _show_paychecks_view(update, ctx, reset_index=True)
 

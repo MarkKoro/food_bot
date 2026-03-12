@@ -317,6 +317,7 @@ def _create_redirect_payment(
     rub: int,
     *,
     receipt_email: str,
+    wants_receipt: bool,
     username: str,
     full_name: str,
 ) -> Dict[str, Any]:
@@ -331,6 +332,7 @@ def _create_redirect_payment(
         "kind": kind,
         "source": "telegram_webapp",
         "receipt_email": receipt_email,
+        "wants_receipt": "1" if wants_receipt else "0",
         "username": username,
         "full_name": full_name,
     }
@@ -425,6 +427,7 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
     succeeded_at = str(payment.get("captured_at") or payment.get("paid_at") or dt.datetime.now().isoformat(timespec="seconds"))
     receipt_email = _normalize_email(str(metadata.get("receipt_email") or ""))
     receipt_email_status = "provided" if receipt_email else "missing"
+    wants_receipt = str(metadata.get("wants_receipt") or "0") == "1"
     username = str(metadata.get("username") or "")
     full_name = str(metadata.get("full_name") or "")
     receipt_collected_at = dt.datetime.now().isoformat(timespec="seconds") if receipt_email else None
@@ -468,8 +471,8 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
                 (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
                  currency, project_key, product_kind, product_title, username, full_name,
                  payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
-                 receipt_email_collected_at, receipt_status)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending')
+                 receipt_email_collected_at, receipt_status, wants_receipt)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending', ?)
                 """,
                 (
                     user_id,
@@ -489,6 +492,7 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
                     receipt_email or None,
                     receipt_email_status,
                     receipt_collected_at,
+                    1 if wants_receipt else 0,
                 ),
             )
             if receipt_email:
@@ -517,8 +521,8 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
                 (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
                  currency, project_key, product_kind, product_title, username, full_name,
                  payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
-                 receipt_email_collected_at, receipt_status)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending')
+                 receipt_email_collected_at, receipt_status, wants_receipt)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending', ?)
                 """,
                 (
                     user_id,
@@ -538,6 +542,7 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
                     receipt_email or None,
                     receipt_email_status,
                     receipt_collected_at,
+                    1 if wants_receipt else 0,
                 ),
             )
             if receipt_email:
@@ -1170,6 +1175,7 @@ def create_redirect_payment(
         conn.close()
 
     kind = str((body or {}).get("kind") or "").strip()
+    wants_receipt = bool((body or {}).get("wants_receipt"))
 
     if kind == "subscription":
         plan_id = str((body or {}).get("plan_id") or "").strip()
@@ -1181,6 +1187,7 @@ def create_redirect_payment(
             plan_id=plan_id,
             rub=0,
             receipt_email=receipt_email,
+            wants_receipt=wants_receipt,
             username=username,
             full_name=full_name,
         )
@@ -1197,6 +1204,7 @@ def create_redirect_payment(
             plan_id=None,
             rub=rub,
             receipt_email=receipt_email,
+            wants_receipt=wants_receipt,
             username=username,
             full_name=full_name,
         )

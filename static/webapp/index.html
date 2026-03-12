@@ -430,6 +430,23 @@
         padding: 10px 12px;
       }
       .field-error { color:#fca5a5; font-size:12px; margin-top:6px; }
+      .receipt-optin-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 8px 10px;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 10px;
+        background: rgba(15, 23, 42, 0.65);
+      }
+      .receipt-optin-row input[type="checkbox"] { margin-top: 2px; }
+      .receipt-optin-label {
+        font-size: 14px;
+        color: #e2e8f0;
+        line-height: 1.35;
+        user-select: none;
+      }
       .step-highlight {
         box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.55), 0 0 20px rgba(34, 197, 94, 0.2);
         border-color: rgba(34, 197, 94, 0.85) !important;
@@ -585,6 +602,10 @@
               </div>
               <div id="email-error" class="field-error"></div>
             </div>
+            <label class="receipt-optin-row" for="receipt-opt-in">
+              <input id="receipt-opt-in" type="checkbox" />
+              <span class="receipt-optin-label">Хочу получить чек на почту</span>
+            </label>
             <div class="pay-actions">
               <button class="pill pill-primary" id="btn-prepare-payment">Подготовить оплату</button>
               <button class="pill pill-secondary" id="btn-open-payment" style="display:none;">Открыть оплату в браузере</button>
@@ -802,6 +823,7 @@
       const emailCollectCard = document.getElementById("email-collect-card");
       const emailInput = document.getElementById("receipt-email-input");
       const emailError = document.getElementById("email-error");
+      const receiptOptIn = document.getElementById("receipt-opt-in");
       const btnSaveEmail = document.getElementById("btn-save-email");
       const btnChangeEmail = document.getElementById("btn-change-email");
       const emailSavedCaption = document.getElementById("email-saved-caption");
@@ -1061,8 +1083,12 @@
         if (!receiptEmailState.ready) {
           throw new Error("Перед оплатой сохраните email для отправки чека.");
         }
+        const wantsReceipt = !!receiptOptIn?.checked;
         if (paymentStatusEl) paymentStatusEl.textContent = "Подготавливаем счёт...";
-        const created = await createRedirectPayment(config);
+        const created = await createRedirectPayment({
+          ...config,
+          wants_receipt: wantsReceipt,
+        });
         const confirmationUrl = created?.confirmation_url;
         const paymentId = created?.payment_id;
         if (!confirmationUrl || !paymentId) throw new Error("Не удалось подготовить счёт");
