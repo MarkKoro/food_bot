@@ -27,7 +27,11 @@ async def create_tables(db: aiosqlite.Connection) -> None:
             last_menu_message_id INTEGER,
             trial_until TEXT,
             trial_used_count INTEGER DEFAULT 0,
-            paid_trial_used INTEGER DEFAULT 0
+            paid_trial_used INTEGER DEFAULT 0,
+            receipt_email TEXT,
+            receipt_email_status TEXT DEFAULT 'missing',
+            receipt_email_source TEXT,
+            receipt_email_collected_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS meals (
@@ -137,6 +141,10 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "paid_trial_used": "INTEGER DEFAULT 0",
         "payment_mode": "TEXT DEFAULT 'sub'",
         "trial_granted": "INTEGER DEFAULT 0",
+        "receipt_email": "TEXT",
+        "receipt_email_status": "TEXT DEFAULT 'missing'",
+        "receipt_email_source": "TEXT",
+        "receipt_email_collected_at": "TEXT",
     }
 
     added_cols: set[str] = set()
@@ -164,6 +172,21 @@ async def create_tables(db: aiosqlite.Connection) -> None:
         "amount_rub": "INTEGER NOT NULL DEFAULT 0",
         "amount_stars": "INTEGER NOT NULL DEFAULT 0",
         "raw": "TEXT",
+        "currency": "TEXT",
+        "project_key": "TEXT",
+        "product_kind": "TEXT",
+        "product_title": "TEXT",
+        "username": "TEXT",
+        "full_name": "TEXT",
+        "payment_created_at": "TEXT",
+        "payment_succeeded_at": "TEXT",
+        "receipt_email": "TEXT",
+        "receipt_email_status": "TEXT DEFAULT 'missing'",
+        "receipt_email_source": "TEXT",
+        "receipt_email_collected_at": "TEXT",
+        "receipt_status": "TEXT DEFAULT 'pending'",
+        "receipt_sent_at": "TEXT",
+        "receipt_note": "TEXT",
     }
     for col, definition in required_pcols.items():
         if col not in pcols:
@@ -1018,6 +1041,188 @@ async def save_payment(
         telegram_charge_id=telegram_charge_id,
         provider_charge_id=provider_charge_id,
     )
+
+
+async def get_user_receipt_email(db: aiosqlite.Connection, user_id: int) -> dict:
+    await ensure_user(db, user_id)
+    cur = await db.execute(
+        """
+        SELECT receipt_email, receipt_email_status, receipt_email_source, receipt_email_collected_at
+        FROM users
+        WHERE telegram_id = ?
+        """,
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return {
+            "receipt_email": None,
+            "receipt_email_status": "missing",
+            "receipt_email_source": None,
+            "receipt_email_collected_at": None,
+        }
+    return {
+        "receipt_email": row[0],
+        "receipt_email_status": row[1] or ("provided" if row[0] else "missing"),
+        "receipt_email_source": row[2],
+        "receipt_email_collected_at": row[3],
+    }
+
+
+async def set_user_receipt_email(
+    db: aiosqlite.Connection,
+    user_id: int,
+    email: str,
+    *,
+    source: str = "webapp",
+) -> None:
+    await ensure_user(db, user_id)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    await db.execute(
+        """
+        UPDATE users
+        SET receipt_email = ?,
+            receipt_email_status = 'provided',
+            receipt_email_source = ?,
+            receipt_email_collected_at = ?
+        WHERE telegram_id = ?
+        """,
+        ((email or "").strip().lower(), source, now_iso, user_id),
+    )
+    await db.commit()
+
+
+async def set_payment_receipt_fields(
+    db: aiosqlite.Connection,
+    *,
+    provider_charge_id: str,
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    project_key: str | None,
+    product_kind: str | None,
+    product_title: str | None,
+    payment_created_at: str | None,
+    payment_succeeded_at: str | None,
+    receipt_email: str | None,
+    receipt_email_status: str = "missing",
+    receipt_email_source: str | None = None,
+    receipt_email_collected_at: str | None = None,
+) -> None:
+    await db.execute(
+        """
+        UPDATE payments
+        SET username = ?,
+            full_name = ?,
+            currency = 'RUB',
+            project_key = ?,
+            product_kind = ?,
+            product_title = ?,
+            payment_created_at = COALESCE(?, payment_created_at),
+            payment_succeeded_at = COALESCE(?, payment_succeeded_at),
+            receipt_email = ?,
+            receipt_email_status = ?,
+            receipt_email_source = ?,
+            receipt_email_collected_at = ?,
+            receipt_status = COALESCE(receipt_status, 'pending')
+        WHERE provider_charge_id = ? AND user_id = ?
+        """,
+        (
+            username,
+            full_name,
+            project_key,
+            product_kind,
+            product_title,
+            payment_created_at,
+            payment_succeeded_at,
+            (receipt_email or "").strip().lower() or None,
+            receipt_email_status,
+            receipt_email_source,
+            receipt_email_collected_at,
+            provider_charge_id,
+            user_id,
+        ),
+    )
+    await db.commit()
+
+
+async def list_rub_receipt_payments(
+    db: aiosqlite.Connection,
+    *,
+    filter_key: str = "all",
+) -> list[dict]:
+    where = ["amount_rub > 0", "provider = 'yookassa_widget'"]
+    if filter_key == "missing_email":
+        where.append("COALESCE(receipt_email, '') = ''")
+    elif filter_key == "with_email":
+        where.append("COALESCE(receipt_email, '') <> ''")
+    elif filter_key == "receipt_pending":
+        where.append("COALESCE(receipt_status, 'pending') = 'pending'")
+    elif filter_key == "receipt_sent":
+        where.append("COALESCE(receipt_status, 'pending') = 'sent'")
+    elif filter_key == "ready":
+        where.append("COALESCE(receipt_email, '') <> ''")
+        where.append("COALESCE(receipt_status, 'pending') = 'pending'")
+
+    sql = f"""
+        SELECT id, provider_charge_id, user_id, username, full_name, product_kind, product_title,
+               amount_rub, COALESCE(currency, 'RUB') AS currency,
+               payment_created_at, payment_succeeded_at, project_key,
+               receipt_email, COALESCE(receipt_email_status, 'missing') AS receipt_email_status,
+               receipt_email_source, receipt_email_collected_at,
+               COALESCE(receipt_status, 'pending') AS receipt_status, receipt_sent_at, receipt_note
+        FROM payments
+        WHERE {' AND '.join(where)}
+        ORDER BY COALESCE(payment_succeeded_at, datetime(ts, 'unixepoch')) DESC, id DESC
+    """
+    cur = await db.execute(sql)
+    rows = await cur.fetchall()
+    await cur.close()
+    result = []
+    for row in rows:
+        result.append({
+            "id": row[0],
+            "provider_charge_id": row[1],
+            "user_id": row[2],
+            "username": row[3],
+            "full_name": row[4],
+            "product_kind": row[5],
+            "product_title": row[6],
+            "amount_rub": row[7],
+            "currency": row[8],
+            "payment_created_at": row[9],
+            "payment_succeeded_at": row[10],
+            "project_key": row[11],
+            "receipt_email": row[12],
+            "receipt_email_status": row[13],
+            "receipt_email_source": row[14],
+            "receipt_email_collected_at": row[15],
+            "receipt_status": row[16],
+            "receipt_sent_at": row[17],
+            "receipt_note": row[18],
+        })
+    return result
+
+
+async def mark_receipt_status(
+    db: aiosqlite.Connection,
+    payment_id: int,
+    *,
+    sent: bool,
+) -> None:
+    if sent:
+        await db.execute(
+            "UPDATE payments SET receipt_status='sent', receipt_sent_at=datetime('now','localtime') WHERE id=?",
+            (payment_id,),
+        )
+    else:
+        await db.execute(
+            "UPDATE payments SET receipt_status='pending', receipt_sent_at=NULL WHERE id=?",
+            (payment_id,),
+        )
+    await db.commit()
+
 
 
 async def get_user_count(db: aiosqlite.Connection) -> int:

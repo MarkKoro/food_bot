@@ -75,6 +75,8 @@ from db import (
     grant_active_promotion,
     clear_promotions,
     purge_user,
+    list_rub_receipt_payments,
+    mark_receipt_status,
 )
 
 # ── Модель тарифов ─────────────────────────────────────
@@ -407,6 +409,9 @@ def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboard
 
     if has_templates:
         keyboard.insert(0, [InlineKeyboardButton("📁 Добавить из шаблона", callback_data="templates")])
+
+    if mode == "admin":
+        keyboard.insert(0, [InlineKeyboardButton("🧾 Чеки", callback_data="admin:paychecks")])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -887,7 +892,8 @@ async def build_remaining_limit_notice(
 async def build_main_keyboard(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> InlineKeyboardMarkup:
     db = get_db(ctx)
     has_tpl = await has_templates(db, user_id)
-    return kb_main(has_templates=has_tpl)
+    mode = "admin" if is_admin(user_id) else "sub"
+    return kb_main(mode=mode, has_templates=has_tpl)
 
 
 # ── Сервисные хелперы сообщений ───────────────────────
@@ -3883,6 +3889,43 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_set_goal_screen(update, ctx)
     elif data == "stats":
         await show_stats(update, ctx)
+    elif data == "admin:paychecks":
+        ctx.user_data["paychecks_filter"] = "ready"
+        ctx.user_data["paychecks_index"] = 0
+        await _show_paychecks_view(update, ctx, reset_index=True)
+    elif data.startswith("paychecks:filter:"):
+        _, _, filter_key = data.split(":", 2)
+        ctx.user_data["paychecks_filter"] = filter_key
+        ctx.user_data["paychecks_index"] = 0
+        await _show_paychecks_view(update, ctx, reset_index=True)
+    elif data.startswith("paychecks:nav:"):
+        _, _, direction, filter_key = data.split(":", 3)
+        ctx.user_data["paychecks_filter"] = filter_key
+        items = await list_rub_receipt_payments(get_db(ctx), filter_key=filter_key)
+        idx = int(ctx.user_data.get("paychecks_index", 0))
+        if items:
+            if direction == "first":
+                idx = 0
+            elif direction == "last":
+                idx = len(items) - 1
+            elif direction == "prev":
+                idx = max(0, idx - 1)
+            elif direction == "next":
+                idx = min(len(items) - 1, idx + 1)
+        ctx.user_data["paychecks_index"] = idx
+        await _show_paychecks_view(update, ctx, reset_index=False)
+    elif data.startswith("paychecks:sent:"):
+        _, _, pid_s, filter_key = data.split(":", 3)
+        await mark_receipt_status(get_db(ctx), int(pid_s), sent=True)
+        ctx.user_data["paychecks_filter"] = filter_key
+        await _show_paychecks_view(update, ctx, reset_index=False)
+    elif data.startswith("paychecks:reset:"):
+        _, _, pid_s, filter_key = data.split(":", 3)
+        await mark_receipt_status(get_db(ctx), int(pid_s), sent=False)
+        ctx.user_data["paychecks_filter"] = filter_key
+        await _show_paychecks_view(update, ctx, reset_index=False)
+    elif data == "noop":
+        return
     elif data == "stats_export":
         await show_stats_export_menu(update, ctx)
     elif data.startswith("stats_export:"):
@@ -4404,6 +4447,116 @@ def format_payment_success_notice(
     lines.append("Приятного подсчёта своих граммов — я уже готов к новым запросам!")
 
     return "\n".join(lines)
+
+
+PAYCHECK_FILTERS = [
+    ("all", "Все"),
+    ("missing_email", "Без email"),
+    ("with_email", "С email"),
+    ("receipt_pending", "Чек не отправлен"),
+    ("receipt_sent", "Чек отправлен"),
+    ("ready", "Готово к чеку"),
+]
+
+
+def _paychecks_filter_title(key: str) -> str:
+    for k, title in PAYCHECK_FILTERS:
+        if k == key:
+            return title
+    return "Все"
+
+
+def _paycheck_card_text(item: dict, index: int, total: int, filter_key: str) -> str:
+    user_id = int(item.get("user_id") or 0)
+    full_name = (item.get("full_name") or "—").strip()
+    username = (item.get("username") or "").strip()
+    username_line = f"@{username}" if username else "—"
+    mention = f"[Открыть профиль](tg://user?id={user_id})" if user_id else "—"
+    return (
+        f"🧾 *RUB-платёж* `{index}/{total}`\n"
+        f"Фильтр: *{escape_md(_paychecks_filter_title(filter_key))}*\n\n"
+        f"ID записи: `{item.get('id')}`\n"
+        f"Оплачено: `{escape_md(str(item.get('payment_succeeded_at') or '—'))}`\n"
+        f"Provider payment id: `{escape_md(str(item.get('provider_charge_id') or '—'))}`\n"
+        f"Сумма: *{item.get('amount_rub')} {escape_md(str(item.get('currency') or 'RUB'))}*\n"
+        f"Что куплено: {escape_md(str(item.get('product_title') or '—'))}\n"
+        f"product_kind: `{escape_md(str(item.get('product_kind') or '—'))}`\n"
+        f"Email: `{escape_md(str(item.get('receipt_email') or '—'))}`\n"
+        f"Email status: `{escape_md(str(item.get('receipt_email_status') or 'missing'))}`\n"
+        f"Receipt status: `{escape_md(str(item.get('receipt_status') or 'pending'))}`\n\n"
+        f"Пользователь: *{escape_md(full_name)}*\n"
+        f"username: {escape_md(username_line)}\n"
+        f"user_id: `{user_id}` · {mention}"
+    )
+
+
+def _kb_paychecks(item: dict, index: int, total: int, filter_key: str) -> InlineKeyboardMarkup:
+    pid = int(item.get("id") or 0)
+    nav_row = [
+        InlineKeyboardButton("⏮", callback_data=f"paychecks:nav:first:{filter_key}"),
+        InlineKeyboardButton("◀️", callback_data=f"paychecks:nav:prev:{filter_key}"),
+        InlineKeyboardButton(f"{index}/{total}", callback_data="noop"),
+        InlineKeyboardButton("▶️", callback_data=f"paychecks:nav:next:{filter_key}"),
+        InlineKeyboardButton("⏭", callback_data=f"paychecks:nav:last:{filter_key}"),
+    ]
+    action_row = [
+        InlineKeyboardButton("✅ Чек отправлен", callback_data=f"paychecks:sent:{pid}:{filter_key}"),
+        InlineKeyboardButton("↩️ Сбросить", callback_data=f"paychecks:reset:{pid}:{filter_key}"),
+    ]
+    filter_buttons = [
+        InlineKeyboardButton(("✅ " if k == filter_key else "") + title, callback_data=f"paychecks:filter:{k}")
+        for k, title in PAYCHECK_FILTERS
+    ]
+    rows = [nav_row, action_row]
+    for i in range(0, len(filter_buttons), 2):
+        rows.append(filter_buttons[i:i + 2])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_paychecks_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, reset_index: bool = False) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if update.message:
+            await update.message.reply_text("Нет доступа.")
+        elif update.callback_query:
+            await update.callback_query.answer("Нет доступа", show_alert=True)
+        return
+
+    db = get_db(ctx)
+    filter_key = ctx.user_data.get("paychecks_filter", "ready")
+    items = await list_rub_receipt_payments(db, filter_key=filter_key)
+    if not items:
+        text = f"🧾 Нет успешных RUB-платежей по фильтру: {_paychecks_filter_title(filter_key)}"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Показать все", callback_data="paychecks:filter:all")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="main")],
+        ])
+        if update.callback_query:
+            await edit_menu_message(update, ctx, text, kb)
+        else:
+            await update.message.reply_text(text, reply_markup=kb)
+        return
+
+    if reset_index:
+        ctx.user_data["paychecks_index"] = 0
+    idx = int(ctx.user_data.get("paychecks_index", 0))
+    idx = max(0, min(idx, len(items) - 1))
+    ctx.user_data["paychecks_index"] = idx
+    item = items[idx]
+    text = _paycheck_card_text(item, idx + 1, len(items), filter_key)
+    kb = _kb_paychecks(item, idx + 1, len(items), filter_key)
+    await edit_menu_message(update, ctx, text, kb)
+
+
+async def cmd_paychecks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id):
+        if update.message:
+            await update.message.reply_text("Нет доступа.")
+        return
+    ctx.user_data["paychecks_filter"] = "ready"
+    ctx.user_data["paychecks_index"] = 0
+    await _show_paychecks_view(update, ctx, reset_index=True)
 
 
 async def cleanup_payment_messages(
@@ -5171,6 +5324,7 @@ def main() -> None:
     application.add_handler(CommandHandler("degrant_payg", cmd_degrant_payg))
     application.add_handler(CommandHandler("stats_payg", cmd_stats_payg))
     application.add_handler(CommandHandler("mystats", cmd_my_stats))
+    application.add_handler(CommandHandler("paychecks", cmd_paychecks))
 
     # Callback-кнопки
     application.add_handler(CallbackQueryHandler(on_callback))

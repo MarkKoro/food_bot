@@ -412,6 +412,29 @@
         margin: 8px 0 0;
       }
 
+      .email-collect-card {
+        margin-top: 10px;
+        padding: 10px;
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        background: rgba(2, 6, 23, 0.35);
+      }
+      .email-collect-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+      .email-input {
+        min-width: 220px;
+        flex: 1 1 240px;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.95);
+        color: #e2e8f0;
+        padding: 10px 12px;
+      }
+      .field-error { color:#fca5a5; font-size:12px; margin-top:6px; }
+      .step-highlight {
+        box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.55), 0 0 20px rgba(34, 197, 94, 0.2);
+        border-color: rgba(34, 197, 94, 0.85) !important;
+      }
+
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -550,6 +573,18 @@
           <div class="plan-card">
             <h3 id="payment-amount">Сумма: —</h3>
             <p id="payment-kind" class="plan-description"></p>
+            <div id="email-collect-card" class="email-collect-card" style="display:none;">
+              <div id="email-collect-title">Укажите email для отправки чека.</div>
+              <div id="email-saved-caption" class="hint" style="display:none;"></div>
+              <div class="email-collect-row" id="email-input-row">
+                <input id="receipt-email-input" class="email-input" type="email" placeholder="example@mail.com" autocomplete="email" />
+                <button class="pill pill-secondary" id="btn-save-email">Сохранить email</button>
+              </div>
+              <div class="email-collect-row" id="email-edit-row" style="display:none;">
+                <button class="pill pill-secondary" id="btn-change-email">Изменить email</button>
+              </div>
+              <div id="email-error" class="field-error"></div>
+            </div>
             <div class="pay-actions">
               <button class="pill pill-primary" id="btn-prepare-payment">Подготовить оплату</button>
               <button class="pill pill-secondary" id="btn-open-payment" style="display:none;">Открыть оплату в браузере</button>
@@ -742,6 +777,16 @@
       const paymentSuccessModal = document.getElementById("payment-success-modal");
       const paymentSuccessText = document.getElementById("payment-success-text");
       const paymentSuccessOk = document.getElementById("payment-success-ok");
+      const emailCollectCard = document.getElementById("email-collect-card");
+      const emailInput = document.getElementById("receipt-email-input");
+      const emailError = document.getElementById("email-error");
+      const btnSaveEmail = document.getElementById("btn-save-email");
+      const btnChangeEmail = document.getElementById("btn-change-email");
+      const emailSavedCaption = document.getElementById("email-saved-caption");
+      const emailInputRow = document.getElementById("email-input-row");
+      const emailEditRow = document.getElementById("email-edit-row");
+
+      let receiptEmailState = { ready: false, email: "", status: "missing" };
 
       let weekChart = null;
       let monthChart = null;
@@ -856,6 +901,51 @@
         return created;
       }
 
+      function validateEmail(email) {
+        return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i.test(String(email || "").trim());
+      }
+
+      function setPaymentStep(step) {
+        [emailInput, btnSaveEmail, btnPreparePayment, btnOpenPayment].forEach((el) => el?.classList.remove("step-highlight"));
+        if (step === 1) emailInput?.classList.add("step-highlight");
+        if (step === 2) btnSaveEmail?.classList.add("step-highlight");
+        if (step === 3) btnPreparePayment?.classList.add("step-highlight");
+        if (step === 4) btnOpenPayment?.classList.add("step-highlight");
+      }
+
+      function syncPaymentEmailGate() {
+        const ready = !!receiptEmailState.ready;
+        if (btnPreparePayment) btnPreparePayment.disabled = !ready;
+        if (btnOpenPayment && btnOpenPayment.style.display !== "none") setPaymentStep(4);
+        else if (ready) setPaymentStep(3);
+        else setPaymentStep(1);
+      }
+
+      async function fetchReceiptEmail() {
+        const info = await fetchJson("/api/payments/receipt-email");
+        receiptEmailState = {
+          email: String(info?.receipt_email || ""),
+          status: String(info?.receipt_email_status || "missing"),
+          ready: String(info?.receipt_email_status || "missing") === "provided" && !!String(info?.receipt_email || ""),
+        };
+        if (emailCollectCard) emailCollectCard.style.display = "block";
+        if (receiptEmailState.ready) {
+          if (emailSavedCaption) {
+            emailSavedCaption.style.display = "block";
+            emailSavedCaption.textContent = `Email для чека: ${receiptEmailState.email}`;
+          }
+          if (emailInput) emailInput.value = receiptEmailState.email;
+          if (emailInputRow) emailInputRow.style.display = "none";
+          if (emailEditRow) emailEditRow.style.display = "flex";
+          if (emailError) emailError.textContent = "";
+        } else {
+          if (emailSavedCaption) emailSavedCaption.style.display = "none";
+          if (emailInputRow) emailInputRow.style.display = "flex";
+          if (emailEditRow) emailEditRow.style.display = "none";
+        }
+        syncPaymentEmailGate();
+      }
+
       function openExternalPayment(url) {
         if (!url) return;
         try {
@@ -920,6 +1010,9 @@
 
       async function startRedirectPayment(config) {
         if (!config) return;
+        if (!receiptEmailState.ready) {
+          throw new Error("Перед оплатой сохраните email для отправки чека.");
+        }
         if (paymentStatusEl) paymentStatusEl.textContent = "Подготавливаем счёт...";
         const created = await createRedirectPayment(config);
         const confirmationUrl = created?.confirmation_url;
@@ -1526,6 +1619,42 @@ function setActiveAnalyticsPreset(range) {
       btnOpenSub?.addEventListener("click", () => openInWebappWidget({ kind: "subscription", plan_id: subPlanSelect?.value || "m1" }));
       btnOpenSubModal?.addEventListener("click", () => setModalOpen(subModal, true));
       btnOpenPaygModal?.addEventListener("click", () => setModalOpen(paygModal, true));
+      btnSaveEmail?.addEventListener("click", async () => {
+        const email = String(emailInput?.value || "").trim();
+        if (!validateEmail(email)) {
+          if (emailError) emailError.textContent = "Введите корректный email.";
+          setPaymentStep(1);
+          return;
+        }
+        if (emailError) emailError.textContent = "";
+        btnSaveEmail.disabled = true;
+        try {
+          await fetch("/api/payments/receipt-email", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
+            },
+            body: JSON.stringify({ email }),
+          }).then(async (r) => {
+            if (!r.ok) throw new Error(await r.text());
+            return r.json();
+          });
+          await fetchReceiptEmail();
+        } catch (err) {
+          if (emailError) emailError.textContent = String(err?.message || "Не удалось сохранить email").replace(/^HTTP \d+:\s*/, "");
+        } finally {
+          btnSaveEmail.disabled = false;
+        }
+      });
+      btnChangeEmail?.addEventListener("click", () => {
+        receiptEmailState.ready = false;
+        if (emailInputRow) emailInputRow.style.display = "flex";
+        if (emailEditRow) emailEditRow.style.display = "none";
+        if (emailSavedCaption) emailSavedCaption.style.display = "none";
+        if (emailError) emailError.textContent = "";
+        syncPaymentEmailGate();
+      });
       subModalClose?.addEventListener("click", () => setModalOpen(subModal, false));
       paygModalClose?.addEventListener("click", () => setModalOpen(paygModal, false));
       paymentSuccessOk?.addEventListener("click", () => {
@@ -1568,6 +1697,7 @@ function setActiveAnalyticsPreset(range) {
             ? "После оплаты подписка активируется автоматически."
             : "После оплаты баланс PAYG пополнится автоматически.";
           forcePaymentScreen = true;
+          await fetchReceiptEmail();
           btnPreparePayment?.addEventListener("click", async () => {
             btnPreparePayment.disabled = true;
             try {
@@ -1581,6 +1711,7 @@ function setActiveAnalyticsPreset(range) {
           btnOpenPayment?.addEventListener("click", () => {
             const pending = readPendingPayment();
             openExternalPayment(btnOpenPayment.dataset.confirmationUrl || pending?.confirmation_url || "");
+            setPaymentStep(4);
           });
         }
 
