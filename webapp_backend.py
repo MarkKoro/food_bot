@@ -7,6 +7,7 @@ import sqlite3
 import httpx
 import logging
 import datetime as dt
+import re
 from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
 
@@ -40,6 +41,7 @@ if not BOT_TOKEN:
 
 DB_PATH = os.getenv("DB_PATH", "data/food_bot.sqlite3")
 logger = logging.getLogger(__name__)
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
 
 SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
     "w1": {"title": "Одна неделя", "price_rub": 125, "days": 7},
@@ -124,6 +126,27 @@ def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) 
     return int(user["id"])
 
 
+def get_verified_user(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> Dict[str, Any]:
+    if not init_data:
+        raise HTTPException(status_code=401, detail="Missing Telegram init data")
+    params = verify_init_data(init_data, BOT_TOKEN)
+    user = params.get("user")
+    if not user or "id" not in user:
+        raise HTTPException(status_code=401, detail="Missing user in init data")
+    return user
+
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _validate_email_or_400(email: str) -> str:
+    normalized = _normalize_email(email)
+    if not normalized or not EMAIL_RE.match(normalized):
+        raise HTTPException(status_code=400, detail="Укажите корректный email")
+    return normalized
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -132,6 +155,42 @@ def get_conn() -> sqlite3.Connection:
 
 def _today_str() -> str:
     return dt.date.today().isoformat()
+
+
+def _user_receipt_email(conn: sqlite3.Connection, user_id: int) -> Dict[str, Any]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT receipt_email, receipt_email_status, receipt_email_source, receipt_email_collected_at
+        FROM users
+        WHERE telegram_id = ?
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {
+            "receipt_email": None,
+            "receipt_email_status": "missing",
+            "receipt_email_source": None,
+            "receipt_email_collected_at": None,
+        }
+    email = _normalize_email(row[0] or "")
+    return {
+        "receipt_email": email or None,
+        "receipt_email_status": row[1] or ("provided" if email else "missing"),
+        "receipt_email_source": row[2],
+        "receipt_email_collected_at": row[3],
+    }
+
+
+def _require_user_receipt_email(conn: sqlite3.Connection, user_id: int) -> str:
+    info = _user_receipt_email(conn, user_id)
+    email = _normalize_email(info.get("receipt_email") or "")
+    status = str(info.get("receipt_email_status") or "missing")
+    if not email or status != "provided":
+        raise HTTPException(status_code=409, detail="Перед оплатой нужно сохранить email для чека")
+    return email
 
 
 
@@ -251,7 +310,16 @@ def _create_widget_payment(user_id: int, kind: str, plan_id: Optional[str], rub:
     }
 
 
-def _create_redirect_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int) -> Dict[str, Any]:
+def _create_redirect_payment(
+    user_id: int,
+    kind: str,
+    plan_id: Optional[str],
+    rub: int,
+    *,
+    receipt_email: str,
+    username: str,
+    full_name: str,
+) -> Dict[str, Any]:
     _yookassa_guard()
 
     title = ""
@@ -262,6 +330,9 @@ def _create_redirect_payment(user_id: int, kind: str, plan_id: Optional[str], ru
         "user_id": str(user_id),
         "kind": kind,
         "source": "telegram_webapp",
+        "receipt_email": receipt_email,
+        "username": username,
+        "full_name": full_name,
     }
 
     if kind == "subscription":
@@ -350,6 +421,13 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
         return False, "foreign_project", "Платёж относится к другому проекту"
     kind = str(metadata.get("kind") or "")
     amount_rub = int(round(float((payment.get("amount") or {}).get("value") or 0)))
+    created_at = str(payment.get("created_at") or "") or None
+    succeeded_at = str(payment.get("captured_at") or payment.get("paid_at") or dt.datetime.now().isoformat(timespec="seconds"))
+    receipt_email = _normalize_email(str(metadata.get("receipt_email") or ""))
+    receipt_email_status = "provided" if receipt_email else "missing"
+    username = str(metadata.get("username") or "")
+    full_name = str(metadata.get("full_name") or "")
+    receipt_collected_at = dt.datetime.now().isoformat(timespec="seconds") if receipt_email else None
 
     conn = get_conn()
     try:
@@ -370,6 +448,7 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
             plan = SUBSCRIPTION_PLANS.get(plan_id)
             if not plan:
                 raise HTTPException(status_code=400, detail="Unknown subscription plan in metadata")
+            product_title = f"Подписка: {plan['title']}"
 
             cur.execute("SELECT premium_until FROM users WHERE telegram_id = ?", (user_id,))
             row = cur.fetchone()
@@ -386,16 +465,48 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
             cur.execute(
                 """
                 INSERT OR IGNORE INTO payments
-                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
+                 currency, project_key, product_kind, product_title, username, full_name,
+                 payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
+                 receipt_email_collected_at, receipt_status)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending')
                 """,
-                (user_id, now_ts, "yookassa_widget", json.dumps({"kind": kind, "plan_id": plan_id}, ensure_ascii=False), amount_rub, raw, payment_id),
+                (
+                    user_id,
+                    now_ts,
+                    "yookassa_widget",
+                    json.dumps({"kind": kind, "plan_id": plan_id}, ensure_ascii=False),
+                    amount_rub,
+                    raw,
+                    payment_id,
+                    PROJECT_KEY,
+                    kind,
+                    product_title,
+                    username or None,
+                    full_name or None,
+                    created_at,
+                    succeeded_at,
+                    receipt_email or None,
+                    receipt_email_status,
+                    receipt_collected_at,
+                ),
             )
+            if receipt_email:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET receipt_email = ?, receipt_email_status = 'provided',
+                        receipt_email_source = 'webapp', receipt_email_collected_at = ?
+                    WHERE telegram_id = ?
+                    """,
+                    (receipt_email, receipt_collected_at, user_id),
+                )
             conn.commit()
             return True, "subscription", f"Подписка {plan['title']} активирована"
 
         if kind == "payg_topup":
             rub = int(metadata.get("rub") or amount_rub)
+            product_title = f"PAYG пополнение: {rub}₽"
             cur.execute(
                 "UPDATE users SET credits = COALESCE(credits,0) + ? WHERE telegram_id = ?",
                 (rub, user_id),
@@ -403,11 +514,42 @@ def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[boo
             cur.execute(
                 """
                 INSERT OR IGNORE INTO payments
-                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)
+                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
+                 currency, project_key, product_kind, product_title, username, full_name,
+                 payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
+                 receipt_email_collected_at, receipt_status)
+                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending')
                 """,
-                (user_id, now_ts, "yookassa_widget", json.dumps({"kind": kind, "rub": rub}, ensure_ascii=False), rub, raw, payment_id),
+                (
+                    user_id,
+                    now_ts,
+                    "yookassa_widget",
+                    json.dumps({"kind": kind, "rub": rub}, ensure_ascii=False),
+                    rub,
+                    raw,
+                    payment_id,
+                    PROJECT_KEY,
+                    kind,
+                    product_title,
+                    username or None,
+                    full_name or None,
+                    created_at,
+                    succeeded_at,
+                    receipt_email or None,
+                    receipt_email_status,
+                    receipt_collected_at,
+                ),
             )
+            if receipt_email:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET receipt_email = ?, receipt_email_status = 'provided',
+                        receipt_email_source = 'webapp', receipt_email_collected_at = ?
+                    WHERE telegram_id = ?
+                    """,
+                    (receipt_email, receipt_collected_at, user_id),
+                )
             conn.commit()
             return True, "payg_topup", f"Баланс пополнен на {rub}₽"
 
@@ -930,6 +1072,50 @@ def api_config() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/payments/receipt-email")
+def get_receipt_email(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        info = _user_receipt_email(conn, user_id)
+    finally:
+        conn.close()
+    return {"ok": True, **info}
+
+
+@app.post("/api/payments/receipt-email")
+def set_receipt_email(
+    body: Dict[str, Any],
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    email = _validate_email_or_400(str((body or {}).get("email") or ""))
+    collected_at = dt.datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
+        cur.execute(
+            """
+            UPDATE users
+            SET receipt_email = ?,
+                receipt_email_status = 'provided',
+                receipt_email_source = 'webapp',
+                receipt_email_collected_at = ?
+            WHERE telegram_id = ?
+            """,
+            (email, collected_at, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "receipt_email": email,
+        "receipt_email_status": "provided",
+        "receipt_email_source": "webapp",
+        "receipt_email_collected_at": collected_at,
+    }
+
+
 def _telegram_api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
@@ -972,15 +1158,32 @@ def _create_invoice_link(
 @app.post("/api/payments/redirect/create")
 def create_redirect_payment(
     body: Dict[str, Any],
-    user_id: int = Depends(get_verified_user_id),
+    user: Dict[str, Any] = Depends(get_verified_user),
 ) -> Dict[str, Any]:
+    user_id = int(user["id"])
+    username = str(user.get("username") or "")
+    full_name = " ".join([str(user.get("first_name") or "").strip(), str(user.get("last_name") or "").strip()]).strip()
+    conn = get_conn()
+    try:
+        receipt_email = _require_user_receipt_email(conn, user_id)
+    finally:
+        conn.close()
+
     kind = str((body or {}).get("kind") or "").strip()
 
     if kind == "subscription":
         plan_id = str((body or {}).get("plan_id") or "").strip()
         if not plan_id:
             raise HTTPException(status_code=400, detail="plan_id is required")
-        return _create_redirect_payment(user_id=user_id, kind=kind, plan_id=plan_id, rub=0)
+        return _create_redirect_payment(
+            user_id=user_id,
+            kind=kind,
+            plan_id=plan_id,
+            rub=0,
+            receipt_email=receipt_email,
+            username=username,
+            full_name=full_name,
+        )
 
     if kind == "payg_topup":
         rub_raw = (body or {}).get("rub")
@@ -988,7 +1191,15 @@ def create_redirect_payment(
             rub = int(rub_raw)
         except Exception:
             raise HTTPException(status_code=400, detail="rub must be integer")
-        return _create_redirect_payment(user_id=user_id, kind=kind, plan_id=None, rub=rub)
+        return _create_redirect_payment(
+            user_id=user_id,
+            kind=kind,
+            plan_id=None,
+            rub=rub,
+            receipt_email=receipt_email,
+            username=username,
+            full_name=full_name,
+        )
 
     raise HTTPException(status_code=400, detail="Unsupported payment kind")
 
