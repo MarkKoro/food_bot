@@ -1168,14 +1168,15 @@ def create_redirect_payment(
     user_id = int(user["id"])
     username = str(user.get("username") or "")
     full_name = " ".join([str(user.get("first_name") or "").strip(), str(user.get("last_name") or "").strip()]).strip()
-    conn = get_conn()
-    try:
-        receipt_email = _require_user_receipt_email(conn, user_id)
-    finally:
-        conn.close()
-
     kind = str((body or {}).get("kind") or "").strip()
     wants_receipt = bool((body or {}).get("wants_receipt"))
+    receipt_email = ""
+    if wants_receipt:
+        conn = get_conn()
+        try:
+            receipt_email = _require_user_receipt_email(conn, user_id)
+        finally:
+            conn.close()
 
     if kind == "subscription":
         plan_id = str((body or {}).get("plan_id") or "").strip()

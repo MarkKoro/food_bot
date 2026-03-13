@@ -891,6 +891,24 @@
         return null;
       }
 
+      function paymentScreenUrl(config) {
+        const url = new URL(window.location.href);
+        const params = url.searchParams;
+        params.set("screen", "payment");
+        params.set("kind", String(config?.kind || ""));
+        params.delete("plan_id");
+        params.delete("rub");
+        if (config?.kind === "subscription") params.set("plan_id", String(config?.plan_id || ""));
+        if (config?.kind === "payg_topup") params.set("rub", String(config?.rub || ""));
+        url.search = params.toString();
+        return url.toString();
+      }
+
+      function goToPaymentScreen(config) {
+        if (!config?.kind) return;
+        window.location.href = paymentScreenUrl(config);
+      }
+
       function describePaymentConfig(cfg) {
         if (!cfg) return { title: "Оплата", amount: "", description: "" };
         if (cfg.kind === "subscription") {
@@ -959,11 +977,23 @@
       }
 
       function syncPaymentEmailGate() {
+        const wantsReceipt = !!receiptOptIn?.checked;
         const ready = !!receiptEmailState.ready;
-        if (btnPreparePayment) btnPreparePayment.disabled = !ready;
-        if (btnOpenPayment && btnOpenPayment.style.display !== "none") setPaymentStep(4);
-        else if (ready) setPaymentStep(3);
-        else setPaymentStep(1);
+        if (btnPreparePayment) btnPreparePayment.disabled = false;
+
+        if (emailCollectCard) {
+          emailCollectCard.style.display = wantsReceipt ? "block" : "none";
+        }
+
+        if (btnOpenPayment && btnOpenPayment.style.display !== "none") {
+          setPaymentStep(4);
+          return;
+        }
+        if (wantsReceipt && !ready) {
+          setPaymentStep(1);
+          return;
+        }
+        setPaymentStep(3);
       }
 
       async function fetchReceiptEmail() {
@@ -973,7 +1003,6 @@
           status: String(info?.receipt_email_status || "missing"),
           ready: String(info?.receipt_email_status || "missing") === "provided" && !!String(info?.receipt_email || ""),
         };
-        if (emailCollectCard) emailCollectCard.style.display = "block";
         if (receiptEmailState.ready) {
           if (emailSavedCaption) {
             emailSavedCaption.style.display = "block";
@@ -1080,9 +1109,6 @@
 
       async function startRedirectPayment(config) {
         if (!config) return;
-        if (!receiptEmailState.ready) {
-          throw new Error("Перед оплатой сохраните email для отправки чека.");
-        }
         const wantsReceipt = !!receiptOptIn?.checked;
         if (paymentStatusEl) paymentStatusEl.textContent = "Подготавливаем счёт...";
         const created = await createRedirectPayment({
@@ -1112,7 +1138,7 @@
       async function openInWebappWidget(config) {
         try {
           await fetchReceiptEmail();
-          if (!receiptEmailState.ready) {
+          if (receiptOptIn?.checked && !receiptEmailState.ready) {
             requestEmailBeforePayment(config);
             return;
           }
@@ -1147,7 +1173,7 @@
             const btn = document.createElement("button");
             btn.className = "pill pill-secondary";
             btn.textContent = `Пополнить на ${amt} ₽`;
-            btn.addEventListener("click", () => openInWebappWidget({ kind: "payg_topup", rub: amt }));
+            btn.addEventListener("click", () => goToPaymentScreen({ kind: "payg_topup", rub: amt }));
             wrap.appendChild(btn);
           }
         }
@@ -1696,9 +1722,28 @@ function setActiveAnalyticsPreset(range) {
         showScreen("analytics");
         loadAdvancedStats(activeAnalyticsRange);
       });
-      btnOpenSub?.addEventListener("click", () => openInWebappWidget({ kind: "subscription", plan_id: subPlanSelect?.value || "m1" }));
+      btnOpenSub?.addEventListener("click", () => goToPaymentScreen({ kind: "subscription", plan_id: subPlanSelect?.value || "m1" }));
       btnOpenSubModal?.addEventListener("click", () => setModalOpen(subModal, true));
       btnOpenPaygModal?.addEventListener("click", () => setModalOpen(paygModal, true));
+      receiptOptIn?.addEventListener("change", async () => {
+        if (receiptOptIn?.checked) {
+          try {
+            await fetchReceiptEmail();
+            if (!receiptEmailState.ready) {
+              if (emailInput) {
+                emailInput.value = "";
+                emailInput.focus({ preventScroll: true });
+              }
+            }
+          } catch (err) {
+            if (paymentStatusEl) {
+              paymentStatusEl.textContent = String(err?.message || "Не удалось получить email").replace(/^HTTP \d+:\s*/, "");
+            }
+          }
+        }
+        syncPaymentEmailGate();
+      });
+
       btnSaveEmail?.addEventListener("click", async () => {
         const email = String(emailInput?.value || "").trim();
         if (!validateEmail(email)) {
@@ -1800,7 +1845,14 @@ function setActiveAnalyticsPreset(range) {
             : "После оплаты баланс PAYG пополнится автоматически.";
           forcePaymentScreen = true;
           await fetchReceiptEmail();
+          if (receiptOptIn) receiptOptIn.checked = false;
+          syncPaymentEmailGate();
           btnPreparePayment?.addEventListener("click", async () => {
+            if (receiptOptIn?.checked && !receiptEmailState.ready) {
+              requestEmailBeforePayment(queryPayment);
+              return;
+            }
+            syncPaymentEmailGate();
             btnPreparePayment.disabled = true;
             try {
               await startRedirectPayment(queryPayment);
@@ -1808,6 +1860,7 @@ function setActiveAnalyticsPreset(range) {
               paymentStatusEl.textContent = String(err?.message || "Ошибка оплаты").replace(/^HTTP \d+:\s*/, "");
             } finally {
               btnPreparePayment.disabled = false;
+              syncPaymentEmailGate();
             }
           });
           btnOpenPayment?.addEventListener("click", () => {
