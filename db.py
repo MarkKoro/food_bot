@@ -13,7 +13,7 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = str(DATA_DIR / "food_bot.sqlite3")
 
 
-async def create_tables(db: aiosqlite.Connection) -> None:
+async def create_tables(db: aiosqlite.Connection) -> int:
     """Создаём все нужные таблицы, если их ещё нет."""
     await db.executescript(
         """
@@ -663,7 +663,7 @@ async def add_meal(
     telegram_id: int,
     totals: dict,
     raw_json: str,
-) -> None:
+) -> int:
     """
     Сохраняем один приём пищи.
     totals: dict с ключами kcal / protein_g / fat_g / carbs_g.
@@ -679,7 +679,7 @@ async def add_meal(
     fat = float(totals.get("fat_g") or 0.0)
     carbs = float(totals.get("carbs_g") or 0.0)
 
-    await db.execute(
+    cur = await db.execute(
         """
         INSERT INTO meals (user_id, date, kcal, protein, fat, carbs, raw_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -688,6 +688,7 @@ async def add_meal(
     )
 
     await db.commit()
+    return int(cur.lastrowid)
 
 
 async def get_meals_date_bounds(

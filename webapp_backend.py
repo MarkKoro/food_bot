@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -584,7 +585,7 @@ def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT created_at, kcal, protein, fat, carbs, raw_json
+            SELECT id, created_at, kcal, protein, fat, carbs, raw_json
             FROM meals
             WHERE user_id = ? AND date = ?
             ORDER BY datetime(created_at) ASC, id ASC
@@ -626,6 +627,7 @@ def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
                 })
 
         meals.append({
+            "id": int(row["id"]),
             "time": meal_time,
             "kcal": float(row["kcal"] or 0),
             "protein": float(row["protein"] or 0),
@@ -635,6 +637,180 @@ def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
         })
 
     return meals
+
+
+def _normalize_item(item: Dict[str, Any]) -> Optional[Dict[str, float | str]]:
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or "").strip()
+    if not name:
+        return None
+    grams = float(item.get("grams") or item.get("weight_g") or 0)
+    return {
+        "name": name,
+        "grams": max(0.0, grams),
+        "kcal": float(item.get("kcal_total") or item.get("kcal") or 0),
+        "protein": float(item.get("protein_g") or item.get("protein") or 0),
+        "fat": float(item.get("fat_g") or item.get("fat") or 0),
+        "carbs": float(item.get("carbs_g") or item.get("carbs") or 0),
+    }
+
+
+def _sum_items(items: List[Dict[str, Any]]) -> Dict[str, float]:
+    totals = {"kcal": 0.0, "protein": 0.0, "fat": 0.0, "carbs": 0.0}
+    for item in items:
+        totals["kcal"] += float(item.get("kcal") or 0)
+        totals["protein"] += float(item.get("protein") or 0)
+        totals["fat"] += float(item.get("fat") or 0)
+        totals["carbs"] += float(item.get("carbs") or 0)
+    return totals
+
+
+def _serialize_items_for_raw(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": str(item.get("name") or ""),
+            "weight_g": float(item.get("grams") or 0),
+            "kcal_total": float(item.get("kcal") or 0),
+            "protein_g": float(item.get("protein") or 0),
+            "fat_g": float(item.get("fat") or 0),
+            "carbs_g": float(item.get("carbs") or 0),
+        }
+        for item in items
+    ]
+
+
+def _rebuild_meal_payload(raw_payload: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = dict(raw_payload or {})
+    payload["items"] = _serialize_items_for_raw(items)
+    totals = _sum_items(items)
+    payload["totals"] = {
+        "kcal": totals["kcal"],
+        "protein_g": totals["protein"],
+        "fat_g": totals["fat"],
+        "carbs_g": totals["carbs"],
+    }
+    return payload
+
+
+def _load_meal_for_update(conn: sqlite3.Connection, meal_id: int, user_id: int) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, user_id, raw_json FROM meals WHERE id = ?",
+        (meal_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Приём пищи не найден")
+    if int(row["user_id"]) != int(user_id):
+        raise HTTPException(status_code=403, detail="Нет доступа к приёму пищи")
+    return row
+
+
+class MealItemUpdateRequest(BaseModel):
+    grams: float = Field(..., ge=0, le=5000)
+
+
+@app.patch("/api/meals/{meal_id}/items/{item_index}")
+def update_meal_item(
+    meal_id: int,
+    item_index: int,
+    payload: MealItemUpdateRequest,
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        row = _load_meal_for_update(conn, meal_id, user_id)
+        raw_payload = _safe_json_loads(row["raw_json"] or "")
+        raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else []
+        if not isinstance(raw_items, list) or not raw_items:
+            raise HTTPException(status_code=400, detail="В этом приёме нет детализации блюд")
+        if item_index < 0 or item_index >= len(raw_items):
+            raise HTTPException(status_code=404, detail="Блюдо не найдено")
+
+        items = [item for item in (_normalize_item(it) for it in raw_items) if item]
+        if item_index >= len(items):
+            raise HTTPException(status_code=404, detail="Блюдо не найдено")
+
+        current = items[item_index]
+        new_grams = float(payload.grams)
+        old_grams = float(current.get("grams") or 0)
+        ratio = (new_grams / old_grams) if old_grams > 0 else 0
+        current["grams"] = new_grams
+        current["kcal"] = float(current.get("kcal") or 0) * ratio
+        current["protein"] = float(current.get("protein") or 0) * ratio
+        current["fat"] = float(current.get("fat") or 0) * ratio
+        current["carbs"] = float(current.get("carbs") or 0) * ratio
+
+        totals = _sum_items(items)
+        rebuilt_payload = _rebuild_meal_payload(raw_payload, items)
+
+        conn.execute(
+            """
+            UPDATE meals
+            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            (
+                totals["kcal"],
+                totals["protein"],
+                totals["fat"],
+                totals["carbs"],
+                json.dumps(rebuilt_payload, ensure_ascii=False),
+                meal_id,
+            ),
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/meals/{meal_id}/items/{item_index}")
+def delete_meal_item(
+    meal_id: int,
+    item_index: int,
+    user_id: int = Depends(get_verified_user_id),
+) -> Dict[str, Any]:
+    conn = get_conn()
+    try:
+        row = _load_meal_for_update(conn, meal_id, user_id)
+        raw_payload = _safe_json_loads(row["raw_json"] or "")
+        raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else []
+        if not isinstance(raw_items, list) or not raw_items:
+            raise HTTPException(status_code=400, detail="В этом приёме нет детализации блюд")
+
+        items = [item for item in (_normalize_item(it) for it in raw_items) if item]
+        if item_index < 0 or item_index >= len(items):
+            raise HTTPException(status_code=404, detail="Блюдо не найдено")
+        items.pop(item_index)
+
+        if not items:
+            conn.execute("DELETE FROM meals WHERE id = ?", (meal_id,))
+            conn.commit()
+            return {"ok": True, "meal_deleted": True}
+
+        totals = _sum_items(items)
+        rebuilt_payload = _rebuild_meal_payload(raw_payload, items)
+        conn.execute(
+            """
+            UPDATE meals
+            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            (
+                totals["kcal"],
+                totals["protein"],
+                totals["fat"],
+                totals["carbs"],
+                json.dumps(rebuilt_payload, ensure_ascii=False),
+                meal_id,
+            ),
+        )
+        conn.commit()
+        return {"ok": True, "meal_deleted": False}
+    finally:
+        conn.close()
 
 def _build_stats_for_day(user_id: int, day: str) -> Dict[str, Any]:
     totals = get_daily_totals_for_user(user_id, day)

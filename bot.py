@@ -499,6 +499,20 @@ def build_webapp_payment_url(*, kind: str, plan_id: str | None = None, rub: int 
     return f"{base}?{urlencode(params)}"
 
 
+
+
+def build_webapp_edit_meal_url(*, meal_date: str, meal_id: int) -> str:
+    base = FOOD_WEBAPP_URL.rstrip("/") + "/"
+    from urllib.parse import urlencode
+    return f"{base}?{urlencode({'date': meal_date, 'edit_meal_id': int(meal_id)})}"
+
+
+def kb_open_meal_editor(*, meal_date: str, meal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✏️ Изменить в мини-приложении", web_app=WebAppInfo(url=build_webapp_edit_meal_url(meal_date=meal_date, meal_id=meal_id)))]]
+    )
+
+
 def kb_payg_topups():
     rows = []
 
@@ -3020,7 +3034,7 @@ async def _process_meal_calculation(
     fat = round(float(totals.get("fat_g", 0) or 0))
     carbs = round(float(totals.get("carbs_g", 0) or 0))
 
-    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+    meal_id = await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
 
     template_saved = False
     template_name = None
@@ -3096,6 +3110,7 @@ async def _process_meal_calculation(
             f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
         )
 
+    lines.append("\nЕсли хотите что-то скорректировать (граммовку/удаление блюда), откройте мини-приложение по кнопке ниже.")
     lines.append(
         "\n_Это приблизительная оценка по фото и данным, которые ты указал._"
     )
@@ -3107,6 +3122,10 @@ async def _process_meal_calculation(
         "extras": extras,
     }
     await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
+    await update.effective_chat.send_message(
+        "Открыть экран редактирования этого приёма:",
+        reply_markup=kb_open_meal_editor(meal_date=date.today().isoformat(), meal_id=meal_id),
+    )
 
 
 # ── Фото еды ─────────────────────────────────────────
@@ -3242,7 +3261,7 @@ async def process_meal_description(
     fat = round(float(totals.get("fat_g", 0) or 0))
     carbs = round(float(totals.get("carbs_g", 0) or 0))
 
-    await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+    meal_id = await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
 
     today_totals = await get_daily_totals(db, uid)
     goal = await get_goal(db, uid)
@@ -3293,6 +3312,7 @@ async def process_meal_description(
             f"  из {goal['carbs']} г (*{_perc(today_c, goal['carbs'])}%*)"
         )
 
+    lines.append("\nЕсли хотите что-то скорректировать (граммовку/удаление блюда), откройте мини-приложение по кнопке ниже.")
     lines.append(f"\n_{note}_")
 
     payg_footer = ""
@@ -3308,6 +3328,10 @@ async def process_meal_description(
         "extras": {},
     }
     await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
+    await update.effective_chat.send_message(
+        "Открыть экран редактирования этого приёма:",
+        reply_markup=kb_open_meal_editor(meal_date=date.today().isoformat(), meal_id=meal_id),
+    )
 
 
 # ── Текст: цель / уточнения / остальное ──────────────

@@ -244,6 +244,76 @@
         flex-wrap: wrap;
         margin: 10px 0;
       }
+
+      .today-meals-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .today-meals-header h2 {
+        margin: 0;
+      }
+      .meal-edit-btn {
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.95);
+        color: #e2e8f0;
+      }
+      .meal-edit-btn[disabled] {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .meal-editor-modal {
+        position: fixed;
+        inset: 0;
+        z-index: 45;
+        background: rgba(2, 6, 23, 0.7);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 14px;
+      }
+      .meal-editor-modal.open { display: flex; }
+      .meal-editor-card {
+        width: min(680px, 100%);
+        max-height: 90vh;
+        overflow: auto;
+        background: rgba(15, 23, 42, 0.98);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 16px;
+        padding: 14px;
+      }
+      .meal-editor-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      .meal-editor-list { display: grid; gap: 10px; margin-top: 10px; }
+      .meal-block {
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 12px;
+        background: rgba(2, 6, 23, 0.4);
+        padding: 10px;
+      }
+      .meal-block h4 { margin: 0 0 8px; font-size: 14px; }
+      .meal-item-editor {
+        border-top: 1px solid rgba(148, 163, 184, 0.2);
+        padding-top: 8px;
+        margin-top: 8px;
+      }
+      .meal-item-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      .meal-item-name { font-weight: 600; }
+      .meal-item-macros { font-size: 12px; color: #cbd5e1; margin-top: 4px; }
+      .meal-item-slider-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+      .meal-item-slider { width: 100%; }
+      .meal-editor-close-btn { min-width: 42px; }
       .meals-table {
         width: 100%;
         border-collapse: collapse;
@@ -507,7 +577,10 @@
       </div>
 
       <div class="card" id="card-today-meals">
-        <h2>Что съедено за день</h2>
+        <div class="today-meals-header">
+          <h2>Что съедено за день</h2>
+          <button id="btn-edit-day-meals" class="pill meal-edit-btn" type="button" aria-label="Редактировать блюда за день">✏️ Редактировать</button>
+        </div>
         <div id="today-meals"></div>
       </div>
 
@@ -712,6 +785,19 @@
       </div>
     </div>
 
+
+    <div id="meal-editor-modal" class="meal-editor-modal" role="dialog" aria-modal="true" aria-labelledby="meal-editor-title">
+      <div class="meal-editor-card">
+        <div class="meal-editor-header">
+          <h3 id="meal-editor-title">Редактирование приёмов пищи</h3>
+          <button id="meal-editor-close" class="pill meal-editor-close-btn" type="button" aria-label="Закрыть">✅</button>
+        </div>
+        <p class="hint">Изменяйте граммовку ползунком — КБЖУ пересчитываются и сохраняются автоматически.</p>
+        <div id="meal-editor-status" class="hint"></div>
+        <div id="meal-editor-list" class="meal-editor-list"></div>
+      </div>
+    </div>
+
     <script>
       const tg = window.Telegram?.WebApp;
       tg?.ready?.();
@@ -758,6 +844,11 @@
       const todayHintEl = document.getElementById("today-hint");
       const todayErrorEl = document.getElementById("today-error");
       const todayMealsEl = document.getElementById("today-meals");
+      const btnEditDayMeals = document.getElementById("btn-edit-day-meals");
+      const mealEditorModal = document.getElementById("meal-editor-modal");
+      const mealEditorClose = document.getElementById("meal-editor-close");
+      const mealEditorStatus = document.getElementById("meal-editor-status");
+      const mealEditorList = document.getElementById("meal-editor-list");
       const weekErrorEl = document.getElementById("week-error");
       const monthErrorEl = document.getElementById("month-error");
       const todayTitleEl = document.getElementById("today-title");
@@ -843,6 +934,10 @@
       let activeMode = "today"; // "today" | "yesterday" | "date"
       let selectedISO = null;
       let lastLoadedDateIso = null;
+      let lastDayData = null;
+      let mealEditorOpen = false;
+      let mealEditorTargetMealId = null;
+      let saveStatusTimer = null;
 
       function showScreen(name) {
         screenToday?.classList.toggle("active", name === "today");
@@ -1292,15 +1387,20 @@
         document.documentElement.style.setProperty("--amb-a", alpha.toFixed(3));
       }
 
-      async function fetchJson(url) {
-        const headers = {};
+      async function fetchJson(url, options = {}) {
+        const headers = { ...(options.headers || {}) };
         if (tgInitData) headers["X-Tg-Init-Data"] = tgInitData;
-        const res = await fetch(url, { headers, cache: "no-store" });
+        const requestOptions = { ...options, headers, cache: "no-store" };
+        const res = await fetch(url, requestOptions);
         if (!res.ok) {
           const body = await res.text();
           throw new Error(`HTTP ${res.status}: ${body}`);
         }
-        return res.json();
+        const ct = res.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          return res.json();
+        }
+        return null;
       }
 
       function renderToday(day, title, caption) {
@@ -1348,6 +1448,9 @@
         `;
 
         const meals = Array.isArray(day?.meals) ? day.meals : [];
+        if (btnEditDayMeals) {
+          btnEditDayMeals.disabled = !meals.length;
+        }
         if (todayMealsEl) {
           if (!meals.length) {
             todayMealsEl.innerHTML = '<div class="hint">За выбранную дату приёмы пищи ещё не добавлены.</div>';
@@ -1361,7 +1464,8 @@
                       const itemLines = Array.isArray(meal.items) && meal.items.length
                         ? meal.items.map((it) => `<div class="meal-items-line">${it.name}${it.grams ? ` — ${fmt(it.grams, 0)} г` : ""} (К ${fmt(it.kcal,0)}, Б ${fmt(it.protein,0)}, Ж ${fmt(it.fat,0)}, У ${fmt(it.carbs,0)})</div>`).join("")
                         : '<div class="meal-items-line">Без детализации блюда</div>';
-                      return `<tr><td>${meal.time || "—"}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
+                      const editBtn = meal.id ? `<button class="pill meal-edit-btn" type="button" data-edit-meal-id="${meal.id}">✏️</button>` : "";
+                      return `<tr><td>${meal.time || "—"} ${editBtn}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
                     })
                     .join("")}
                 </tbody>
@@ -1370,6 +1474,7 @@
           }
         }
 
+        lastDayData = day;
         todayErrorEl.textContent = "";
 
         const todayRingEl = document.getElementById("today-ring");
@@ -1414,6 +1519,77 @@
             todayHintEl.textContent = "За выбранную дату ещё нет записей.";
           }
         }
+      }
+
+      function setMealEditorStatus(text) {
+        if (!mealEditorStatus) return;
+        mealEditorStatus.textContent = text || "";
+        if (saveStatusTimer) clearTimeout(saveStatusTimer);
+        if (text) {
+          saveStatusTimer = setTimeout(() => {
+            if (mealEditorStatus.textContent === text) mealEditorStatus.textContent = "";
+          }, 1500);
+        }
+      }
+
+      function closeMealEditor() {
+        mealEditorOpen = false;
+        mealEditorTargetMealId = null;
+        mealEditorModal?.classList.remove("open");
+      }
+
+      function renderMealEditor() {
+        if (!mealEditorList) return;
+        const meals = Array.isArray(lastDayData?.meals) ? lastDayData.meals : [];
+        const filtered = mealEditorTargetMealId ? meals.filter((m) => Number(m.id) === Number(mealEditorTargetMealId)) : meals;
+        if (!filtered.length) {
+          mealEditorList.innerHTML = '<div class="hint">За выбранный день пока нечего редактировать.</div>';
+          return;
+        }
+        mealEditorList.innerHTML = filtered.map((meal) => {
+          const items = Array.isArray(meal.items) ? meal.items : [];
+          const itemHtml = items.length ? items.map((item, idx) => {
+            const grams = Number(item.grams || 0);
+            const sliderMax = Math.max(grams * 3, 300);
+            return `<div class="meal-item-editor" data-meal-id="${meal.id}" data-item-index="${idx}">
+              <div class="meal-item-top">
+                <div>
+                  <div class="meal-item-name">${item.name || "Блюдо"}</div>
+                  <div class="meal-item-macros">К ${fmt(item.kcal,0)} · Б ${fmt(item.protein,0)} · Ж ${fmt(item.fat,0)} · У ${fmt(item.carbs,0)}</div>
+                </div>
+                <button class="pill meal-edit-btn" type="button" data-action="delete-item" data-meal-id="${meal.id}" data-item-index="${idx}">Удалить</button>
+              </div>
+              <div class="meal-item-slider-row">
+                <input class="meal-item-slider" type="range" min="0" max="${sliderMax}" step="1" value="${grams}" data-action="grams-slider" data-meal-id="${meal.id}" data-item-index="${idx}" />
+                <span>${fmt(grams,0)} г</span>
+              </div>
+            </div>`;
+          }).join("") : '<div class="hint">Без детализации блюд.</div>';
+
+          return `<div class="meal-block">
+            <h4>${meal.time || "—"} · К ${fmt(meal.kcal,0)} / Б ${fmt(meal.protein,0)} / Ж ${fmt(meal.fat,0)} / У ${fmt(meal.carbs,0)}</h4>
+            ${itemHtml}
+          </div>`;
+        }).join("");
+      }
+
+      function openMealEditor(mealId = null) {
+        mealEditorTargetMealId = mealId ? Number(mealId) : null;
+        mealEditorOpen = true;
+        renderMealEditor();
+        mealEditorModal?.classList.add("open");
+      }
+
+      async function saveMealItemGrams(mealId, itemIndex, grams) {
+        await fetchJson(`/api/meals/${mealId}/items/${itemIndex}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ grams }),
+        });
+      }
+
+      async function deleteMealItem(mealId, itemIndex) {
+        await fetchJson(`/api/meals/${mealId}/items/${itemIndex}`, { method: "DELETE" });
       }
 
       async function loadDay(mode, dateIso) {
@@ -1810,9 +1986,67 @@ function setActiveAnalyticsPreset(range) {
       });
       subModal?.addEventListener("click", (e) => { if (e.target === subModal) setModalOpen(subModal, false); });
       paygModal?.addEventListener("click", (e) => { if (e.target === paygModal) setModalOpen(paygModal, false); });
-      paymentSuccessModal?.addEventListener("click", (e) => { if (e.target === paymentSuccessModal) setModalOpen(paymentSuccessModal, false); });
+      btnEditDayMeals?.addEventListener("click", () => openMealEditor(null));
+      mealEditorClose?.addEventListener("click", () => closeMealEditor());
+      mealEditorModal?.addEventListener("click", (e) => { if (e.target === mealEditorModal) closeMealEditor(); });
+
+      todayMealsEl?.addEventListener("click", (e) => {
+        const btn = e.target?.closest?.("[data-edit-meal-id]");
+        if (!btn) return;
+        const mealId = Number(btn.getAttribute("data-edit-meal-id") || 0);
+        if (!mealId) return;
+        openMealEditor(mealId);
+      });
+
+      mealEditorList?.addEventListener("input", (e) => {
+        const slider = e.target?.closest?.("[data-action='grams-slider']");
+        if (!slider) return;
+        const row = slider.closest(".meal-item-slider-row");
+        const valueEl = row?.querySelector("span");
+        if (valueEl) valueEl.textContent = `${fmt(slider.value,0)} г`;
+      });
+
+      mealEditorList?.addEventListener("change", async (e) => {
+        const slider = e.target?.closest?.("[data-action='grams-slider']");
+        if (!slider) return;
+        const row = slider.closest(".meal-item-slider-row");
+        const valueEl = row?.querySelector("span");
+        if (valueEl) valueEl.textContent = `${fmt(slider.value,0)} г`;
+        const mealId = Number(slider.getAttribute("data-meal-id") || 0);
+        const itemIndex = Number(slider.getAttribute("data-item-index") || -1);
+        if (!mealId || itemIndex < 0) return;
+        try {
+          setMealEditorStatus("Сохраняем...");
+          await saveMealItemGrams(mealId, itemIndex, Number(slider.value || 0));
+          await loadDay(activeMode, lastLoadedDateIso);
+          if (mealEditorOpen) renderMealEditor();
+          setMealEditorStatus("Изменения сохранены");
+        } catch (err) {
+          console.error(err);
+          setMealEditorStatus("Не удалось сохранить изменение");
+        }
+      });
+
+      mealEditorList?.addEventListener("click", async (e) => {
+        const btn = e.target?.closest?.("[data-action='delete-item']");
+        if (!btn) return;
+        const mealId = Number(btn.getAttribute("data-meal-id") || 0);
+        const itemIndex = Number(btn.getAttribute("data-item-index") || -1);
+        if (!mealId || itemIndex < 0) return;
+        try {
+          setMealEditorStatus("Удаляем...");
+          await deleteMealItem(mealId, itemIndex);
+          await loadDay(activeMode, lastLoadedDateIso);
+          if (mealEditorOpen) renderMealEditor();
+          setMealEditorStatus("Изменения сохранены");
+        } catch (err) {
+          console.error(err);
+          setMealEditorStatus("Не удалось удалить блюдо");
+        }
+      });
 
       (async function init() {
+
         const queryPayment = paymentQueryConfig();
         let forcePaymentScreen = false;
         try {
@@ -1879,7 +2113,17 @@ function setActiveAnalyticsPreset(range) {
         showScreen(forcePaymentScreen ? "payment" : "today");
         initPaymentButtons();
         setActiveAnalyticsPreset("7d");
-        await loadDay("today");
+        const initParams = new URLSearchParams(location.search);
+        const dateFromQuery = initParams.get("date") || "";
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateFromQuery)) {
+          setActiveMode("date");
+          selectedISO = dateFromQuery;
+          await loadDay("date", dateFromQuery);
+        } else {
+          await loadDay("today");
+        }
+        const mealIdFromQuery = Number(initParams.get("edit_meal_id") || 0);
+        if (mealIdFromQuery) openMealEditor(mealIdFromQuery);
         await loadHistory();
         await loadAdvancedStats("7d");
         await checkPendingPaymentStatus({ silent: true });
