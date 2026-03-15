@@ -507,11 +507,6 @@ def build_webapp_edit_meal_url(*, meal_date: str, meal_id: int) -> str:
     return f"{base}?{urlencode({'date': meal_date, 'edit_meal_id': int(meal_id)})}"
 
 
-def kb_open_meal_editor(*, meal_date: str, meal_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✏️ Изменить в мини-приложении", web_app=WebAppInfo(url=build_webapp_edit_meal_url(meal_date=meal_date, meal_id=meal_id)))]]
-    )
-
 
 def kb_payg_topups():
     rows = []
@@ -1887,13 +1882,21 @@ def format_meal_items_human(items: list | None) -> list[str]:
     return lines
 
 
-def kb_save_template_after_meal() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💾 Сохранить как шаблон", callback_data="save_result_template")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="main")],
-        ]
-    )
+def kb_save_template_after_meal(*, meal_date: str | None = None, meal_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("💾 Сохранить как шаблон", callback_data="save_result_template")],
+    ]
+    if meal_date and meal_id:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить в мини-приложении",
+                    web_app=WebAppInfo(url=build_webapp_edit_meal_url(meal_date=meal_date, meal_id=meal_id)),
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def infer_template_name(data: dict, extras: dict) -> str:
@@ -3121,10 +3124,11 @@ async def _process_meal_calculation(
         "totals": totals,
         "extras": extras,
     }
-    await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
-    await update.effective_chat.send_message(
-        "Открыть экран редактирования этого приёма:",
-        reply_markup=kb_open_meal_editor(meal_date=date.today().isoformat(), meal_id=meal_id),
+    await edit_menu_message(
+        update,
+        ctx,
+        msg,
+        kb_save_template_after_meal(meal_date=date.today().isoformat(), meal_id=meal_id),
     )
 
 
@@ -3327,10 +3331,11 @@ async def process_meal_description(
         "totals": totals,
         "extras": {},
     }
-    await edit_menu_message(update, ctx, msg, kb_save_template_after_meal())
-    await update.effective_chat.send_message(
-        "Открыть экран редактирования этого приёма:",
-        reply_markup=kb_open_meal_editor(meal_date=date.today().isoformat(), meal_id=meal_id),
+    await edit_menu_message(
+        update,
+        ctx,
+        msg,
+        kb_save_template_after_meal(meal_date=date.today().isoformat(), meal_id=meal_id),
     )
 
 

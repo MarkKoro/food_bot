@@ -310,10 +310,22 @@
         gap: 8px;
       }
       .meal-item-name { font-weight: 600; }
+      .meal-item-top .meal-edit-btn {
+        width: 94px;
+      }
       .meal-item-macros { font-size: 12px; color: #cbd5e1; margin-top: 4px; }
       .meal-item-slider-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
-      .meal-item-slider { width: 100%; }
-      .meal-editor-close-btn { min-width: 42px; }
+      .meal-item-slider {
+        flex: 1;
+        min-width: 0;
+      }
+      .meal-item-grams-input {
+        width: 94px;
+        min-width: 94px;
+        text-align: center;
+        border-radius: 999px;
+      }
+      .meal-editor-close-btn { min-width: 96px; font-size: 15px; font-weight: 700; padding: 10px 16px; }
       .meals-table {
         width: 100%;
         border-collapse: collapse;
@@ -790,9 +802,9 @@
       <div class="meal-editor-card">
         <div class="meal-editor-header">
           <h3 id="meal-editor-title">Редактирование приёмов пищи</h3>
-          <button id="meal-editor-close" class="pill meal-editor-close-btn" type="button" aria-label="Закрыть">✅</button>
+          <button id="meal-editor-close" class="pill meal-editor-close-btn" type="button" aria-label="Закрыть">Закрыть</button>
         </div>
-        <p class="hint">Изменяйте граммовку ползунком — КБЖУ пересчитываются и сохраняются автоматически.</p>
+        <p class="hint">Изменяйте граммовку ползунком или введите вручную — КБЖУ пересчитываются и сохраняются автоматически.</p>
         <div id="meal-editor-status" class="hint"></div>
         <div id="meal-editor-list" class="meal-editor-list"></div>
       </div>
@@ -1561,7 +1573,7 @@
               </div>
               <div class="meal-item-slider-row">
                 <input class="meal-item-slider" type="range" min="0" max="${sliderMax}" step="1" value="${grams}" data-action="grams-slider" data-meal-id="${meal.id}" data-item-index="${idx}" />
-                <span>${fmt(grams,0)} г</span>
+                <input class="pill pill-secondary meal-item-grams-input" type="number" min="0" max="${sliderMax}" step="1" inputmode="numeric" aria-label="Граммовка блюда" value="${fmt(grams,0)}" data-action="grams-input" data-meal-id="${meal.id}" data-item-index="${idx}" />
               </div>
             </div>`;
           }).join("") : '<div class="hint">Без детализации блюд.</div>';
@@ -1998,26 +2010,32 @@ function setActiveAnalyticsPreset(range) {
         openMealEditor(mealId);
       });
 
-      mealEditorList?.addEventListener("input", (e) => {
-        const slider = e.target?.closest?.("[data-action='grams-slider']");
-        if (!slider) return;
-        const row = slider.closest(".meal-item-slider-row");
-        const valueEl = row?.querySelector("span");
-        if (valueEl) valueEl.textContent = `${fmt(slider.value,0)} г`;
-      });
+      function syncMealItemGramsRow(row, grams) {
+        if (!row) return;
+        const slider = row.querySelector("[data-action='grams-slider']");
+        const input = row.querySelector("[data-action='grams-input']");
+        if (slider && Number(slider.value) !== grams) slider.value = String(grams);
+        if (input && Number(input.value) !== grams) input.value = String(grams);
+      }
 
-      mealEditorList?.addEventListener("change", async (e) => {
-        const slider = e.target?.closest?.("[data-action='grams-slider']");
-        if (!slider) return;
-        const row = slider.closest(".meal-item-slider-row");
-        const valueEl = row?.querySelector("span");
-        if (valueEl) valueEl.textContent = `${fmt(slider.value,0)} г`;
+      async function commitMealItemGrams(sourceEl) {
+        const row = sourceEl?.closest?.(".meal-item-slider-row");
+        if (!row) return;
+        const slider = row.querySelector("[data-action='grams-slider']");
+        const input = row.querySelector("[data-action='grams-input']");
+        if (!slider || !input) return;
+        const max = Number(slider.max || 0) || 0;
+        const parsedValue = Number(input.value);
+        const safeValue = Number.isFinite(parsedValue) ? Math.max(0, Math.min(max, Math.round(parsedValue))) : Number(slider.value || 0);
+        syncMealItemGramsRow(row, safeValue);
+        if (sourceEl?.dataset?.lastCommittedGrams === String(safeValue)) return;
+        if (sourceEl?.dataset) sourceEl.dataset.lastCommittedGrams = String(safeValue);
         const mealId = Number(slider.getAttribute("data-meal-id") || 0);
         const itemIndex = Number(slider.getAttribute("data-item-index") || -1);
         if (!mealId || itemIndex < 0) return;
         try {
           setMealEditorStatus("Сохраняем...");
-          await saveMealItemGrams(mealId, itemIndex, Number(slider.value || 0));
+          await saveMealItemGrams(mealId, itemIndex, safeValue);
           await loadDay(activeMode, lastLoadedDateIso);
           if (mealEditorOpen) renderMealEditor();
           setMealEditorStatus("Изменения сохранены");
@@ -2025,7 +2043,45 @@ function setActiveAnalyticsPreset(range) {
           console.error(err);
           setMealEditorStatus("Не удалось сохранить изменение");
         }
+      }
+
+      mealEditorList?.addEventListener("input", (e) => {
+        const slider = e.target?.closest?.("[data-action='grams-slider']");
+        if (slider) {
+          const row = slider.closest(".meal-item-slider-row");
+          syncMealItemGramsRow(row, Number(slider.value || 0));
+          return;
+        }
+        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
+        if (!gramsInput) return;
+        const row = gramsInput.closest(".meal-item-slider-row");
+        if (!row) return;
+        const sliderInRow = row.querySelector("[data-action='grams-slider']");
+        const max = Number(sliderInRow?.max || 0) || 0;
+        const typedValue = Number(gramsInput.value);
+        if (!Number.isFinite(typedValue)) return;
+        const safeValue = Math.max(0, Math.min(max, Math.round(typedValue)));
+        syncMealItemGramsRow(row, safeValue);
       });
+
+      mealEditorList?.addEventListener("change", async (e) => {
+        const gramsControl = e.target?.closest?.("[data-action='grams-slider'], [data-action='grams-input']");
+        if (!gramsControl) return;
+        await commitMealItemGrams(gramsControl);
+      });
+
+      mealEditorList?.addEventListener("keydown", async (e) => {
+        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
+        if (!gramsInput || e.key !== "Enter") return;
+        e.preventDefault();
+        await commitMealItemGrams(gramsInput);
+      });
+
+      mealEditorList?.addEventListener("blur", async (e) => {
+        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
+        if (!gramsInput) return;
+        await commitMealItemGrams(gramsInput);
+      }, true);
 
       mealEditorList?.addEventListener("click", async (e) => {
         const btn = e.target?.closest?.("[data-action='delete-item']");
