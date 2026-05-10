@@ -10,6 +10,7 @@ import base64
 import logging
 import math
 import re
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -77,6 +78,11 @@ from db import (
     purge_user,
     list_rub_receipt_payments,
     mark_receipt_status,
+    create_gift_code,
+    redeem_gift_code,
+    get_gift_codes_stats,
+    list_unused_gift_codes,
+    deactivate_gift_code,
 )
 
 # ── Модель тарифов ─────────────────────────────────────
@@ -460,6 +466,7 @@ def kb_settings() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
+            [InlineKeyboardButton("🎁 Подарочный код", callback_data="gift_code")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
     )
@@ -467,6 +474,36 @@ def kb_settings() -> InlineKeyboardMarkup:
 
 def kb_goal_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]])
+
+
+def _gen_gift_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3))
+
+
+def kb_gift_code_user() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="settings")]])
+
+
+def kb_gift_code_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать новый код", callback_data="gift_code:create")],
+        [InlineKeyboardButton("📚 Коды", callback_data="gift_code:codes")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="settings")],
+    ])
+
+
+def kb_gift_codes_list(codes: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🎟 {c['code']} ({c['bonus_days']}д)", callback_data=f"gift_code:manage:{c['id']}")] for c in codes[:20]]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="gift_code")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_gift_code_manage(code_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Деактивировать", callback_data=f"gift_code:delete:{code_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="gift_code:codes")],
+    ])
 
 
 def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_text: str):
@@ -1770,6 +1807,7 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• 🎯 Задать цель КБЖУ вручную — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
         "• 💳 Режим оплаты — управление подпиской и PAYG внутри настроек.\n"
+        "• 🎁 Подарочный код — активируйте код на премиум-подписку.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
 
@@ -3421,6 +3459,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_template_settings(update, ctx)
         return
 
+    if state == "await_gift_code_input":
+        await delete_user_message(update)
+        status, bonus_days = await redeem_gift_code(db, text.upper(), uid)
+        if status == "ok":
+            until = await get_premium_until(db, uid)
+            notice = f"✅ Подарочный код активирован: +{bonus_days} дн. премиума. Действует до {fmt_dt(until)}."
+            await show_main_menu(update, ctx, notice=notice)
+        elif status == "used":
+            await edit_menu_message(update, ctx, "Извините, этот код уже истек (был использован).", kb_gift_code_user())
+        else:
+            await edit_menu_message(update, ctx, "Извините, такого кода не существует или он недействителен.", kb_gift_code_user())
+        return
+
+    if state == "await_gift_code_days":
+        await delete_user_message(update)
+        try:
+            days = int(text)
+        except Exception:
+            days = 0
+        if days <= 0 or days > 3650:
+            await edit_menu_message(update, ctx, "Введите целое число дней от 1 до 3650.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="gift_code")]]))
+            return
+        code = _gen_gift_code()
+        await create_gift_code(db, code, days, uid)
+        ctx.user_data["state"] = None
+        await edit_menu_message(update, ctx, f"✅ Код создан на {days} дн.\n\n`{code}`\n\nНажмите на код выше, чтобы скопировать.", kb_gift_code_admin())
+        return
+
     # Уточнения после фото
     pending = ctx.user_data.get("pending_meal") or {}
     extras = pending.get("extras") or {}
@@ -3878,6 +3944,48 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await show_template_settings(update, ctx, page=page)
     elif data == "settings":
         await show_settings(update, ctx)
+    elif data == "gift_code":
+        ctx.user_data["state"] = "await_gift_code_input"
+        if is_admin(uid):
+            await edit_menu_message(update, ctx, "🎁 Подарочные коды\n\nЗдесь можно активировать код или управлять кодами администратора.", kb_gift_code_admin())
+        else:
+            await edit_menu_message(update, ctx, "🎁 Подарочный код\n\nЗдесь вы можете ввести подарочный код для получения премиума.\nОтправьте код следующим сообщением.", kb_gift_code_user())
+    elif data == "gift_code:create":
+        if not is_admin(uid):
+            await show_settings(update, ctx)
+            return
+        ctx.user_data["state"] = "await_gift_code_days"
+        await edit_menu_message(update, ctx, "Введите количество дней премиума для нового кода.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="gift_code")]]))
+    elif data == "gift_code:codes":
+        if not is_admin(uid):
+            await show_settings(update, ctx)
+            return
+        st = await get_gift_codes_stats(db)
+        codes = await list_unused_gift_codes(db, limit=20)
+        txt = f"📚 Коды\n\nВсего создано: {st['total']}\nАктивные: {st['active']}\nИспользованные: {st['used']}\n\nВыберите неиспользованный код:"
+        await edit_menu_message(update, ctx, txt, kb_gift_codes_list(codes))
+    elif data.startswith("gift_code:manage:"):
+        if not is_admin(uid):
+            await show_settings(update, ctx)
+            return
+        code_id = int(data.split(":")[-1])
+        codes = await list_unused_gift_codes(db, limit=200)
+        c = next((x for x in codes if x['id']==code_id), None)
+        if not c:
+            await edit_menu_message(update, ctx, "Код уже недоступен.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="gift_code:codes")]]))
+            return
+        await edit_menu_message(update, ctx, f"Код: `{c['code']}`\nДней: {c['bonus_days']}", kb_gift_code_manage(code_id))
+    elif data.startswith("gift_code:delete:"):
+        if not is_admin(uid):
+            await show_settings(update, ctx)
+            return
+        code_id = int(data.split(":")[-1])
+        await deactivate_gift_code(db, code_id)
+        st = await get_gift_codes_stats(db)
+        codes = await list_unused_gift_codes(db, limit=20)
+        txt = f"📚 Коды\n\nВсего создано: {st['total']}\nАктивные: {st['active']}\nИспользованные: {st['used']}\n\nВыберите неиспользованный код:"
+        await edit_menu_message(update, ctx, txt, kb_gift_codes_list(codes))
+        return
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
     elif data == "premium_menu_stars":
