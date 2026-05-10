@@ -123,6 +123,16 @@ async def create_tables(db: aiosqlite.Connection) -> int:
             granted_at TEXT DEFAULT (datetime('now','utc')),
             PRIMARY KEY (promo_id, user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS gift_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            bonus_days INTEGER NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now','utc')),
+            used_by INTEGER,
+            used_at TEXT
+        );
         """
     )
     await db.commit()
@@ -375,6 +385,103 @@ async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
     except Exception:
         return False
     return dt >= datetime.utcnow()
+
+
+
+
+async def create_gift_code(
+    db: aiosqlite.Connection, code: str, bonus_days: int, created_by: int
+) -> int:
+    cur = await db.execute(
+        "INSERT INTO gift_codes (code, bonus_days, created_by) VALUES (?, ?, ?)",
+        (code, bonus_days, created_by),
+    )
+    await db.commit()
+    return int(cur.lastrowid)
+
+
+async def get_gift_code(db: aiosqlite.Connection, code: str) -> dict | None:
+    cur = await db.execute(
+        "SELECT id, code, bonus_days, created_by, created_at, used_by, used_at FROM gift_codes WHERE code = ?",
+        (code,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "code": row[1],
+        "bonus_days": int(row[2]),
+        "created_by": int(row[3]),
+        "created_at": row[4],
+        "used_by": int(row[5]) if row[5] is not None else None,
+        "used_at": row[6],
+    }
+
+
+async def redeem_gift_code(db: aiosqlite.Connection, code: str, user_id: int) -> tuple[str, int]:
+    cur = await db.execute(
+        "SELECT id, bonus_days, used_by FROM gift_codes WHERE code = ?",
+        (code,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return "not_found", 0
+
+    gift_id, bonus_days, used_by = int(row[0]), int(row[1]), row[2]
+    if used_by is not None:
+        return "used", bonus_days
+
+    now_iso = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        "UPDATE gift_codes SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL",
+        (user_id, now_iso, gift_id),
+    )
+    if cur.rowcount <= 0:
+        await db.rollback()
+        return "used", bonus_days
+
+    await ensure_user(db, user_id)
+    current_until = await get_premium_until(db, user_id)
+    now = datetime.utcnow()
+    base = current_until if current_until and current_until > now else now
+    new_until = base + timedelta(days=bonus_days)
+    await set_premium_until(db, user_id, new_until)
+    await db.commit()
+    return "ok", bonus_days
+
+
+async def get_gift_codes_stats(db: aiosqlite.Connection) -> dict:
+    cur = await db.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN used_by IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN used_by IS NOT NULL THEN 1 ELSE 0 END) FROM gift_codes"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    total = int((row[0] if row else 0) or 0)
+    active = int((row[1] if row else 0) or 0)
+    used = int((row[2] if row else 0) or 0)
+    return {"total": total, "active": active, "used": used}
+
+
+async def list_unused_gift_codes(db: aiosqlite.Connection, limit: int = 50) -> list[dict]:
+    cur = await db.execute(
+        "SELECT id, code, bonus_days, created_at FROM gift_codes WHERE used_by IS NULL ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [{"id": int(r[0]), "code": r[1], "bonus_days": int(r[2]), "created_at": r[3]} for r in rows]
+
+
+async def deactivate_gift_code(db: aiosqlite.Connection, code_id: int) -> bool:
+    cur = await db.execute(
+        "UPDATE gift_codes SET used_by = 0, used_at = datetime('now','utc') WHERE id = ? AND used_by IS NULL",
+        (code_id,),
+    )
+    await db.commit()
+    return cur.rowcount > 0
 
 
 async def get_trial_info(
