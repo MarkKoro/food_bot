@@ -1,7 +1,8 @@
-python-telegram-bot==21.*
+python-telegram-bot[rate-limiter]==21.*
 httpx
-openai
 python-dotenv
 Pillow
 aiosqlite
 openpyxl
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

@@ -5,16 +5,19 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 import aiosqlite
+from dotenv import load_dotenv
 
 # Путь к базе: ./data/food_bot.sqlite3
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = str(DATA_DIR / "food_bot.sqlite3")
+load_dotenv(BASE_DIR / ".env")
+_db_path = Path(os.getenv("DB_PATH", "data/food_bot.sqlite3")).expanduser()
+DB_PATH = str(_db_path if _db_path.is_absolute() else BASE_DIR / _db_path)
 
 
 async def create_tables(db: aiosqlite.Connection) -> int:
     """Создаём все нужные таблицы, если их ещё нет."""
+    await db.execute("PRAGMA busy_timeout=30000")
+    await db.execute("PRAGMA journal_mode=WAL")
     await db.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -137,6 +140,9 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     )
     await db.commit()
 
+    from billing import SCHEMA
+    await db.executescript(SCHEMA)
+    await db.execute("BEGIN IMMEDIATE")
     # Миграции: добавляем новые столбцы в users, если их ещё нет
     cur = await db.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in await cur.fetchall()]
@@ -161,14 +167,12 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     for col, definition in required_cols.items():
         if col not in cols:
             await db.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
-            await db.commit()
             added_cols.add(col)
 
     if "trial_granted" in cols or "trial_granted" in added_cols:
         await db.execute(
             "UPDATE users SET trial_granted=1 WHERE trial_until IS NOT NULL AND trial_granted=0"
         )
-        await db.commit()
 
     # ── Миграции: payments (идемпотентность платежей)
     cur = await db.execute("PRAGMA table_info(payments)")
@@ -176,7 +180,7 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     await cur.close()
 
     required_pcols = {
-        "ts": "INTEGER NOT NULL DEFAULT (strftime('%s','now'))",
+        "ts": "INTEGER NOT NULL DEFAULT 0",
         "telegram_charge_id": "TEXT",
         "provider_charge_id": "TEXT",
         "amount_rub": "INTEGER NOT NULL DEFAULT 0",
@@ -202,8 +206,9 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     for col, definition in required_pcols.items():
         if col not in pcols:
             await db.execute(f"ALTER TABLE payments ADD COLUMN {col} {definition}")
-            await db.commit()
 
+    await db.execute("UPDATE payments SET telegram_charge_id=NULL WHERE telegram_charge_id=''")
+    await db.execute("UPDATE payments SET provider_charge_id=NULL WHERE provider_charge_id=''")
     await db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_telegram_charge_id "
         "ON payments(telegram_charge_id) WHERE telegram_charge_id IS NOT NULL"
@@ -215,6 +220,26 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_payments_user_ts ON payments(user_id, ts)"
     )
+
+    cur = await db.execute("PRAGMA table_info(meals)")
+    meal_cols = [row[1] for row in await cur.fetchall()]
+    if "version" not in meal_cols:
+        await db.execute("ALTER TABLE meals ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    if "source_key" not in meal_cols:
+        await db.execute("ALTER TABLE meals ADD COLUMN source_key TEXT")
+    await cur.close()
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meals_source ON meals(user_id,source_key) WHERE source_key IS NOT NULL")
+
+    cur = await db.execute("PRAGMA table_info(requests)")
+    request_cols = [row[1] for row in await cur.fetchall()]
+    await cur.close()
+    if "pay_mode" not in request_cols:
+        await db.execute("ALTER TABLE requests ADD COLUMN pay_mode TEXT")
+    if "cost_rub" not in request_cols:
+        await db.execute("ALTER TABLE requests ADD COLUMN cost_rub INTEGER")
+    # Old Telegram subscription helper stored kopecks in amount_rub; PAYG stored rubles.
+    await db.execute("UPDATE payments SET amount_rub=amount_rub/100,currency='RUB' WHERE currency IS NULL "
+                     "AND raw LIKE 'currency=RUB; amount=%' AND payload LIKE 'sub:%' AND amount_rub % 100 = 0")
     await db.commit()
 
 
@@ -234,6 +259,8 @@ async def ensure_user(db: aiosqlite.Connection, telegram_id: int) -> bool:
 async def add_promotion(
     db: aiosqlite.Connection, total_slots: int, bonus_days: int
 ) -> int:
+    if not 1 <= total_slots <= 1000000 or not 1 <= bonus_days <= 3650:
+        raise ValueError("Некорректные параметры акции")
     cur = await db.execute(
         "INSERT INTO promotions (total_slots, remaining_slots, bonus_days) VALUES (?, ?, ?)",
         (total_slots, total_slots, bonus_days),
@@ -290,38 +317,22 @@ async def clear_promotions(db: aiosqlite.Connection) -> int:
 async def grant_active_promotion(
     db: aiosqlite.Connection, user_id: int
 ) -> tuple[dict | None, bool]:
-    await ensure_user(db, user_id)
-
-    cur = await db.execute(
-        "SELECT promo_id FROM promotion_grants WHERE user_id = ?",
-        (user_id,),
-    )
-    already = await cur.fetchone()
-    await cur.close()
-    if already:
-        return None, False
-
-    promo = await get_active_promotion(db)
-    if not promo:
-        return None, False
-
-    async with db.execute(
-        "UPDATE promotions SET remaining_slots = remaining_slots - 1 "
-        "WHERE id = ? AND remaining_slots > 0",
-        (promo["id"],),
-    ) as upd:
-        await db.commit()
-        if upd.rowcount != 1:
-            return None, False
-
-    await db.execute(
-        "INSERT INTO promotion_grants (promo_id, user_id) VALUES (?, ?)",
-        (promo["id"], user_id),
-    )
-    await db.commit()
-
-    promo["remaining_slots"] -= 1
-    return promo, True
+    import asyncio
+    from billing import connection, extend_subscription
+    def grant():
+        with connection(write=True) as conn:
+            if conn.execute("SELECT 1 FROM promotion_grants WHERE user_id=?", (user_id,)).fetchone():
+                return None, False
+            row = conn.execute("SELECT id, total_slots, remaining_slots, bonus_days FROM promotions WHERE remaining_slots>0 ORDER BY id ASC LIMIT 1").fetchone()
+            if not row:
+                return None, False
+            promo = dict(row)
+            conn.execute("UPDATE promotions SET remaining_slots=remaining_slots-1 WHERE id=?", (promo["id"],))
+            conn.execute("INSERT INTO promotion_grants(promo_id,user_id) VALUES (?,?)", (promo["id"],user_id))
+            extend_subscription(conn,user_id,promo["bonus_days"])
+            promo["remaining_slots"] -= 1
+            return promo, True
+    return await asyncio.to_thread(grant)
 
 
 async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
@@ -329,16 +340,16 @@ async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
         "meals",
         "goals",
         "subscriptions",
-        "payments",
         "requests",
         "templates",
-        "promotion_grants",
     ]
 
     for table in tables_with_user_id:
         await db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
 
-    await db.execute("DELETE FROM users WHERE telegram_id = ?", (user_id,))
+    # Keep the account, paid entitlements, receipt and redemption history.
+    await db.execute("UPDATE users SET last_menu_message_id=NULL WHERE telegram_id=?", (user_id,))
+    await db.execute("DELETE FROM bot_state WHERE user_id=?", (user_id,))
     await db.execute("DELETE FROM invites WHERE referrer_id = ? OR invited_id = ?", (user_id, user_id))
     await db.commit()
 
@@ -362,7 +373,8 @@ async def get_premium_until(
     if not row or not row[0]:
         return None
     try:
-        return datetime.fromisoformat(row[0])
+        from billing import utc_datetime
+        return utc_datetime(row[0])
     except Exception:
         return None
 
@@ -381,7 +393,8 @@ async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
     if not premium_until:
         return False
     try:
-        dt = datetime.fromisoformat(premium_until)
+        from billing import utc_datetime
+        dt = utc_datetime(premium_until)
     except Exception:
         return False
     return dt >= datetime.utcnow()
@@ -421,36 +434,19 @@ async def get_gift_code(db: aiosqlite.Connection, code: str) -> dict | None:
 
 
 async def redeem_gift_code(db: aiosqlite.Connection, code: str, user_id: int) -> tuple[str, int]:
-    cur = await db.execute(
-        "SELECT id, bonus_days, used_by FROM gift_codes WHERE code = ?",
-        (code,),
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    if not row:
-        return "not_found", 0
-
-    gift_id, bonus_days, used_by = int(row[0]), int(row[1]), row[2]
-    if used_by is not None:
-        return "used", bonus_days
-
-    now_iso = datetime.utcnow().isoformat()
-    cur = await db.execute(
-        "UPDATE gift_codes SET used_by = ?, used_at = ? WHERE id = ? AND used_by IS NULL",
-        (user_id, now_iso, gift_id),
-    )
-    if cur.rowcount <= 0:
-        await db.rollback()
-        return "used", bonus_days
-
-    await ensure_user(db, user_id)
-    current_until = await get_premium_until(db, user_id)
-    now = datetime.utcnow()
-    base = current_until if current_until and current_until > now else now
-    new_until = base + timedelta(days=bonus_days)
-    await set_premium_until(db, user_id, new_until)
-    await db.commit()
-    return "ok", bonus_days
+    import asyncio
+    from billing import connection, extend_subscription, utc_datetime
+    def redeem():
+        with connection(write=True) as conn:
+            row = conn.execute("SELECT id,bonus_days,used_by FROM gift_codes WHERE code=?", (code,)).fetchone()
+            if not row:
+                return "not_found", 0
+            if row["used_by"] is not None:
+                return "used", row["bonus_days"]
+            conn.execute("UPDATE gift_codes SET used_by=?,used_at=? WHERE id=?", (user_id,utc_datetime().isoformat(),row["id"]))
+            extend_subscription(conn,user_id,row["bonus_days"])
+            return "ok", row["bonus_days"]
+    return await asyncio.to_thread(redeem)
 
 
 async def get_gift_codes_stats(db: aiosqlite.Connection) -> dict:
@@ -501,7 +497,8 @@ async def get_trial_info(
     trial_until = None
     if trial_until_raw:
         try:
-            trial_until = datetime.fromisoformat(trial_until_raw)
+            from billing import utc_datetime
+            trial_until = utc_datetime(trial_until_raw)
         except Exception:
             trial_until = None
 
@@ -653,6 +650,11 @@ async def add_template(
     totals: dict,
     raw_json: str | None = None,
 ) -> int:
+    from billing import validate_totals
+    totals = validate_totals(totals)
+    name = name.strip()[:80]
+    if not name:
+        raise ValueError("Empty template name")
     await ensure_user(db, user_id)
 
     kcal = float(totals.get("kcal") or 0.0)
@@ -746,6 +748,9 @@ async def delete_template(
 async def rename_template(
     db: aiosqlite.Connection, user_id: int, template_id: int, new_name: str
 ) -> None:
+    new_name = new_name.strip()[:80]
+    if not new_name:
+        raise ValueError("Empty template name")
     await ensure_user(db, user_id)
     await db.execute(
         "UPDATE templates SET name = ? WHERE id = ? AND user_id = ?",
@@ -1012,6 +1017,10 @@ async def set_goal(
     fat: float,
     carbs: float,
 ) -> None:
+    from billing import validate_totals
+    values = validate_totals(dict(kcal=kcal,protein_g=protein,fat_g=fat,carbs_g=carbs))
+    if not 1 <= values["kcal"] <= 20000 or any(v>5000 for k,v in values.items() if k!="kcal"):
+        raise ValueError("Invalid goal")
     await ensure_user(db, telegram_id)
     await db.execute(
         """

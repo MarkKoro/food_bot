@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os
+from pathlib import Path
+from functools import wraps
+import billing
 import asyncio
 import io
 import json
@@ -102,11 +105,8 @@ class SubscriptionPlan:
 
 
 SUB_PLANS: dict[str, SubscriptionPlan] = {
-    "w1": SubscriptionPlan("w1", "Одна неделя", 0, 125, 84),  # 125₽ ≈ 84⭐
-    "m1": SubscriptionPlan("m1", "1 месяц", 1, 399, 266),  # 399₽ ≈ 266⭐
-    "m3": SubscriptionPlan("m3", "3 месяца", 3, 1000, 667),  # 1000₽ ≈ 667⭐
-    "m6": SubscriptionPlan("m6", "6 месяцев", 6, 1800, 1200),  # 1800₽ ≈ 1200⭐
-    "y1": SubscriptionPlan("y1", "1 год", 12, 3500, 2334),  # 3500₽ ≈ 2334⭐
+    key: SubscriptionPlan(key, plan["title"], plan["months"], plan["price_rub"], plan["price_stars"])
+    for key, plan in billing.PLANS.items()
 }
 
 STARS_PLANS: dict[str, int] = {
@@ -162,15 +162,15 @@ def get_plan_duration_days(plan_id: str) -> int:
 
 load_dotenv()
 
-MAX_CONCURRENT_OPENAI = int(os.getenv("MAX_CONCURRENT_OPENAI", "5"))
+MAX_CONCURRENT_OPENAI = max(1, min(20, int(os.getenv("MAX_CONCURRENT_OPENAI", "5"))))
 _OPENAI_SEM = asyncio.Semaphore(MAX_CONCURRENT_OPENAI)
 
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # vision — полноценный gpt-4o
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o")           # текст/голос — полноценный gpt-4o
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")       # Text/image model; environment overrides remain supported.
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o")
 AUDIO_TRANSCRIBE_MODEL = os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 VISION_DETAIL = os.getenv("VISION_DETAIL", "high").lower()  # low | high | auto (если у тебя поддержано)
 VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "1600"))  # макс сторона после ресайза
@@ -263,6 +263,8 @@ def _is_bad_vision_result(data: dict) -> bool:
         items = []
 
     totals = data.get("totals") or {}
+    if not isinstance(totals, dict) or not isinstance(items, list):
+        return True
 
     def _as_float(val: object) -> float:
         try:
@@ -317,6 +319,8 @@ async def db_get_user_row(db, user_id: int) -> dict:
 
 
 async def db_set_payment_mode(db, user_id: int, mode: str) -> None:
+    if mode not in {"sub", "payg"}:
+        return
     await db.execute("UPDATE users SET payment_mode=? WHERE telegram_id=?", (mode, user_id))
     await db.commit()
 
@@ -363,7 +367,7 @@ def _parse_dt(s: str | None) -> datetime | None:
         return None
     try:
         # обычно хранится как '    msg = "\n".join(lines) + payg_footerY-MM-DD HH:MM:SS'
-        return datetime.fromisoformat(s)
+        return billing.utc_datetime(s)
     except Exception:
         return None
 
@@ -417,7 +421,7 @@ def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboard
         keyboard.insert(0, [InlineKeyboardButton("📁 Добавить из шаблона", callback_data="templates")])
 
     if mode == "admin":
-        keyboard.insert(0, [InlineKeyboardButton("🧾 Чеки", callback_data="admin:paychecks")])
+        keyboard.insert(0, [InlineKeyboardButton("🛠 Управление ботом", callback_data="admin:menu")])
 
     return InlineKeyboardMarkup(keyboard)
 
@@ -846,13 +850,33 @@ def build_survey_block(ans: dict) -> str:
 # ── DB init ───────────────────────────────────────────
 
 async def init_db(app):
-    db = await aiosqlite.connect(DB_PATH, check_same_thread=False)
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH, timeout=30, check_same_thread=False)
     await create_tables(db)
     app.bot_data["db"] = db
+    refresh_settings()
+    await asyncio.to_thread(billing.recover_telegram_events)
+    app.bot_data["payment_recovery_task"] = asyncio.create_task(recover_payments_loop())
     logging.info("DB initialised at %s", DB_PATH)
 
 
+async def recover_payments_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(billing.recover_telegram_events)
+        except Exception:
+            logger.exception("Payment recovery will retry")
+
+
 async def close_db(app):
+    task = app.bot_data.get("payment_recovery_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     db = app.bot_data.get("db")
     if db:
         await db.close()
@@ -888,7 +912,7 @@ def escape_md(text: str) -> str:
 def _reset_limit_block_state(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Сбрасываем счётчики попыток на новый день."""
 
-    today = datetime.now().date().isoformat()
+    today = date.today().isoformat()
     if ctx.user_data.get("limit_block_date") != today:
         ctx.user_data["limit_block_date"] = today
         ctx.user_data["limit_block_attempts"] = 0
@@ -975,8 +999,9 @@ async def edit_menu_message(
                 parse_mode="Markdown",
             )
             return
-        except BadRequest:
-            pass
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
 
     try:
         msg = await ctx.bot.send_message(
@@ -1110,6 +1135,8 @@ async def _get_access_flags(
 ) -> tuple[bool, datetime | None, bool]:
     """Возвращает признаки подписки/триала без побочных эффектов."""
 
+    if is_admin(user_id):
+        return True, ADMIN_PREMIUM_UNTIL, False
     premium_active = await is_premium_user(db, user_id)
     premium_until = await get_premium_until(db, user_id)
 
@@ -1118,7 +1145,7 @@ async def _get_access_flags(
     trial_active = bool(trial_until and trial_until > utcnow() and used < TRIAL_LIMIT)
 
     has_subscription = premium_active or trial_active
-    subscription_until = premium_until or (trial_until if trial_active else None)
+    subscription_until = premium_until if premium_active else (trial_until if trial_active else None)
 
     return has_subscription, subscription_until, trial_active
 
@@ -1241,7 +1268,7 @@ async def require_access(
     # админ — всегда можно, без лимитов
     if is_admin(user_id):
         await ensure_admin_premium(db, user_id)
-        if kind is not None:
+        if consume and kind is not None:
             await log_request(db, user_id, kind)
         return True
 
@@ -1253,7 +1280,7 @@ async def require_access(
             return False
 
     if await is_premium_user(db, user_id):
-        if kind is not None:
+        if consume and kind is not None:
             await log_request(db, user_id, kind)
         return "premium"
 
@@ -1265,11 +1292,11 @@ async def require_access(
 
     if trial_active:
         if consume:
-            ok = await consume_trial_request(db, user_id)
+            ok = await consume_trial_request(db, user_id, limit=TRIAL_LIMIT)
             if ok and kind is not None:
                 await log_request(db, user_id, kind)
             return "trial" if ok else None
-        if kind is not None:
+        if consume and kind is not None:
             await log_request(db, user_id, kind)
         return "trial"
 
@@ -1319,7 +1346,6 @@ async def ensure_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool
 
 async def on_check_sub_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     if await ensure_subscription(update, ctx):
         kb = await build_main_keyboard(ctx, update.effective_user.id)
         await edit_menu_message(
@@ -1444,6 +1470,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         payload = {
             "model": VISION_MODEL,
             "messages": messages,
+            "max_completion_tokens": 3000,
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
@@ -1527,6 +1554,7 @@ async def analyze_food_text(description: str) -> dict:
     payload = {
         "model": TEXT_MODEL,
         "messages": messages,
+        "max_completion_tokens": 3000,
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
@@ -1552,7 +1580,7 @@ async def analyze_food_text(description: str) -> dict:
 
 def extract_totals(data: dict) -> dict:
     if not isinstance(data, dict):
-        return {"kcal": 0.0, "protein_g": 0.0, "fat_g": 0.0, "carbs_g": 0.0}
+        raise ValueError("Некорректный ответ модели")
 
     candidate = None
     for key in ("totals", "total", "summary", "overall"):
@@ -1620,7 +1648,9 @@ def extract_totals(data: dict) -> dict:
     if all(v == 0.0 for v in totals.values()):
         logging.warning("extract_totals got only zeros from data: %s", data)
 
-    return totals
+    if not isinstance(data,dict) or data.get("ok") is False or not any(totals.values()):
+        raise ValueError("Модель не распознала еду")
+    return billing.validate_totals(totals)
 
 
 # ── Главные экраны ───────────────────────────────────
@@ -1638,6 +1668,8 @@ async def show_main_menu(
     if notice is None:
         notice = ctx.user_data.pop("promo_notice", None)
 
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("pending_meal",None)
     db = get_db(ctx)
     user_id = update.effective_user.id
 
@@ -1670,7 +1702,9 @@ async def show_main_menu(
         lines.append(f"Баланс: {balance}₽.")
         lines.append(f"Цена: {PAYG_COST_RUB}₽ за запрос (фото/голос/текст).")
     else:
+        _, access_until, trial_active = await _get_access_flags(db,user_id)
         status_text = (
+            f"пробный доступ до {fmt_dt(access_until,True)}." if trial_active and not premium_active else
             f"активно до {fmt_dt(premium_until)}."
             if premium_active and premium_until
             else "Не активно."
@@ -1724,23 +1758,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscription(update, ctx):
         return
 
-    new_user = await ensure_user(db, uid)
+    promo = await asyncio.to_thread(billing.start_user,uid)
     notice = None
-
-    if new_user:
-        promo, granted = await grant_active_promotion(db, uid)
-        if granted and promo:
-            now = utcnow()
-            current_until = await get_premium_until(db, uid)
-            base = current_until if current_until and current_until > now else now
-            bonus_days = int(promo.get("bonus_days") or 0)
-            new_until = base + timedelta(days=bonus_days)
-            await set_premium_until(db, uid, new_until)
-
-            notice = (
-                "🎁 Поздравляем! Вы получили {days} суток премиум-доступа "
-                "в подарок от команды бота. Пользуйтесь на здоровье!"
-            ).format(days=bonus_days)
+    if promo:
+        notice = f"🎁 Вы получили {promo['bonus_days']} суток премиум-доступа в подарок от команды бота."
 
     if notice:
         ctx.user_data["promo_notice"] = notice
@@ -1792,9 +1813,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "   • что именно за блюда на тарелке.\n"
         "3. Все приёмы пищи копятся в базе, статистику за день и неделю можно посмотреть через «📊 Статистика».\n"
         "4. В «⚙️ Настройки» можно задать дневную цель по КБЖУ.\n\n"
-        "В будущем появится:\n"
-        "• голосовой ввод приёма пищи;\n"
-        "• WebApp с красивыми графиками за месяц."
+        "Также можно отправить текст или голосовое до 60 секунд.\n"
+        "Мини-приложение позволяет менять граммовку и смотреть графики."
     )
     kb = await build_main_keyboard(ctx, update.effective_user.id)
     await edit_menu_message(update, ctx, text, kb)
@@ -1939,13 +1959,13 @@ def kb_save_template_after_meal(*, meal_date: str | None = None, meal_id: int | 
 
 def infer_template_name(data: dict, extras: dict) -> str:
     if extras.get("composition"):
-        return extras["composition"].strip()
+        return extras["composition"].strip()[:80]
 
     items = data.get("items") if isinstance(data, dict) else None
     if isinstance(items, list) and items:
         first = items[0]
         if isinstance(first, dict) and first.get("name"):
-            return str(first.get("name")).strip()
+            return str(first.get("name")).strip()[:80]
 
     return "Блюдо"
 
@@ -2153,6 +2173,8 @@ async def ask_template_portion(
 async def apply_template_portion(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, template_id: int, portion: float
 ) -> None:
+    if portion not in TEMPLATE_PORTION_OPTIONS or not 0 < template_id < 2**63:
+        return
     db = get_db(ctx)
     uid = update.effective_user.id
     tpl = await get_template(db, uid, template_id)
@@ -2180,7 +2202,25 @@ async def apply_template_portion(
         ensure_ascii=False,
     )
 
-    await add_meal(db, uid, scaled, raw_json)
+    template_payload = _safe_json_loads(tpl.get("raw_json") or "{}")
+    analysis = template_payload.get("analysis",template_payload) if isinstance(template_payload,dict) else {}
+    source_items = analysis.get("items",[]) if isinstance(analysis,dict) else []
+    scaled_items = []
+    for item in source_items if isinstance(source_items,list) else []:
+        if not isinstance(item,dict):
+            continue
+        copy = dict(item)
+        for key in ("grams","weight_g","kcal","kcal_total","protein","protein_g","fat","fat_g","carbs","carbs_g"):
+            if key in copy:
+                try:
+                    copy[key] = float(copy[key]) * portion
+                except (ValueError,TypeError):
+                    copy[key] = 0
+        scaled_items.append(copy)
+    detail = json.loads(raw_json)
+    detail.update(items=scaled_items,totals=scaled)
+    raw_json = json.dumps(detail,ensure_ascii=False)
+    await asyncio.to_thread(billing.save_meal,uid,scaled,raw_json,source_key=f"template:{update.effective_chat.id}:{update.callback_query.message.message_id}:{template_id}")
 
     notice = (
         f"✅ Успешно добавлено из «{escape_md(tpl['name'])}» (x{portion}).\n"
@@ -2197,7 +2237,7 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     balance = int(u.get("credits", 0) or 0)
 
     premium_until = _parse_dt(u.get("premium_until"))
-    has_sub = bool(u.get("is_premium")) and premium_until and premium_until > datetime.now()
+    has_sub = bool(u.get("is_premium")) and premium_until and premium_until > utcnow()
 
     sub_until_text = premium_until.strftime("%d.%m.%Y") if has_sub else "нет активной подписки"
 
@@ -2355,6 +2395,7 @@ async def generate_goal_from_survey(answers: dict) -> dict:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        "max_completion_tokens": 3000,
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
@@ -2401,6 +2442,7 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         protein = float(goal_data.get("protein_g", 0))
         fat = float(goal_data.get("fat_g", 0))
         carbs = float(goal_data.get("carbs_g", 0))
+        validate_goal(kcal,protein,fat,carbs)
     except Exception:
         logging.exception("bad goal_data: %s", goal_data)
         ctx.user_data["state"] = None
@@ -2432,6 +2474,13 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ── Цель КБЖУ ─────────────────────────────────────────
+
+
+def validate_goal(kcal,protein,fat,carbs):
+    values = billing.validate_totals(dict(kcal=kcal,protein_g=protein,fat_g=fat,carbs_g=carbs))
+    if not 1 <= values["kcal"] <= 20000 or any(v > 5000 for k,v in values.items() if k != "kcal"):
+        raise ValueError("Некорректная цель")
+    return values
 
 
 def build_goal_prompt(goal: dict | None, prefix: str | None = None) -> str:
@@ -2475,7 +2524,7 @@ async def handle_goal_input(
 ) -> None:
     await delete_user_message(update)
 
-    cleaned = text.replace(",", " ")
+    cleaned = text.replace(",", ".")
     parts = [p for p in cleaned.split() if p.strip()]
 
     if len(parts) != 4:
@@ -2487,6 +2536,7 @@ async def handle_goal_input(
 
     try:
         kcal, p, f, c = map(float, parts)
+        validate_goal(kcal,p,f,c)
     except ValueError:
         db = get_db(ctx)
         goal = await get_goal(db, update.effective_user.id)
@@ -2658,7 +2708,7 @@ def _build_stats_workbook(
             goal_f,
             goal_c,
             f"=IF(F{excel_row}>0,B{excel_row}/F{excel_row},0)",
-            f"=IF(AVERAGE(G{excel_row}:I{excel_row})>0,AVERAGE(C{excel_row}/G{excel_row},D{excel_row}/H{excel_row},E{excel_row}/I{excel_row}),0)",
+            f"=IFERROR(AVERAGE(IFERROR(C{excel_row}/G{excel_row},0),IFERROR(D{excel_row}/H{excel_row},0),IFERROR(E{excel_row}/I{excel_row},0)),0)",
             f'=IF(AND(J{excel_row}>=0.9,J{excel_row}<=1.1,K{excel_row}>=0.9,K{excel_row}<=1.1),"✅ Норма","⚠️ Отклонение")',
         ])
 
@@ -2750,6 +2800,7 @@ def _build_stats_workbook(
             round(row["carbs"], 2),
             _humanize_meal_raw_json(row.get("raw_json") or ""),
         ])
+        ws_meals.cell(ws_meals.max_row,7).data_type = "s"
 
     ws_meals.freeze_panes = "A2"
     for col, width in {
@@ -2790,7 +2841,7 @@ async def show_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     db = get_db(ctx)
     uid = update.effective_user.id
 
-    today = datetime.now().date()
+    today = date.today()
     yesterday = today - timedelta(days=1)
 
     totals_today = await get_daily_totals(db, uid, today.isoformat())
@@ -2887,7 +2938,7 @@ async def export_stats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pe
 
     db = get_db(ctx)
     uid = user.id
-    today = datetime.now().date()
+    today = date.today()
     start_date, end_date, period_label = _resolve_export_period(period_key, today)
 
     if period_key == "all":
@@ -3004,13 +3055,12 @@ async def _process_meal_calculation(
         image_bytes = bio.read()
     except Exception:
         logging.exception("failed to download photo for user %s", uid)
-        ctx.user_data["state"] = None
-        ctx.user_data["pending_meal"] = None
+        ctx.user_data["state"] = "await_meal_extras_menu"
         await edit_menu_message(
             update,
             ctx,
-            "Не смог скачать фото. Попробуй ещё раз отправить снимок.",
-            await build_main_keyboard(ctx, uid),
+            "Не смог скачать фото. Нажми «Считать» ещё раз или отправь снимок после отмены.",
+            kb_meal_extras(extras),
         )
         return
 
@@ -3033,29 +3083,13 @@ async def _process_meal_calculation(
         ctx.user_data["pending_meal"] = None
         return
 
-    if uid not in ADMINS and mode == "payg":
-        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
-        if not ok:
-            bal = int(u.get("credits", 0) or 0)
-            await edit_menu_message(
-                update,
-                ctx,
-                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
-                kb_payg_topups(),
-            )
-            return
-
-        # логируем только PAYG (чтобы в SUB не было двойного лога)
-        await db_log_request(db, uid, "photo")
-
     # Считаем КБЖУ
     try:
         data = await analyze_food_photo(image_bytes, extra_description=extra_description)
         totals = extract_totals(data)
     except Exception:
         logging.exception("analyze_food_photo failed for %s", uid)
-        ctx.user_data["state"] = None
-        ctx.user_data["pending_meal"] = None
+        ctx.user_data["state"] = "await_meal_extras_menu"
         await edit_menu_message(
             update,
             ctx,
@@ -3066,7 +3100,7 @@ async def _process_meal_calculation(
                 "• постарайся, чтобы еда была хорошо видна;\n"
                 "• при необходимости добавь описание через меню уточнений."
             ),
-            await build_main_keyboard(ctx, uid),
+            kb_meal_extras(extras),
         )
         return
 
@@ -3075,7 +3109,13 @@ async def _process_meal_calculation(
     fat = round(float(totals.get("fat_g", 0) or 0))
     carbs = round(float(totals.get("carbs_g", 0) or 0))
 
-    meal_id = await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+    try:
+        meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
+                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind="photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+    except Exception as exc:
+        logger.exception("Could not save meal for %s",uid)
+        await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Повторите расчёт.",kb_meal_extras(extras))
+        return
 
     template_saved = False
     template_name = None
@@ -3179,6 +3219,10 @@ async def _handle_image_message(
         await delete_user_message(update)
         return
 
+    existing = ctx.user_data.get("pending_meal")
+    if existing and existing.get("photo_file_id") != photo_file_id:
+        await edit_menu_message(update,ctx,"Сначала сохраните или отмените предыдущее фото. Затем отправьте следующее.",kb_meal_extras(existing.get("extras") or {}))
+        return
     message = update.message
     db = get_db(ctx)
     u0 = await db_get_user_row(db, update.effective_user.id)
@@ -3215,7 +3259,7 @@ async def _handle_image_message(
             await delete_user_message(update)
             return
 
-        mode = await require_access(update, ctx, consume=True, kind="photo")
+        mode = await require_access(update, ctx, consume=False, kind="photo")
         if not mode:
             try:
                 await message.delete()
@@ -3303,7 +3347,14 @@ async def process_meal_description(
     fat = round(float(totals.get("fat_g", 0) or 0))
     carbs = round(float(totals.get("carbs_g", 0) or 0))
 
-    meal_id = await add_meal(db, uid, totals, json.dumps(data, ensure_ascii=False))
+    try:
+        meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
+                    source_key=f"message:{update.effective_chat.id}:{update.message.message_id}",
+                    kind="voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+    except Exception as exc:
+        logger.exception("Could not save meal for %s",uid)
+        await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Отправьте сообщение повторно.",main_kb)
+        return
 
     today_totals = await get_daily_totals(db, uid)
     goal = await get_goal(db, uid)
@@ -3380,8 +3431,10 @@ async def process_meal_description(
 # ── Текст: цель / уточнения / остальное ──────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if ctx.user_data.get("state") == "admin_setting":
+        await admin_setting_input(update,ctx)
+        return
     if not await ensure_subscription(update, ctx):
-        await delete_user_message(update)
         return
 
     uid = update.effective_user.id
@@ -3473,6 +3526,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if state == "await_gift_code_days":
+        if not is_admin(uid):
+            ctx.user_data["state"] = None
+            return
         await delete_user_message(update)
         try:
             days = int(text)
@@ -3538,8 +3594,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Любой другой текст — считаем как самостоятельный приём пищи
-    await delete_user_message(update)
+    # Keep the source text so a failed calculation can be retried.
     ctx.user_data["state"] = None
     ctx.user_data.pop("pending_meal", None)
 
@@ -3577,7 +3632,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 subscription_until=subscription_until,
             )
             return
-        mode = await require_access(update, ctx, consume=True, kind="text")
+        mode = await require_access(update, ctx, consume=False, kind="text")
 
     if not mode:
         return
@@ -3592,20 +3647,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     u = u0 or await db_get_user_row(db, uid)
     pay_mode = u.get("payment_mode", "sub")
-
-    if uid not in ADMINS and pay_mode == "payg":
-        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
-        if not ok:
-            bal = int(u.get("credits", 0) or 0)
-            await edit_menu_message(
-                update,
-                ctx,
-                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
-                kb_payg_topups(),
-            )
-            return
-
-        await db_log_request(db, uid, "text")
 
     await process_meal_description(
         update,
@@ -3643,7 +3684,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_menu_message(
             update,
             ctx,
-            "🎙️ Голосовое слишком длинное. Пожалуйста, уложись в 1–1.5 минуты 🙂",
+            "🎙️ Голосовое слишком длинное. Пожалуйста, уложись в 60 секунд 🙂",
             main_kb,
         )
         return
@@ -3682,12 +3723,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await delete_user_message(update)
             return
-        mode = await require_access(update, ctx, consume=True, kind="voice")
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-
+        mode = await require_access(update, ctx, consume=False, kind="voice")
     if not mode:
         return
 
@@ -3720,20 +3756,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     u = u0 or await db_get_user_row(db, uid)
     pay_mode = u.get("payment_mode", "sub")
-
-    if uid not in ADMINS and pay_mode == "payg":
-        ok = await db_try_spend_payg(db, uid, PAYG_COST_RUB)
-        if not ok:
-            bal = int(u.get("credits", 0) or 0)
-            await edit_menu_message(
-                update,
-                ctx,
-                f"💳 Баланс PAYG пуст/недостаточен.\nБаланс: {bal}₽\nНужно: {PAYG_COST_RUB}₽\n\nПополнить?",
-                kb_payg_topups(),
-            )
-            return
-
-        await db_log_request(db, uid, "voice")
 
     # Транскрибируем
     try:
@@ -3777,7 +3799,23 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = query.data or ""
     uid = update.effective_user.id
     await query.answer()
+    if data.startswith(("payg_buy:","payg_buy_stars:","payg_buy_card:")) and not data.rsplit(":",1)[-1].isdigit():
+        return
+    if data.startswith(("gift_code:manage:","gift_code:delete:")) and not data.rsplit(":",1)[-1].isdigit():
+        return
     db = get_db(ctx)
+    if data.startswith(("tpl_portion:","save_result_template","meal_extra_","survey_ans:","survey_skip:","gift_code:delete:","paychecks:sent:")):
+        current_menu = ctx.chat_data.get("menu_message_id") or await get_last_menu_message_id(db,uid)
+        if current_menu and query.message and query.message.message_id != current_menu:
+            return
+    if data.startswith(("admin:","paychecks:")) and not is_admin(uid):
+        return
+    if data.startswith("admin:") and data != "admin:paychecks":
+        await admin_callback(update,ctx,data)
+        return
+    if data in {"main","settings","stats","pay_mode","premium_menu","premium_menu_stars"}:
+        ctx.user_data.pop("admin_setting",None)
+        ctx.user_data["state"] = None
 
     if data == "sub:invoice_back":
         # Назад из инвойса сразу к списку тарифов
@@ -4181,6 +4219,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         template_name = infer_template_name(data_for_tpl, extras_for_tpl)
         template_raw = json.dumps({"analysis": data_for_tpl, "extras": extras_for_tpl}, ensure_ascii=False)
         await add_template(db, uid, template_name, totals_for_tpl, template_raw)
+        ctx.user_data.pop("last_meal_for_template",None)
         await show_main_menu(update, ctx, notice=f"💾 Сохранено как шаблон: «{escape_md(template_name)}».", notice_at_bottom=True)
     elif data == "meal_extra_send":
         await _process_meal_calculation(update, ctx)
@@ -4239,350 +4278,60 @@ async def on_premium_menu_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def on_buy_with_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Оплата подписки Telegram Stars.
-    Ожидает callback_data вида: 'buy_stars:<plan_key>'.
-    """
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-
-    user = update.effective_user
-    message = query.message
-    if not user or not message:
-        return
-
-    # Разбираем план
-    data = query.data or ""
-    parts = data.split(":", 1)
-    if len(parts) != 2:
-        await query.edit_message_text("Не удалось определить тариф. Попробуйте ещё раз.")
-        return
-
-    plan_key = parts[1]
-    plan = SUB_PLANS.get(plan_key)
-    if not plan:
-        await query.edit_message_text("Тариф не найден. Попробуйте выбрать другой.")
-        return
-
-    db = get_db(ctx)
-    user_id = update.effective_user.id
-    _, _, paid_trial_used = await get_trial_info(db, user_id)
-
-    if plan_key == "w1" and paid_trial_used:
-        await edit_menu_message(
-            update,
-            ctx,
-            "⛔️ Тариф «Одна неделя» доступен только один раз.\n\n"
-            "Выбери обычную подписку:",
-            kb_premium_plans_stars(paid_trial_used=True),
-        )
-        return
-
-    duration_days = get_plan_duration_days(plan.key)
-    duration_label = (
-        f"на {plan.months} мес." if plan.months else f"на {duration_days} дн."
-    )
-
-    # Stars: 1 звезда = amount 1. Без умножений.
-    stars_amount = max(1, int(plan.price_stars))
-
-    prices = [
-        LabeledPrice(
-            label=f"{plan.title} — {plan.price_stars}⭐",
-            amount=stars_amount,
-        )
-    ]
-
-    # Полезно иметь payload с инфой о плане и пользователе
-    payload = json.dumps(
-        {
-            "type": "subscription",
-            "plan_key": plan.key,
-            "months": plan.months,
-            "user_id": user.id,
-        }
-    )
-
-    # Клавиатура инвойса:
-    # 1) Кнопка оплаты в звёздах
-    # 2) "Назад" — возвращает к списку тарифов
-    invoice_keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Оплатить подписку ⭐", pay=True)],
-            [InlineKeyboardButton("← Назад", callback_data="sub_stars:invoice_back")],
-        ]
-    )
-
-    # Сначала пытаемся отправить инвойс
+async def _send_order_invoice(update, ctx, kind, *, plan_id=None, rub=0, currency="XTR"):
+    if currency == "RUB" and not YOOKASSA_PROVIDER_TOKEN:
+        await edit_menu_message(update,ctx,"Оплата картой пока недоступна. Выберите Stars.",kb_back_to_main())
+        return False
     try:
-        invoice_message = await ctx.bot.send_invoice(
-            chat_id=user.id,
-            title=plan.title,
-            description=(
-                f"Подписка «{plan.title}» {duration_label}\n\n"
-                "Оплата произойдёт в Telegram Stars."
-            ),
-            payload=payload,
-            currency="XTR",
-            prices=prices,
-            provider_token="",  # для Stars так и нужно — пустая строка
-            reply_markup=invoice_keyboard,
-        )
-    except BadRequest as e:
-        # Если что-то пошло не так, хотя бы не оставляем пользователя без сообщения
-        logger.exception("Ошибка при отправке инвойса в Stars: %s", e)
-        await query.edit_message_text(
-            "Не удалось создать счёт в звёздах.\n"
-            "Попробуйте ещё раз или выберите оплату картой."
-        )
-        return
-
-    # Инвойс успешно создан — старое меню можно убрать
-    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
-    try:
-        await message.delete()
+        order = await asyncio.to_thread(billing.create_order,update.effective_user.id,kind,plan_id=plan_id,rub=rub,currency=currency)
+        if order["status"] == "checkout":
+            raise billing.PaymentError("Предыдущая оплата ещё обрабатывается. Не оплачивайте повторно.")
+        invoice = await ctx.bot.send_invoice(chat_id=update.effective_user.id,title=order["title"],description=order["title"],
+                    payload="food:"+order["id"],currency=currency,prices=[LabeledPrice(order["title"],order["amount"])],
+                    provider_token="" if currency=="XTR" else YOOKASSA_PROVIDER_TOKEN,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить",pay=True)],
+                    [InlineKeyboardButton("← Назад",callback_data="premium_menu_stars" if kind=="subscription" and currency=="XTR" else "premium_menu" if kind=="subscription" else "payg:invoice_back")]]))
+    except billing.PaymentError as exc:
+        await edit_menu_message(update,ctx,str(exc),kb_back_to_main())
+        return False
     except Exception:
-        # Не критично, если не удалилось
-        pass
-
-
-async def send_payg_invoice_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id
-
-    # удалить старый invoice если вдруг висит
-    old = ctx.chat_data.pop("last_invoice_message_id", None)
-    if old:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
-        except Exception:
-            pass
-
-    await delete_menu_message(ctx, chat_id)
-
-    stars = rub_to_stars(rub)
-    payload = json.dumps({"type": "payg_topup", "rub": rub, "method": "stars"})
-
-    prices = [LabeledPrice(label=f"PAYG +{rub}₽", amount=stars)]
-
-    invoice_kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Оплатить ⭐", pay=True)],
-            [InlineKeyboardButton("🔙 Назад", callback_data="payg:invoice_back")],
-        ]
-    )
-
-    invoice_message = await ctx.bot.send_invoice(
-        chat_id=uid,
-        title="Грамм — Pay-as-you-go",
-        description=f"Пополнение баланса на +{rub}₽.\nСписание: {PAYG_COST_RUB}₽ за запрос.",
-        payload=payload,
-        provider_token=None,   # Stars
-        currency="XTR",
-        prices=prices,
-        reply_markup=invoice_kb,
-        max_tip_amount=0,
-    )
-
-    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
-
-
-async def send_payg_invoice_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, rub: int) -> None:
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id
-
-    if not YOOKASSA_PROVIDER_TOKEN:
-        await edit_menu_message(
-            update,
-            ctx,
-            "💳 Оплата картой появится чуть позже (нужен токен YooKassa).\nПока доступна оплата Stars.",
-            kb_payg_topups(),
-        )
-        return
-
-    old = ctx.chat_data.pop("last_invoice_message_id", None)
-    if old:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
-        except Exception:
-            pass
-
-    await delete_menu_message(ctx, chat_id)
-
-    payload = json.dumps({"type": "payg_topup", "rub": rub, "method": "card"})
-    prices = [LabeledPrice(label=f"PAYG +{rub}₽", amount=rub * 100)]  # копейки
-
-    invoice_kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Оплатить 💳", pay=True)],
-            [InlineKeyboardButton("🔙 Назад", callback_data="payg:invoice_back")],
-        ]
-    )
-
-    invoice_message = await ctx.bot.send_invoice(
-        chat_id=uid,
-        title="Грамм — Pay-as-you-go",
-        description=f"Пополнение баланса на +{rub}₽.\nСписание: {PAYG_COST_RUB}₽ за запрос.",
-        payload=payload,
-        provider_token=YOOKASSA_PROVIDER_TOKEN,
-        currency="RUB",
-        prices=prices,
-        reply_markup=invoice_kb,
-        is_flexible=False,
-        max_tip_amount=0,
-    )
-
-    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
-
-
-async def send_stars_invoice(
-    update: Update,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    plan_key: str,
-    months: int,
-) -> None:
-    chat_id = update.effective_chat.id
-    stars_amount = STARS_PLANS.get(plan_key)
-    plan_meta = STARS_PLAN_META.get(plan_key, {})
-
-    if stars_amount is None or not (5 <= stars_amount <= 100_000):
-        await update.effective_chat.send_message(
-            "Некорректная стоимость подписки в звёздах. Сообщите, пожалуйста, разработчику."
-        )
-        return
-
-    label_months = plan_meta.get("months", months)
-    label_days = plan_meta.get("days")
-    if label_days and not label_months:
-        label = f"Подписка на {label_days} дн."
-    else:
-        label = f"Подписка на {label_months} мес."
-
-    prices = [LabeledPrice(label=label, amount=stars_amount)]
-
-    payload = f"sub_stars:{plan_key}"
-    back_markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("« Назад", callback_data="sub_back")]]
-    )
-
-    await delete_menu_message(ctx, chat_id)
-
-    invoice_message = await ctx.bot.send_invoice(
-        chat_id=chat_id,
-        title=plan_meta.get("title", "Подписка Грамм"),
-        description=(
-            plan_meta.get(
-                "description",
-                "Доступ к голосовому и фото-анализу еды. Оплата Telegram Stars, комиссия уже включена.",
-            )
-        ),
-        payload=payload,
-        currency="XTR",
-        prices=prices,
-        max_tip_amount=0,
-        provider_token=None,
-        reply_markup=back_markup,
-    )
-
-    if update.callback_query:
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-
-    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
-
-
-async def on_buy_with_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    chat_id = update.effective_chat.id
-    await query.answer()
-    data = query.data
-    _, plan_id = data.split(":", 1)
-    sent_ok = await send_subscription_invoice_for_plan(update, ctx, plan_id)
-    if sent_ok:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await delete_menu_message(ctx, chat_id)
-        except Exception:
-            pass
-
-
-async def send_subscription_invoice_for_plan(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, plan_id: str
-) -> bool:
-    plan = SUB_PLANS.get(plan_id)
-    if not plan:
-        if update.callback_query:
-            await update.callback_query.edit_message_text("Неизвестный план подписки.")
-        else:
-            await update.effective_chat.send_message("Неизвестный план подписки.")
+        logger.exception("Invoice delivery failed")
+        await edit_menu_message(update,ctx,"Не удалось открыть счёт. Попробуйте ещё раз — повторный запрос использует тот же счёт.",kb_back_to_main())
         return False
-
-    if not YOOKASSA_PROVIDER_TOKEN:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                "Оплата картой появится чуть позже. Сейчас можно оформить подписку за Stars."
-            )
-        else:
-            await on_premium_menu(update, ctx)
-        return False
-
-    chat_id = update.effective_chat.id
-    ctx.chat_data["selected_plan_id"] = plan_id
-    payload = f"sub:{plan.id}:card"
-
-    old = ctx.chat_data.pop("last_invoice_message_id", None)
-    if old:
+    old = ctx.chat_data.get("last_invoice_message_id")
+    ctx.chat_data["last_invoice_message_id"] = invoice.message_id
+    if old and old != invoice.message_id:
         try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=old)
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id,message_id=old)
         except Exception:
             pass
-
-    invoice_kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Оплатить 💳", pay=True)],
-            [InlineKeyboardButton("🔙 Назад", callback_data="sub:invoice_back")],
-        ]
-    )
-
-    try:
-        invoice_message = await ctx.bot.send_invoice(
-            chat_id=chat_id,
-            title=f"Подписка на {plan.title}",
-            description="Подписка на умный дневник питания с фото, голосом и текстом.",
-            payload=payload,
-            provider_token=YOOKASSA_PROVIDER_TOKEN,
-            currency="RUB",
-            prices=[LabeledPrice(label=plan.title, amount=plan.price_rub * 100)],
-            reply_markup=invoice_kb,
-            is_flexible=False,
-            max_tip_amount=0,
-        )
-    except Exception:
-        logging.exception("Failed to send RUB subscription invoice")
-        if update.callback_query:
-            db = get_db(ctx)
-            _, _, paid_trial_used = await get_trial_info(db, update.effective_user.id)
-            await update.callback_query.edit_message_text(
-                "Не удалось создать счёт на оплату картой. Попробуй ещё раз.",
-                reply_markup=kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used)),
-            )
-        else:
-            await update.effective_chat.send_message(
-                "Не удалось создать счёт на оплату. Попробуйте снова чуть позже."
-            )
-        return False
-
-    ctx.chat_data["last_invoice_message_id"] = invoice_message.message_id
+    await delete_menu_message(ctx,update.effective_chat.id)
     return True
+
+
+async def on_buy_with_stars(update, ctx):
+    return await _send_order_invoice(update,ctx,"subscription",plan_id=update.callback_query.data.split(":",1)[1])
+
+
+async def send_payg_invoice_stars(update, ctx, rub):
+    return await _send_order_invoice(update,ctx,"payg_topup",rub=rub)
+
+
+async def send_payg_invoice_card(update, ctx, rub):
+    return await _send_order_invoice(update,ctx,"payg_topup",rub=rub,currency="RUB")
+
+
+async def send_stars_invoice(update, ctx, plan_key, months):
+    return await _send_order_invoice(update,ctx,"subscription",plan_id=STARS_PLAN_TO_PLAN_ID.get(plan_key))
+
+
+async def on_buy_with_card(update, ctx):
+    return await send_subscription_invoice_for_plan(update,ctx,update.callback_query.data.split(":",1)[1])
+
+
+async def send_subscription_invoice_for_plan(update, ctx, plan_id):
+    return await _send_order_invoice(update,ctx,"subscription",plan_id=plan_id,currency="RUB")
+
 
 
 def format_payment_success_notice(
@@ -4729,225 +4478,33 @@ async def cleanup_payment_messages(
             pass
 
 
-async def on_precheckout_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_precheckout_query(update, ctx):
     q = update.pre_checkout_query
-    payload = q.invoice_payload or ""
-
     try:
-        data = json.loads(payload)
-        if data.get("type") in ("sub", "payg_topup", "subscription"):
-            await q.answer(ok=True)
-            return
+        await asyncio.to_thread(billing.precheckout,q.invoice_payload,q.from_user.id,q.total_amount,q.currency,q.id)
+    except billing.PaymentError as exc:
+        await q.answer(ok=False,error_message=str(exc))
     except Exception:
-        pass
-
-    allow = False
-
-    if payload.startswith("sub:") or payload.startswith("sub_stars:"):
-        allow = True
+        logger.exception("Precheckout verification unavailable")
+        await q.answer(ok=False,error_message="Не удалось проверить счёт. Деньги не списаны, попробуйте позже.")
     else:
-        try:
-            payload_data = json.loads(payload)
-            if isinstance(payload_data, dict) and payload_data.get("type") == "subscription":
-                allow = True
-        except json.JSONDecodeError:
-            allow = False
-
-    if allow:
         await q.answer(ok=True)
-    else:
-        await q.answer(ok=False, error_message="Неизвестный тип оплаты.")
 
 
-async def on_successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    user = update.effective_user
+async def on_successful_payment(update, ctx):
+    message, user = update.message, update.effective_user
     sp = message.successful_payment
-    tg_charge_id = getattr(sp, "telegram_payment_charge_id", None)
-    prov_charge_id = getattr(sp, "provider_payment_charge_id", None)
     payload = sp.invoice_payload or ""
-    user_id = user.id
-    db = ctx.application.bot_data["db"]
-
     try:
-        data = json.loads(payload)
+        await asyncio.to_thread(billing.remember_telegram_event,user.id,sp.to_dict())
+        order, applied = await asyncio.to_thread(billing.apply_telegram_event,user.id,sp.to_dict())
     except Exception:
-        data = {}
-
-    plan_title: str | None = None
-
-    if data.get("type") == "payg_topup":
-        rub = int(data.get("rub") or 0)
-        method = data.get("method") or ("stars" if sp.currency == "XTR" else "card")
-
-        db2 = get_db(ctx)
-        inserted = await save_payment(
-            db2,
-            user_id,
-            method,
-            rub,
-            "RUB",
-            payload,
-            telegram_charge_id=tg_charge_id,
-            provider_charge_id=prov_charge_id,
-        )
-        if not inserted:
-            logging.warning("Duplicate payment ignored (PAYG): %s", tg_charge_id)
-            await show_main_menu(update, ctx)
-            return
-
-        await db_add_payg_balance(db2, user_id, rub)
-
-        chat_id = message.chat_id
-        await cleanup_payment_messages(ctx, chat_id, message)
-
-        notice = format_payment_success_notice("payg", amount_rub=rub)
-        await show_main_menu(update, ctx, notice=notice)
+        logger.exception("Paid order requires reconciliation, user=%s charge=%s", user.id,sp.telegram_payment_charge_id)
+        await message.reply_text("Платёж получен, но подтверждение доступа требует проверки. Не оплачивайте повторно. Сохраните это сообщение и обратитесь в поддержку.")
         return
-
-    now = utcnow()
-    current_until = await get_premium_until(db, user_id)
-
-    parts = payload.split(":", 2)
-    payload_data = None
-    try:
-        payload_data = json.loads(payload)
-    except json.JSONDecodeError:
-        payload_data = None
-
-    new_until = None
-    plan_key = None
-
-    if payload.startswith("sub:"):
-        if len(parts) != 3:
-            await update.message.reply_text("Неизвестный тип платежа.")
-            return
-
-        _, plan_id, provider = parts
-        plan = SUB_PLANS.get(plan_id)
-        if not plan:
-            await update.message.reply_text(
-                "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
-            )
-            return
-
-        plan_key = plan.id
-        plan_title = f"Подписка {plan.title} оформлена."
-        inserted = await save_payment(
-            db,
-            user_id,
-            provider,
-            sp.total_amount,
-            sp.currency,
-            payload,
-            telegram_charge_id=tg_charge_id,
-            provider_charge_id=prov_charge_id,
-        )
-        if not inserted:
-            logging.warning("Duplicate payment ignored (SUB card): %s", tg_charge_id)
-            await show_main_menu(update, ctx)
-            return
-
-        base = current_until if (current_until and current_until > now) else now
-        days = 7 if plan_key == "w1" else plan.months * 30
-        if days <= 0:
-            days = get_plan_duration_days(plan.id)
-        if days <= 0:
-            await update.message.reply_text("Некорректная продолжительность подписки.")
-            return
-
-        new_until = base + timedelta(days=days)
-
-    elif payload.startswith("sub_stars:"):
-        if len(parts) != 2:
-            await update.message.reply_text("Неизвестный тип платежа.")
-            return
-
-        _, plan_key = parts
-        plan_meta = STARS_PLAN_META.get(plan_key)
-        if not plan_meta:
-            await update.message.reply_text(
-                "Платёж прошёл, но тариф не найден. Напиши, пожалуйста, в поддержку."
-            )
-            return
-        plan_key = plan_meta.get("plan_key") or STARS_PLAN_TO_PLAN_ID.get(plan_key)
-        if plan_key and (plan := SUB_PLANS.get(plan_key)):
-            plan_title = f"Подписка {plan.title} оформлена."
-        elif plan_meta.get("title"):
-            plan_title = f"Подписка {plan_meta.get('title')} оформлена."
-        days = int(plan_meta.get("days", plan_meta.get("months", 0) * 30))
-        if days <= 0:
-            await update.message.reply_text("Некорректная продолжительность подписки.")
-            return
-        inserted = await save_payment(
-            db,
-            user_id,
-            "stars",
-            sp.total_amount,
-            sp.currency,
-            payload,
-            telegram_charge_id=tg_charge_id,
-            provider_charge_id=prov_charge_id,
-        )
-        if not inserted:
-            logging.warning("Duplicate payment ignored (SUB stars): %s", tg_charge_id)
-            await show_main_menu(update, ctx)
-            return
-
-        base = current_until if (current_until and current_until > now) else now
-        new_until = base + timedelta(days=days)
-
-    elif isinstance(payload_data, dict) and payload_data.get("type") == "subscription":
-        plan_key = payload_data.get("plan_key")
-        plan = SUB_PLANS.get(plan_key)
-        if not plan:
-            await update.message.reply_text(
-                "Платёж прошёл, но план не найден. Напиши, пожалуйста, в поддержку."
-            )
-            return
-
-        months = int(payload_data.get("months") or plan.months)
-        plan_title = f"Подписка {plan.title} оформлена."
-        inserted = await save_payment(
-            db,
-            user_id,
-            "stars",
-            sp.total_amount,
-            sp.currency,
-            payload,
-            telegram_charge_id=tg_charge_id,
-            provider_charge_id=prov_charge_id,
-        )
-        if not inserted:
-            logging.warning("Duplicate payment ignored (SUB stars): %s", tg_charge_id)
-            await show_main_menu(update, ctx)
-            return
-
-        base = current_until if (current_until and current_until > now) else now
-        days = 7 if plan_key == "w1" else months * 30
-        if days <= 0:
-            days = get_plan_duration_days(plan.id)
-        if days <= 0:
-            await update.message.reply_text("Некорректная продолжительность подписки.")
-            return
-
-        new_until = base + timedelta(days=days)
-
-    else:
-        await update.message.reply_text("Неизвестный тип платежа.")
-        return
-    await set_premium_until(db, user_id, new_until)
-
-    if plan_key == "w1":
-        await mark_paid_trial_used(db, user_id)
-
-    chat_id = message.chat_id
-    await cleanup_payment_messages(ctx, chat_id, message)
-
-    notice = format_payment_success_notice(
-        "sub", plan_title=plan_title or "Подписка обновлена."
-    )
-    await show_main_menu(update, ctx, notice=notice)
+    if applied:
+        await cleanup_payment_messages(ctx,message.chat_id,message)
+    await show_main_menu(update,ctx,notice="✅ "+order["title"]+" — оплачено." if applied else "Этот платёж уже учтён.")
 
 
 async def on_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4963,19 +4520,10 @@ async def on_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         logging.warning("Invalid web_app_data payload: %s", raw)
         return
 
-    if data.get("type") != "webapp_widget_paid":
+    if not isinstance(data, dict) or data.get("type") != "webapp_widget_paid":
         return
-
-    kind = (data.get("kind") or "").strip()
-    message = (data.get("message") or "").strip()
-    if not message:
-        if kind == "subscription":
-            message = "✅ Поздравляем! Подписка успешно оплачена."
-        else:
-            rub = int(data.get("rub") or 0)
-            message = f"✅ Поздравляем! Баланс пополнен на {rub}₽." if rub > 0 else "✅ Поздравляем! Баланс успешно пополнен."
-
-    await show_main_menu(update, ctx, notice=message)
+    # Client messages are hints only; entitlements come from verified provider events.
+    await show_main_menu(update, ctx)
 
 # ── Админ и прочее (минимальный каркас) ──────────────
 
@@ -4998,7 +4546,7 @@ async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         target_id = int(ctx.args[0])
         days = int(ctx.args[1])
-        if days <= 0 or days > 3650:
+        if not 0 < target_id < 2**63 or days <= 0 or days > 3650:
             raise ValueError
     except Exception:
         return await update.message.reply_text("Пример: /grant 123456789 30")
@@ -5006,27 +4554,10 @@ async def cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = get_db(ctx)
     await ensure_user(db, target_id)
 
-    cur = await db.execute("SELECT premium_until FROM users WHERE telegram_id=?", (target_id,))
-    row = await cur.fetchone()
-    await cur.close()
-
-    now = utcnow()
-    base = now
-    if row and row[0]:
-        try:
-            cur_until = datetime.fromisoformat(row[0])
-            if cur_until > now:
-                base = cur_until
-        except Exception:
-            pass
-
-    new_until = base + timedelta(days=days)
-
-    await db.execute(
-        "UPDATE users SET is_premium=1, premium_until=? WHERE telegram_id=?",
-        (new_until.isoformat(), target_id),
-    )
-    await db.commit()
+    def grant():
+        with billing.connection(write=True) as conn:
+            return billing.extend_subscription(conn,target_id,days)
+    new_until = billing.utc_datetime(await asyncio.to_thread(grant))
 
     return await update.message.reply_text(
         f"✅ Выдано {days} дн.\n"
@@ -5046,6 +4577,8 @@ async def cmd_degrant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         target_id = int(ctx.args[0])
+        if not 0 < target_id < 2**63:
+            raise ValueError
     except Exception:
         return await update.message.reply_text("Пример: /degrant 123456789")
 
@@ -5061,12 +4594,13 @@ async def cmd_degrant(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await update.message.reply_text(f"🧹 Подписка снята. ID: {target_id}")
 
 
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
+async def cmd_stats(update, ctx):
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
-    if not is_admin(update.effective_user.id):
-        return await update.message.reply_text("Нет доступа.")
+    await edit_menu_message(update,ctx,await admin_stats_text(ctx),admin_keyboard())
 
+
+async def admin_stats_text(ctx):
     db = get_db(ctx)
     now_iso = utcnow().isoformat()
 
@@ -5102,15 +4636,17 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     avg_req_per_user_per_day_7d = (req_7d / (active_users_7d * 7.0)) if active_users_7d else 0.0
 
     # оплаты (в общем виде)
-    cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount),0) FROM payments GROUP BY provider")
+    cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount_rub),0), COALESCE(SUM(amount_stars),0) FROM payments GROUP BY provider")
     pay_rows = await cur.fetchall()
     await cur.close()
 
     pay_lines = []
-    for provider, cnt, total in pay_rows:
-        pay_lines.append(f"• {provider}: {cnt} шт., сумма={total}")
+    for provider, cnt, rub, stars in pay_rows:
+        pay_lines.append(f"• {escape_md(provider)}: {cnt} шт., {rub}₽ / {stars}⭐")
 
+    unresolved = await q1("SELECT COUNT(*) FROM payment_events WHERE applied=0")
     text = (
+        f"Платежи, требующие проверки: {unresolved}\n\n"
         "📊 *Статистика*\n\n"
         f"👥 Пользователи: *{users_total}*\n"
         f"⭐ Активная подписка: *{premium_active}*\n"
@@ -5125,7 +4661,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + "\n"
     )
 
-    return await update.message.reply_text(text, parse_mode="Markdown")
+    return text
 
 
 async def cmd_add_promotion(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5145,9 +4681,9 @@ async def cmd_add_promotion(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         return await update.message.reply_text("Пример: /promo_add 10 5")
 
-    if slots <= 0 or days <= 0:
+    if not 1 <= slots <= 1000000 or not 1 <= days <= 3650:
         return await update.message.reply_text(
-            "Числа должны быть положительными. Пример: /promo_add 10 5"
+            "Введите от 1 до 1000000 пользователей и от 1 до 3650 дней. Пример: /promo_add 10 5"
         )
 
     db = get_db(ctx)
@@ -5226,13 +4762,15 @@ async def cmd_purge_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not ctx.args or ctx.args[0] != "CONFIRM_PURGE":
         return await update.message.reply_text(
-            "⚠️ Команда удалит все ваши данные. Для подтверждения введите: /purge_me CONFIRM_PURGE"
+            "⚠️ Команда удалит дневник, цели и шаблоны. Оплаты и купленный доступ сохранятся. Для подтверждения введите: /purge_me CONFIRM_PURGE"
         )
 
     db = get_db(ctx)
     await purge_user(db, update.effective_user.id)
+    ctx.user_data.clear()
+    ctx.user_data["_loaded"] = True
     await update.message.reply_text(
-        "🧹 Профиль полностью удалён. Нажмите /start, чтобы зарегистрироваться заново."
+        "🧹 Дневник, цели и шаблоны очищены. Купленный доступ и платёжная история сохранены. Нажмите /start."
     )
 
 
@@ -5243,8 +4781,14 @@ async def cmd_grant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Использование: /grant_payg <user_id> [rub]")
         return
 
-    target_id = int(ctx.args[0])
-    rub = int(ctx.args[1]) if len(ctx.args) > 1 else 0
+    try:
+        target_id = int(ctx.args[0])
+        rub = int(ctx.args[1]) if len(ctx.args) > 1 else 0
+        if not 0 < target_id < 2**63 or not 0 <= rub <= 1000000:
+            raise ValueError
+    except (ValueError,OverflowError):
+        await update.message.reply_text("Пример: /grant_payg 123456789 100. Сумма от 0 до 1000000 ₽.")
+        return
 
     db = get_db(ctx)
     await ensure_user(db, target_id)
@@ -5268,7 +4812,13 @@ async def cmd_degrant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Использование: /degrant_payg <user_id>")
         return
 
-    target_id = int(ctx.args[0])
+    try:
+        target_id = int(ctx.args[0])
+        if not 0 < target_id < 2**63:
+            raise ValueError
+    except (ValueError,OverflowError):
+        await update.message.reply_text("Укажите корректный ID пользователя.")
+        return
     db = get_db(ctx)
     await ensure_user(db, target_id)
     await db_set_payment_mode(db, target_id, "sub")
@@ -5307,7 +4857,7 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     # requests: today / 7d
     req_today_total = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime')")
-    req_7d_total    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day')")
+    req_7d_total    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day')")
 
     # если pay_mode/cost_rub нет — считаем грубо по join с users
     # (позже улучшишь, но метрики уже будут)
@@ -5319,8 +4869,8 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     try:
         req_today_payg = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='payg'")
         req_today_sub  = await q1("SELECT COUNT(*) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='sub'")
-        req_7d_payg    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
-        req_7d_sub     = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='sub'")
+        req_7d_payg    = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day') AND pay_mode='payg'")
+        req_7d_sub     = await q1("SELECT COUNT(*) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day') AND pay_mode='sub'")
     except Exception:
         req_today_payg = await q1("""
             SELECT COUNT(*) FROM requests r
@@ -5337,34 +4887,34 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         req_7d_payg = await q1("""
             SELECT COUNT(*) FROM requests r
             JOIN users u ON u.telegram_id=r.user_id
-            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+            WHERE datetime(r.created_at) >= datetime('now','localtime','-7 day')
               AND COALESCE(u.payment_mode,'sub')='payg'
         """)
         req_7d_sub = await q1("""
             SELECT COUNT(*) FROM requests r
             JOIN users u ON u.telegram_id=r.user_id
-            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+            WHERE datetime(r.created_at) >= datetime('now','localtime','-7 day')
               AND COALESCE(u.payment_mode,'sub')='sub'
         """)
 
     # активные юзеры за 7 дней
-    active_7d_total = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day')")
+    active_7d_total = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day')")
     active_7d_payg = 0
     active_7d_sub  = 0
     try:
-        active_7d_payg = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
-        active_7d_sub  = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='sub'")
+        active_7d_payg = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day') AND pay_mode='payg'")
+        active_7d_sub  = await q1("SELECT COUNT(DISTINCT user_id) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day') AND pay_mode='sub'")
     except Exception:
         active_7d_payg = await q1("""
             SELECT COUNT(DISTINCT r.user_id) FROM requests r
             JOIN users u ON u.telegram_id=r.user_id
-            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+            WHERE datetime(r.created_at) >= datetime('now','localtime','-7 day')
               AND COALESCE(u.payment_mode,'sub')='payg'
         """)
         active_7d_sub = await q1("""
             SELECT COUNT(DISTINCT r.user_id) FROM requests r
             JOIN users u ON u.telegram_id=r.user_id
-            WHERE datetime(r.created_at) >= datetime('now','-7 day')
+            WHERE datetime(r.created_at) >= datetime('now','localtime','-7 day')
               AND COALESCE(u.payment_mode,'sub')='sub'
         """)
 
@@ -5373,7 +4923,7 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     payg_spent_7d = 0
     try:
         payg_spent_today = await q1("SELECT COALESCE(SUM(cost_rub),0) FROM requests WHERE date(created_at)=date('now','localtime') AND pay_mode='payg'")
-        payg_spent_7d    = await q1("SELECT COALESCE(SUM(cost_rub),0) FROM requests WHERE datetime(created_at) >= datetime('now','-7 day') AND pay_mode='payg'")
+        payg_spent_7d    = await q1("SELECT COALESCE(SUM(cost_rub),0) FROM requests WHERE datetime(created_at) >= datetime('now','localtime','-7 day') AND pay_mode='payg'")
     except Exception:
         payg_spent_today = int(req_today_payg) * PAYG_COST_RUB
         payg_spent_7d    = int(req_7d_payg) * PAYG_COST_RUB
@@ -5381,7 +4931,7 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     # платежи (как получится)
     payments_by_provider = []
     try:
-        cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount),0) FROM payments GROUP BY provider ORDER BY 3 DESC")
+        cur = await db.execute("SELECT provider, COUNT(*), COALESCE(SUM(amount_rub),0), COALESCE(SUM(amount_stars),0) FROM payments GROUP BY provider ORDER BY 3 DESC")
         payments_by_provider = await cur.fetchall()
         await cur.close()
     except Exception:
@@ -5410,14 +4960,14 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         f"16) Active users 7d SUB: **{active_7d_sub}**\n\n"
         f"17) PAYG spent today (usage): **{payg_spent_today}₽**\n"
         f"18) PAYG spent 7d (usage): **{payg_spent_7d}₽**\n"
-        f"19) Avg req/day per active PAYG user (7d): **{(req_7d_payg / active_7d_payg):.2f if active_7d_payg else 0}**\n"
-        f"20) Avg req/day per active SUB user (7d): **{(req_7d_sub / active_7d_sub):.2f if active_7d_sub else 0}**\n"
+        f"19) Avg req/day per active PAYG user (7d): **{(req_7d_payg / (active_7d_payg * 7) if active_7d_payg else 0):.2f}**\n"
+        f"20) Avg req/day per active SUB user (7d): **{(req_7d_sub / (active_7d_sub * 7) if active_7d_sub else 0):.2f}**\n"
     )
 
     if payments_by_provider:
         text += "\n💰 **Payments by provider (all-time)**\n"
-        for prov, cnt, sm in payments_by_provider:
-            text += f"• {prov}: {cnt} / {sm}\n"
+        for prov, cnt, rub, stars in payments_by_provider:
+            text += f"• {escape_md(prov)}: {cnt} / {rub}₽ / {stars}⭐\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -5444,6 +4994,119 @@ async def cmd_my_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── main ─────────────────────────────────────────────
 
+def refresh_settings():
+    global PAYG_COST_RUB, DAILY_LIMIT, TRIAL_LIMIT
+    values = billing.settings()
+    PAYG_COST_RUB, DAILY_LIMIT, TRIAL_LIMIT = (values[k] for k in ("payg_cost","daily_limit","trial_limit"))
+    for key, plan in billing.plans().items():
+        SUB_PLANS[key] = SubscriptionPlan(key,plan["title"],plan["months"],plan["price_rub"],plan["price_stars"])
+        STARS_PLANS[PLAN_ID_TO_STARS_PLAN[key]] = plan["price_stars"]
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика бота",callback_data="admin:stats")],
+        [InlineKeyboardButton("💰 Цены подписок",callback_data="admin:prices")],
+        [InlineKeyboardButton("⚙️ Стоимость запроса и лимиты",callback_data="admin:limits")],
+        [InlineKeyboardButton("🎁 Подарочные коды",callback_data="gift_code"),InlineKeyboardButton("🧾 Чеки",callback_data="admin:paychecks")],
+        [InlineKeyboardButton("⬅️ Главное меню",callback_data="main")],
+    ])
+
+
+async def cmd_admin(update, ctx):
+    if is_admin(update.effective_user.id):
+        ctx.user_data["state"] = None
+        await edit_menu_message(update,ctx,"🛠 Управление ботом\n\nНастройки сохраняются для бота и мини-приложения. Изменение цены применяется к новым счетам.",admin_keyboard())
+
+
+async def admin_callback(update,ctx,data):
+    if not is_admin(update.effective_user.id):
+        return
+    ctx.user_data["state"] = None
+    if data == "admin:menu":
+        return await cmd_admin(update,ctx)
+    if data == "admin:stats":
+        return await cmd_stats(update,ctx)
+    values = billing.settings()
+    if data in {"admin:prices","admin:limits"}:
+        rows = []
+        if data == "admin:prices":
+            for key, plan in billing.plans().items():
+                rows.append([InlineKeyboardButton(f"{plan['title']}: {plan['price_rub']}₽",callback_data=f"admin:set:price_{key}_rub"),
+                             InlineKeyboardButton(f"{plan['price_stars']}⭐",callback_data=f"admin:set:price_{key}_stars")])
+        else:
+            labels = {"payg_cost":"Цена запроса PAYG, ₽","daily_limit":"Запросов в день по подписке","trial_limit":"Запросов за пробный период"}
+            rows = [[InlineKeyboardButton(f"{label}: {values[key]}",callback_data=f"admin:set:{key}")] for key,label in labels.items()]
+        rows.append([InlineKeyboardButton("⬅️ Управление",callback_data="admin:menu")])
+        return await edit_menu_message(update,ctx,"Выберите параметр для изменения:",InlineKeyboardMarkup(rows))
+    if data.startswith("admin:set:"):
+        key = data.split(":",2)[2]
+        if key not in billing.LIMITS:
+            return
+        ctx.user_data["state"] = "admin_setting"
+        ctx.user_data["admin_setting"] = key
+        low, high = billing.LIMITS[key]
+        await edit_menu_message(update,ctx,f"Сейчас: {values[key]}.\nПришлите новое целое значение от {low} до {high}.\nЦены в рублях и Stars задаются отдельно.",
+                                InlineKeyboardMarkup([[InlineKeyboardButton("Отмена",callback_data="admin:menu")]]))
+
+
+async def admin_setting_input(update,ctx):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        ctx.user_data["state"] = None
+        return
+    key = ctx.user_data.get("admin_setting")
+    try:
+        value = int((update.message.text or "").strip())
+        await asyncio.to_thread(billing.set_setting,key,value,uid)
+    except (ValueError,TypeError):
+        await update.message.reply_text("Не удалось сохранить: введите целое число в указанном диапазоне или нажмите «Отмена».")
+        return
+    refresh_settings()
+    ctx.user_data["state"] = None
+    ctx.user_data.pop("admin_setting",None)
+    await edit_menu_message(update,ctx,f"✅ Сохранено: {value}. Настройка действует и после перезапуска.",admin_keyboard())
+
+
+def persistent_handler(handler):
+    @wraps(handler)
+    async def wrapped(update,ctx):
+        user = update.effective_user
+        if not user:
+            return
+        # Food, profile and admin flows belong in a private chat.
+        if update.effective_chat and update.effective_chat.type != "private":
+            return
+        if not ctx.user_data.get("_loaded"):
+            with billing.connection() as conn:
+                row = conn.execute("SELECT data FROM bot_state WHERE user_id=?",(user.id,)).fetchone()
+            if row:
+                try:
+                    data = json.loads(row[0])
+                    if isinstance(data,dict):
+                        ctx.user_data.update(data)
+                except ValueError:
+                    logger.warning("Invalid saved conversation state for %s",user.id)
+            ctx.user_data["_loaded"] = True
+        refresh_settings()
+        try:
+            await handler(update,ctx)
+        finally:
+            data = {}
+            for key,value in ctx.user_data.items():
+                if key.startswith("_"):
+                    continue
+                try:
+                    json.dumps(value,allow_nan=False)
+                except (TypeError,ValueError):
+                    continue
+                data[key] = value
+            with billing.connection(write=True) as conn:
+                conn.execute("INSERT INTO bot_state VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data",
+                             (user.id,json.dumps(data,ensure_ascii=False,allow_nan=False)))
+    return wrapped
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -5459,48 +5122,49 @@ def main() -> None:
 
     application.post_init = init_db
     application.post_stop = close_db
+    application.add_handler(CommandHandler("admin", persistent_handler(cmd_admin)))
 
     # Команды
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("pay", cmd_pay))
+    application.add_handler(CommandHandler("start", persistent_handler(cmd_start)))
+    application.add_handler(CommandHandler("help", persistent_handler(cmd_help)))
+    application.add_handler(CommandHandler("pay", persistent_handler(cmd_pay)))
 
     # Админ-команды
-    application.add_handler(CommandHandler("grant", cmd_grant))
-    application.add_handler(CommandHandler("degrant", cmd_degrant))
-    application.add_handler(CommandHandler("stats", cmd_stats))
-    application.add_handler(CommandHandler("promo_add", cmd_add_promotion))
-    application.add_handler(CommandHandler("promo_status", cmd_promo_status))
-    application.add_handler(CommandHandler("promo_clear", cmd_clear_promotions))
-    application.add_handler(CommandHandler("purge_me", cmd_purge_me))
-    application.add_handler(CommandHandler("grant_payg", cmd_grant_payg))
-    application.add_handler(CommandHandler("degrant_payg", cmd_degrant_payg))
-    application.add_handler(CommandHandler("stats_payg", cmd_stats_payg))
-    application.add_handler(CommandHandler("mystats", cmd_my_stats))
-    application.add_handler(CommandHandler("paychecks", cmd_paychecks))
+    application.add_handler(CommandHandler("grant", persistent_handler(cmd_grant)))
+    application.add_handler(CommandHandler("degrant", persistent_handler(cmd_degrant)))
+    application.add_handler(CommandHandler("stats", persistent_handler(cmd_stats)))
+    application.add_handler(CommandHandler("promo_add", persistent_handler(cmd_add_promotion)))
+    application.add_handler(CommandHandler("promo_status", persistent_handler(cmd_promo_status)))
+    application.add_handler(CommandHandler("promo_clear", persistent_handler(cmd_clear_promotions)))
+    application.add_handler(CommandHandler("purge_me", persistent_handler(cmd_purge_me)))
+    application.add_handler(CommandHandler("grant_payg", persistent_handler(cmd_grant_payg)))
+    application.add_handler(CommandHandler("degrant_payg", persistent_handler(cmd_degrant_payg)))
+    application.add_handler(CommandHandler("stats_payg", persistent_handler(cmd_stats_payg)))
+    application.add_handler(CommandHandler("mystats", persistent_handler(cmd_my_stats)))
+    application.add_handler(CommandHandler("paychecks", persistent_handler(cmd_paychecks)))
 
     # Callback-кнопки
-    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(CallbackQueryHandler(persistent_handler(on_callback)))
     application.add_handler(PreCheckoutQueryHandler(on_precheckout_query))
     application.add_handler(
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, on_successful_payment)
+        MessageHandler(filters.SUCCESSFUL_PAYMENT, persistent_handler(on_successful_payment))
     )
     application.add_handler(
-        MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data)
+        MessageHandler(filters.StatusUpdate.WEB_APP_DATA, persistent_handler(on_webapp_data))
     )
 
     # Фото еды
     application.add_handler(
-        MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo)
+        MessageHandler(filters.PHOTO & ~filters.COMMAND, persistent_handler(handle_photo))
     )
     # Голосовые (заглушка)
     application.add_handler(
-        MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice)
+        MessageHandler(filters.VOICE & ~filters.COMMAND, persistent_handler(handle_voice))
     )
 
     # Любой текст (цель, уточнения, всё остальное)
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, persistent_handler(handle_text))
     )
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)

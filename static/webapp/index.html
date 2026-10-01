@@ -534,6 +534,19 @@
         border-color: rgba(34, 197, 94, 0.85) !important;
       }
 
+      html { scrollbar-gutter: stable; overflow-anchor: none; }
+      body { min-height: 100svh; }
+      body:has(.meal-editor-modal.open), body:has(.pay-modal.open) { overflow: hidden; }
+      input, select, .meal-item-grams-input { font-size: 16px; }
+      button { touch-action: manipulation; }
+      .meal-editor-modal, .pay-modal { align-items: flex-start; padding-top: max(14px, env(safe-area-inset-top)); }
+      .meal-editor-card, .pay-modal-card { max-height: calc(var(--visible-height, 100svh) - 28px); overflow: auto; overscroll-behavior: contain; }
+      .meal-editor-card { display: flex; flex-direction: column; overflow: hidden; }
+      .meal-editor-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+      .meal-item-name, .meals-table td { overflow-wrap: anywhere; }
+      #meal-editor-status { min-height: 20px; margin: 4px 0; }
+      .meal-editor-header { flex-shrink: 0; }
+      @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -720,7 +733,7 @@
 
           <div class="plan-card">
             <h3>➕ Pay-as-you-go</h3>
-            <p class="plan-description">Пополняете баланс и платите только за использованные запросы. Стоимость одного запроса — 2 ₽ (фото/голос/текст). Подходит, если вы пользуетесь ботом нерегулярно и хотите платить только по факту.</p>
+            <p class="plan-description">Пополняете баланс и платите только за использованные запросы. Стоимость одного запроса — <span data-payg-cost>2</span> ₽ (фото/голос/текст). Подходит, если вы пользуетесь ботом нерегулярно и хотите платить только по факту.</p>
             <ul class="plan-list">
               <li>Списания идут за каждый анализ</li>
               <li>Пополнения: 60 / 100 / 200 / 400 ₽</li>
@@ -740,7 +753,7 @@
           <h3>⭐ Оформление подписки</h3>
           <button class="pay-modal-close" id="sub-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите срок подписки и нажмите «Оплатить подписку». Откроется платёжная страница YooKassa внутри Telegram. После успешной оплаты активируется доступ к выбранному тарифу, и в этом режиме не будет отдельного списания за каждый запрос.</p>
+        <p class="pay-modal-note">Выберите срок подписки и нажмите «Оплатить подписку». Откроется платёжная страница YooKassa в браузере. После успешной оплаты активируется доступ к выбранному тарифу, и в этом режиме не будет отдельного списания за каждый запрос.</p>
         <div class="plan-controls">
           <label for="sub-plan-select" class="muted">Срок подписки</label>
           <select id="sub-plan-select" class="pill pill-secondary">
@@ -763,7 +776,7 @@
           <h3>➕ Пополнение Pay-as-you-go</h3>
           <button class="pay-modal-close" id="payg-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите сумму пополнения и перейдите к оплате. Откроется платёжная страница YooKassa внутри Telegram, после оплаты сумма зачислится на баланс Pay-as-you-go. Далее с баланса будет списываться по 2 ₽ за каждый запрос (фото/голос/текст).</p>
+        <p class="pay-modal-note">Выберите сумму пополнения и перейдите к оплате. Откроется платёжная страница YooKassa в браузере, после оплаты сумма зачислится на баланс Pay-as-you-go. Далее с баланса будет списываться по <span data-payg-cost>2</span> ₽ за каждый запрос (фото/голос/текст).</p>
         <div class="pay-actions" id="payg-modal-buttons"></div>
       </div>
     </div>
@@ -802,10 +815,11 @@
       <div class="meal-editor-card">
         <div class="meal-editor-header">
           <h3 id="meal-editor-title">Редактирование приёмов пищи</h3>
-          <button id="meal-editor-close" class="pill meal-editor-close-btn" type="button" aria-label="Закрыть">Закрыть</button>
+          <button id="meal-editor-close" class="pill meal-editor-close-btn" type="button" aria-label="Сохранить и закрыть">Готово</button>
         </div>
         <p class="hint">Изменяйте граммовку ползунком или введите вручную — КБЖУ пересчитываются и сохраняются автоматически.</p>
-        <div id="meal-editor-status" class="hint"></div>
+        <div id="meal-editor-status" class="hint" role="status" aria-live="polite"></div>
+        <div class="row"><button class="pill" id="meal-editor-retry" type="button">Сохранить правки</button><button class="pill" id="meal-editor-discard" type="button">Отменить несохранённое</button></div>
         <div id="meal-editor-list" class="meal-editor-list"></div>
       </div>
     </div>
@@ -815,6 +829,28 @@
       tg?.ready?.();
       const tgInitData = tg?.initData || "";
       const tgUserId = tg?.initDataUnsafe?.user?.id || null;
+      const storagePrefix = `food:${location.pathname}:${tgUserId || "guest"}:`;
+      const memoryStorage = new Map();
+      const storage = {
+        getItem(key) { try { return localStorage.getItem(storagePrefix + key) ?? memoryStorage.get(key) ?? null; } catch { return memoryStorage.get(key) ?? null; } },
+        setItem(key,value) { memoryStorage.set(key,String(value)); try { localStorage.setItem(storagePrefix + key,String(value)); } catch {} },
+        removeItem(key) { memoryStorage.delete(key); try { localStorage.removeItem(storagePrefix + key); } catch {} }
+      };
+      function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+      function jsonStored(key, fallback) { try { return JSON.parse(storage.getItem(key)) ?? fallback; } catch { return fallback; } }
+      function updateVisibleHeight() { document.documentElement.style.setProperty("--visible-height", `${window.visualViewport?.height || innerHeight}px`); }
+      updateVisibleHeight();
+      window.visualViewport?.addEventListener("resize",updateVisibleHeight);
+      let serverPlans = {};
+      let paymentBusy = false, paymentChecking = false;
+      let dayRequest = 0, analyticsRequest = 0;
+      let mealWriteChain = Promise.resolve();
+      const queuedDrafts = new Map();
+      let mealDeleteBusy = false;
+      let mealDrafts = jsonStored("meal-drafts", {});
+      if (!mealDrafts || Array.isArray(mealDrafts) || typeof mealDrafts !== "object") mealDrafts = {};
+      function persistDrafts() { storage.setItem("meal-drafts", JSON.stringify(mealDrafts)); }
+
 
       function qs(name) {
         return new URLSearchParams(location.search).get(name);
@@ -1019,8 +1055,8 @@
       function describePaymentConfig(cfg) {
         if (!cfg) return { title: "Оплата", amount: "", description: "" };
         if (cfg.kind === "subscription") {
-          const map = { w1: ["Одна неделя", 125], m1: ["1 месяц", 399], m3: ["3 месяца", 1000], m6: ["6 месяцев", 1800], y1: ["1 год", 3500] };
-          const val = map[cfg.plan_id] || [cfg.plan_id, 0];
+          const plan = serverPlans[cfg.plan_id];
+          const val = plan ? [plan.title, plan.price_rub] : [cfg.plan_id, "уточняется"];
           return { title: `Подписка ${val[0]}`, amount: `${val[1]} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
         }
         return { title: "Пополнение PAYG", amount: `${cfg.rub} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
@@ -1028,47 +1064,36 @@
 
       function savePendingPayment(data) {
         if (!data?.payment_id) return;
-        localStorage.setItem(PENDING_KEYS.paymentId, String(data.payment_id));
-        localStorage.setItem(PENDING_KEYS.kind, String(data.kind || ""));
-        localStorage.setItem(PENDING_KEYS.planId, String(data.plan_id || ""));
-        localStorage.setItem(PENDING_KEYS.rub, String(data.rub || ""));
-        localStorage.setItem(PENDING_KEYS.createdAt, String(data.created_at || Date.now()));
-        localStorage.setItem(PENDING_KEYS.projectKey, String(data.project_key || ""));
-        localStorage.setItem(PENDING_KEYS.confirmationUrl, String(data.confirmation_url || ""));
+        storage.setItem(PENDING_KEYS.paymentId, String(data.payment_id));
+        storage.setItem(PENDING_KEYS.kind, String(data.kind || ""));
+        storage.setItem(PENDING_KEYS.planId, String(data.plan_id || ""));
+        storage.setItem(PENDING_KEYS.rub, String(data.rub || ""));
+        storage.setItem(PENDING_KEYS.createdAt, String(data.created_at || Date.now()));
+        storage.setItem(PENDING_KEYS.projectKey, String(data.project_key || ""));
+        storage.setItem(PENDING_KEYS.confirmationUrl, String(data.confirmation_url || ""));
       }
 
       function readPendingPayment() {
-        const payment_id = localStorage.getItem(PENDING_KEYS.paymentId);
+        const payment_id = storage.getItem(PENDING_KEYS.paymentId);
         if (!payment_id) return null;
         return {
           payment_id,
-          kind: localStorage.getItem(PENDING_KEYS.kind) || "",
-          plan_id: localStorage.getItem(PENDING_KEYS.planId) || "",
-          rub: localStorage.getItem(PENDING_KEYS.rub) || "",
-          created_at: localStorage.getItem(PENDING_KEYS.createdAt) || "",
-          project_key: localStorage.getItem(PENDING_KEYS.projectKey) || "",
-          confirmation_url: localStorage.getItem(PENDING_KEYS.confirmationUrl) || "",
+          kind: storage.getItem(PENDING_KEYS.kind) || "",
+          plan_id: storage.getItem(PENDING_KEYS.planId) || "",
+          rub: storage.getItem(PENDING_KEYS.rub) || "",
+          created_at: storage.getItem(PENDING_KEYS.createdAt) || "",
+          project_key: storage.getItem(PENDING_KEYS.projectKey) || "",
+          confirmation_url: storage.getItem(PENDING_KEYS.confirmationUrl) || "",
         };
       }
 
       function clearPendingPayment() {
-        Object.values(PENDING_KEYS).forEach((k) => localStorage.removeItem(k));
+        Object.values(PENDING_KEYS).forEach((k) => storage.removeItem(k));
         if (btnOpenPayment) btnOpenPayment.style.display = "none";
       }
 
       async function createRedirectPayment(config) {
-        const created = await fetch(`/api/payments/redirect/create`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
-          },
-          body: JSON.stringify(config),
-        }).then(async (r) => {
-          if (!r.ok) throw new Error(await r.text());
-          return r.json();
-        });
-        return created;
+        return fetchJson("/api/payments/redirect/create", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});
       }
 
       function validateEmail(email) {
@@ -1086,7 +1111,7 @@
       function syncPaymentEmailGate() {
         const wantsReceipt = !!receiptOptIn?.checked;
         const ready = !!receiptEmailState.ready;
-        if (btnPreparePayment) btnPreparePayment.disabled = false;
+        if (btnPreparePayment) btnPreparePayment.disabled = paymentBusy;
 
         if (emailCollectCard) {
           emailCollectCard.style.display = wantsReceipt ? "block" : "none";
@@ -1128,17 +1153,7 @@
       }
 
       async function saveReceiptEmail(email) {
-        await fetch("/api/payments/receipt-email", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(tgInitData ? { "X-Tg-Init-Data": tgInitData } : {}),
-          },
-          body: JSON.stringify({ email }),
-        }).then(async (r) => {
-          if (!r.ok) throw new Error(await r.text());
-          return r.json();
-        });
+        await fetchJson("/api/payments/receipt-email", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email})});
         await fetchReceiptEmail();
       }
 
@@ -1163,24 +1178,12 @@
         window.open(url, "_blank");
       }
 
-      function notifyBotAboutWebappPayment(kind, payload = {}) {
-        try {
-          if (!tg?.sendData) return;
-          tg.sendData(JSON.stringify({
-            type: "webapp_widget_paid",
-            kind,
-            ...payload,
-          }));
-        } catch (err) {
-          console.warn("Telegram WebApp sendData error", err);
-        }
-      }
-
       async function checkPendingPaymentStatus({ silent = false } = {}) {
         const pending = readPendingPayment();
-        if (!pending?.payment_id) return;
+        if (!pending?.payment_id || paymentChecking) return;
         if (pending.project_key && currentProjectKey && pending.project_key !== currentProjectKey) return;
 
+        paymentChecking = true;
         try {
           const status = await fetchJson(`/api/payments/yookassa/status?payment_id=${encodeURIComponent(pending.payment_id)}`);
           const st = String(status?.status || "unknown");
@@ -1188,11 +1191,7 @@
             const msg = pending.kind === "subscription"
               ? "Поздравляем! Подписка успешно активирована."
               : `Поздравляем! Баланс пополнен на ${pending.rub || 0} ₽.`;
-            notifyBotAboutWebappPayment(pending.kind, {
-              rub: Number(pending.rub || 0),
-              payment_id: String(pending.payment_id || ""),
-              message: msg,
-            });
+            clearPendingPayment();
             if (paymentSuccessText) paymentSuccessText.textContent = msg;
             setModalOpen(paymentSuccessModal, true);
             clearPendingPayment();
@@ -1209,13 +1208,26 @@
           }
         } catch (err) {
           if (!silent && paymentStatusEl) {
-            paymentStatusEl.textContent = "Не удалось проверить статус платежа.";
+            paymentStatusEl.textContent = "Не удалось проверить статус платежа. Не оплачивайте повторно, проверка повторится.";
           }
-        }
+        } finally { paymentChecking = false; }
       }
 
       async function startRedirectPayment(config) {
-        if (!config) return;
+        if (!config || paymentBusy) return;
+        paymentBusy = true;
+        syncPaymentEmailGate();
+        try {
+        const previous = readPendingPayment();
+        if (previous?.payment_id) {
+          await checkPendingPaymentStatus();
+          const pending = readPendingPayment();
+          if (pending) {
+            if (btnOpenPayment && pending.confirmation_url) { btnOpenPayment.style.display = "inline-flex"; btnOpenPayment.dataset.confirmationUrl = pending.confirmation_url; }
+            if (paymentStatusEl) paymentStatusEl.textContent = "У вас уже есть счёт. Откройте его или дождитесь подтверждения отмены. Повторная оплата не нужна.";
+          }
+          return;
+        }
         const wantsReceipt = !!receiptOptIn?.checked;
         if (paymentStatusEl) paymentStatusEl.textContent = "Подготавливаем счёт...";
         const created = await createRedirectPayment({
@@ -1224,7 +1236,8 @@
         });
         const confirmationUrl = created?.confirmation_url;
         const paymentId = created?.payment_id;
-        if (!confirmationUrl || !paymentId) throw new Error("Не удалось подготовить счёт");
+        if (paymentAmountEl && created?.amount_rub) paymentAmountEl.textContent = `Сумма по счёту: ${created.amount_rub} ₽`;
+        if (!confirmationUrl || !paymentId) { await checkPendingPaymentStatus(); throw new Error("Проверьте статус предыдущего платежа. Не оплачивайте повторно."); }
 
         savePendingPayment({
           payment_id: paymentId,
@@ -1240,6 +1253,7 @@
           btnOpenPayment.dataset.confirmationUrl = confirmationUrl;
         }
         if (paymentStatusEl) paymentStatusEl.textContent = "Счёт подготовлен. Теперь откройте оплату в браузере.";
+        } finally { paymentBusy = false; syncPaymentEmailGate(); }
       }
 
       async function openInWebappWidget(config) {
@@ -1345,13 +1359,13 @@
 
       function isoToday() {
         const d = new Date();
-        return d.toISOString().slice(0, 10);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
       }
 
       function isoYesterday() {
         const d = new Date();
         d.setDate(d.getDate() - 1);
-        return d.toISOString().slice(0, 10);
+        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
       }
 
       function formatHuman(iso) {
@@ -1403,10 +1417,17 @@
         const headers = { ...(options.headers || {}) };
         if (tgInitData) headers["X-Tg-Init-Data"] = tgInitData;
         const requestOptions = { ...options, headers, cache: "no-store" };
-        const res = await fetch(url, requestOptions);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(),20000);
+        let res;
+        try { res = await fetch(url, { ...requestOptions, signal: controller.signal }); } finally { clearTimeout(timer); }
         if (!res.ok) {
           const body = await res.text();
-          throw new Error(`HTTP ${res.status}: ${body}`);
+          let message = "Не удалось выполнить запрос. Попробуйте ещё раз.";
+          try { const detail = JSON.parse(body).detail; if (typeof detail === "string") message = detail; } catch {}
+          const error = new Error(res.status === 401 ? "Откройте мини-приложение заново из бота: сессия истекла." : message);
+          error.status = res.status;
+          throw error;
         }
         const ct = res.headers.get("content-type") || "";
         if (ct.includes("application/json")) {
@@ -1474,10 +1495,10 @@
                   ${meals
                     .map((meal) => {
                       const itemLines = Array.isArray(meal.items) && meal.items.length
-                        ? meal.items.map((it) => `<div class="meal-items-line">${it.name}${it.grams ? ` — ${fmt(it.grams, 0)} г` : ""} (К ${fmt(it.kcal,0)}, Б ${fmt(it.protein,0)}, Ж ${fmt(it.fat,0)}, У ${fmt(it.carbs,0)})</div>`).join("")
+                        ? meal.items.map((it) => `<div class="meal-items-line">${escapeHtml(it.name)}${it.grams ? ` — ${fmt(it.grams, 0)} г` : ""} (К ${fmt(it.kcal,0)}, Б ${fmt(it.protein,0)}, Ж ${fmt(it.fat,0)}, У ${fmt(it.carbs,0)})</div>`).join("")
                         : '<div class="meal-items-line">Без детализации блюда</div>';
                       const editBtn = meal.id ? `<button class="pill meal-edit-btn" type="button" data-edit-meal-id="${meal.id}">✏️</button>` : "";
-                      return `<tr><td>${meal.time || "—"} ${editBtn}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
+                      return `<tr><td>${escapeHtml(meal.time || "—")} ${editBtn}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
                     })
                     .join("")}
                 </tbody>
@@ -1499,7 +1520,7 @@
         const c = totals.carbs || 0;
         const sumMacros = p + f + c;
 
-        if (sumMacros > 0 && todayRingEl) {
+        if (sumMacros > 0 && todayRingEl && typeof Chart !== "undefined") {
           todayRing = new Chart(todayRingEl.getContext("2d"), {
             type: "doughnut",
             data: {
@@ -1537,14 +1558,16 @@
         if (!mealEditorStatus) return;
         mealEditorStatus.textContent = text || "";
         if (saveStatusTimer) clearTimeout(saveStatusTimer);
-        if (text) {
+        if (text === "Изменения сохранены" || text === "Блюдо удалено") {
           saveStatusTimer = setTimeout(() => {
             if (mealEditorStatus.textContent === text) mealEditorStatus.textContent = "";
           }, 1500);
         }
       }
 
-      function closeMealEditor() {
+      async function closeMealEditor() {
+        if (!await flushMealDrafts()) return;
+        document.activeElement?.blur?.();
         mealEditorOpen = false;
         mealEditorTargetMealId = null;
         mealEditorModal?.classList.remove("open");
@@ -1562,24 +1585,26 @@
           const items = Array.isArray(meal.items) ? meal.items : [];
           const itemHtml = items.length ? items.map((item, idx) => {
             const grams = Number(item.grams || 0);
-            const sliderMax = Math.max(grams * 3, 300);
+            const sliderMax = 5000;
+            const draft = mealDrafts[`${meal.id}:${idx}`];
+            const displayGrams = draft ? draft.value : String(grams);
             return `<div class="meal-item-editor" data-meal-id="${meal.id}" data-item-index="${idx}">
               <div class="meal-item-top">
                 <div>
-                  <div class="meal-item-name">${item.name || "Блюдо"}</div>
+                  <div class="meal-item-name">${escapeHtml(item.name || "Блюдо")}</div>
                   <div class="meal-item-macros">К ${fmt(item.kcal,0)} · Б ${fmt(item.protein,0)} · Ж ${fmt(item.fat,0)} · У ${fmt(item.carbs,0)}</div>
                 </div>
                 <button class="pill meal-edit-btn" type="button" data-action="delete-item" data-meal-id="${meal.id}" data-item-index="${idx}">Удалить</button>
               </div>
               <div class="meal-item-slider-row">
-                <input class="meal-item-slider" type="range" min="0" max="${sliderMax}" step="1" value="${grams}" data-action="grams-slider" data-meal-id="${meal.id}" data-item-index="${idx}" />
-                <input class="pill pill-secondary meal-item-grams-input" type="number" min="0" max="${sliderMax}" step="1" inputmode="numeric" aria-label="Граммовка блюда" value="${fmt(grams,0)}" data-action="grams-input" data-meal-id="${meal.id}" data-item-index="${idx}" />
+                <input class="meal-item-slider" type="range" min="1" max="${sliderMax}" step="1" value="${escapeHtml(displayGrams)}" data-action="grams-slider" data-meal-id="${meal.id}" data-item-index="${idx}" />
+                <input class="pill pill-secondary meal-item-grams-input" type="text" inputmode="decimal" enterkeyhint="done" aria-label="Граммовка блюда" value="${escapeHtml(displayGrams)}" data-action="grams-input" data-meal-id="${meal.id}" data-item-index="${idx}" />
               </div>
             </div>`;
           }).join("") : '<div class="hint">Без детализации блюд.</div>';
 
           return `<div class="meal-block">
-            <h4>${meal.time || "—"} · К ${fmt(meal.kcal,0)} / Б ${fmt(meal.protein,0)} / Ж ${fmt(meal.fat,0)} / У ${fmt(meal.carbs,0)}</h4>
+            <h4>${escapeHtml(meal.time || "—")} · К ${fmt(meal.kcal,0)} / Б ${fmt(meal.protein,0)} / Ж ${fmt(meal.fat,0)} / У ${fmt(meal.carbs,0)}</h4>
             ${itemHtml}
           </div>`;
         }).join("");
@@ -1592,19 +1617,15 @@
         mealEditorModal?.classList.add("open");
       }
 
-      async function saveMealItemGrams(mealId, itemIndex, grams) {
-        await fetchJson(`/api/meals/${mealId}/items/${itemIndex}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ grams }),
-        });
+      async function saveMealItemGrams(mealId, itemIndex, grams, version) {
+        return fetchJson(`/api/meals/${mealId}/items/${itemIndex}`, {method:"PATCH", headers:{"Content-Type":"application/json"},body:JSON.stringify({grams,version})});
       }
-
-      async function deleteMealItem(mealId, itemIndex) {
-        await fetchJson(`/api/meals/${mealId}/items/${itemIndex}`, { method: "DELETE" });
+      async function deleteMealItem(mealId, itemIndex, version) {
+        return fetchJson(`/api/meals/${mealId}/items/${itemIndex}?version=${version}`, {method:"DELETE"});
       }
 
       async function loadDay(mode, dateIso) {
+        const requestId = ++dayRequest;
         if (!tgInitData) {
           todayErrorEl.textContent =
             "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
@@ -1647,17 +1668,22 @@
           dateInput.value = effectiveDate;
         }
 
+        const cached = jsonStored(`day:${effectiveDate}`,null);
+        if (!lastDayData && cached?.data && Date.now()-cached.ts < 600000) renderToday(cached.data,title,caption);
         try {
           const stats = await fetchJson(url);
+          if (requestId !== dayRequest) return;
           renderToday(stats, title, caption);
+          storage.setItem(`day:${effectiveDate}`,JSON.stringify({ts:Date.now(),data:stats}));
         } catch (err) {
           console.error(err);
           dlog(err?.stack || String(err));
-          todayErrorEl.textContent = "Ошибка загрузки данных.";
+          if (requestId === dayRequest) todayErrorEl.textContent = err.message || "Ошибка загрузки данных.";
         }
       }
 
       function buildWeekChart(history) {
+        if (typeof Chart === "undefined") return;
         const labels = history.map((d) => formatDayLabel(d.day));
         const kcalData = history.map((d) => d.kcal || 0);
 
@@ -1698,6 +1724,7 @@
       }
 
       function buildMonthChart(history) {
+        if (typeof Chart === "undefined") return;
         const labels = history.map((d) => formatDayLabel(d.day));
         const kcalData = history.map((d) => d.kcal || 0);
 
@@ -1798,6 +1825,7 @@ function setActiveAnalyticsPreset(range) {
 
         const ctx = document.getElementById("analytics-chart")?.getContext("2d");
         if (!ctx) return;
+        if (typeof Chart === "undefined") return;
         analyticsChart?.destroy?.();
         analyticsChart = new Chart(ctx, {
           type: "line",
@@ -1807,6 +1835,7 @@ function setActiveAnalyticsPreset(range) {
       }
 
       async function loadAdvancedStats(range = activeAnalyticsRange) {
+        const requestId = ++analyticsRequest;
         analyticsError.textContent = "";
         const params = new URLSearchParams({ range });
         if (range === "custom") {
@@ -1825,7 +1854,7 @@ function setActiveAnalyticsPreset(range) {
         }
         try {
           const data = await fetchJson(`/api/stats/advanced?${params.toString()}`);
-          renderAnalytics(data);
+          if (requestId === analyticsRequest) renderAnalytics(data);
         } catch (err) {
           console.error(err);
           analyticsError.textContent = "Ошибка загрузки расширенной статистики.";
@@ -2018,88 +2047,112 @@ function setActiveAnalyticsPreset(range) {
         if (input && Number(input.value) !== grams) input.value = String(grams);
       }
 
-      async function commitMealItemGrams(sourceEl) {
-        const row = sourceEl?.closest?.(".meal-item-slider-row");
-        if (!row) return;
-        const slider = row.querySelector("[data-action='grams-slider']");
+      function stageMealInput(control) {
+        const row = control?.closest?.(".meal-item-editor");
+        if (!row) return null;
         const input = row.querySelector("[data-action='grams-input']");
-        if (!slider || !input) return;
-        const max = Number(slider.max || 0) || 0;
-        const parsedValue = Number(input.value);
-        const safeValue = Number.isFinite(parsedValue) ? Math.max(0, Math.min(max, Math.round(parsedValue))) : Number(slider.value || 0);
-        syncMealItemGramsRow(row, safeValue);
-        if (sourceEl?.dataset?.lastCommittedGrams === String(safeValue)) return;
-        if (sourceEl?.dataset) sourceEl.dataset.lastCommittedGrams = String(safeValue);
-        const mealId = Number(slider.getAttribute("data-meal-id") || 0);
-        const itemIndex = Number(slider.getAttribute("data-item-index") || -1);
-        if (!mealId || itemIndex < 0) return;
+        const slider = row.querySelector("[data-action='grams-slider']");
+        if (control === slider) input.value = slider.value;
+        const mealId = Number(row.dataset.mealId), itemIndex = Number(row.dataset.itemIndex);
+        const meal = lastDayData?.meals?.find(m => Number(m.id) === mealId);
+        if (!meal) return null;
+        const key = `${mealId}:${itemIndex}`;
+        const old = mealDrafts[key];
+        if (!old && Number(input.value.replace(",",".")) === Number(meal.items[itemIndex]?.grams)) return null;
+        mealDrafts[key] = {mealId,itemIndex,value:input.value,version:old?.version ?? meal.version,day:lastLoadedDateIso};
+        persistDrafts();
+        return key;
+      }
+      async function writeMealDraft(key) {
+        const draft = mealDrafts[key];
+        if (!draft) return true;
+        const value = Number(String(draft.value).replace(",","."));
+        if (!String(draft.value).trim() || !Number.isFinite(value) || value <= 0 || value > 5000) {
+          setMealEditorStatus("Введите вес больше 0 и не более 5000 г. Для удаления есть отдельная кнопка.");
+          return false;
+        }
+        const snapshot = {...draft};
         try {
-          setMealEditorStatus("Сохраняем...");
-          await saveMealItemGrams(mealId, itemIndex, safeValue);
-          await loadDay(activeMode, lastLoadedDateIso);
-          if (mealEditorOpen) renderMealEditor();
+          setMealEditorStatus("Сохраняем…");
+          const result = await saveMealItemGrams(snapshot.mealId,snapshot.itemIndex,value,snapshot.version);
+          const meal = lastDayData?.meals?.find(m => Number(m.id) === snapshot.mealId);
+          if (meal) meal.version = result.version;
+          for (const pending of Object.values(mealDrafts)) if (pending.mealId === snapshot.mealId && pending.version === snapshot.version) pending.version = result.version;
+          if (mealDrafts[key]?.value === snapshot.value) delete mealDrafts[key];
+          persistDrafts();
+          if (snapshot.day === lastLoadedDateIso) await loadDay(activeMode,lastLoadedDateIso);
           setMealEditorStatus("Изменения сохранены");
+          return true;
         } catch (err) {
-          console.error(err);
-          setMealEditorStatus("Не удалось сохранить изменение");
+          setMealEditorStatus(err.status === 409 ? "Данные изменены в другом окне. Ваш ввод сохранён. Отмените несохранённое, чтобы загрузить актуальные данные." : "Не удалось сохранить. Ввод сохранён на этом устройстве; нажмите «Сохранить правки» для повтора.");
+          return false;
         }
       }
-
-      mealEditorList?.addEventListener("input", (e) => {
-        const slider = e.target?.closest?.("[data-action='grams-slider']");
-        if (slider) {
-          const row = slider.closest(".meal-item-slider-row");
-          syncMealItemGramsRow(row, Number(slider.value || 0));
-          return;
-        }
-        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
-        if (!gramsInput) return;
-        const row = gramsInput.closest(".meal-item-slider-row");
-        if (!row) return;
-        const sliderInRow = row.querySelector("[data-action='grams-slider']");
-        const max = Number(sliderInRow?.max || 0) || 0;
-        const typedValue = Number(gramsInput.value);
-        if (!Number.isFinite(typedValue)) return;
-        const safeValue = Math.max(0, Math.min(max, Math.round(typedValue)));
-        syncMealItemGramsRow(row, safeValue);
+      function enqueueMealWrite(action) {
+        const result = mealWriteChain.then(action,action);
+        mealWriteChain = result.catch(() => false);
+        return result;
+      }
+      function commitMealItemGrams(sourceEl) {
+        const key = stageMealInput(sourceEl);
+        if (!key) return mealWriteChain;
+        const signature = JSON.stringify([key,mealDrafts[key]?.value,mealDrafts[key]?.version]);
+        if (queuedDrafts.has(signature)) return queuedDrafts.get(signature);
+        const pending = enqueueMealWrite(() => writeMealDraft(key)).finally(() => queuedDrafts.delete(signature));
+        queuedDrafts.set(signature,pending);
+        return pending;
+      }
+      async function flushMealDrafts() {
+        if (mealEditorOpen) mealEditorList.querySelectorAll("[data-action='grams-input']").forEach(stageMealInput);
+        return enqueueMealWrite(async () => {
+          while (Object.keys(mealDrafts).length) {
+            for (const key of Object.keys(mealDrafts)) if (!await writeMealDraft(key)) return false;
+          }
+          return true;
+        });
+      }
+      mealEditorList?.addEventListener("focusin",e => {
+        if (e.target.matches("[data-action='grams-input']")) e.target.select();
       });
-
-      mealEditorList?.addEventListener("change", async (e) => {
-        const gramsControl = e.target?.closest?.("[data-action='grams-slider'], [data-action='grams-input']");
-        if (!gramsControl) return;
-        await commitMealItemGrams(gramsControl);
+      mealEditorList?.addEventListener("input",e => {
+        if (e.target.matches("[data-action='grams-slider'],[data-action='grams-input']")) stageMealInput(e.target);
       });
-
-      mealEditorList?.addEventListener("keydown", async (e) => {
-        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
-        if (!gramsInput || e.key !== "Enter") return;
-        e.preventDefault();
-        await commitMealItemGrams(gramsInput);
+      mealEditorList?.addEventListener("change",e => {
+        if (e.target.matches("[data-action='grams-slider'],[data-action='grams-input']")) commitMealItemGrams(e.target);
       });
-
-      mealEditorList?.addEventListener("blur", async (e) => {
-        const gramsInput = e.target?.closest?.("[data-action='grams-input']");
-        if (!gramsInput) return;
-        await commitMealItemGrams(gramsInput);
-      }, true);
-
-      mealEditorList?.addEventListener("click", async (e) => {
-        const btn = e.target?.closest?.("[data-action='delete-item']");
-        if (!btn) return;
-        const mealId = Number(btn.getAttribute("data-meal-id") || 0);
-        const itemIndex = Number(btn.getAttribute("data-item-index") || -1);
-        if (!mealId || itemIndex < 0) return;
-        try {
-          setMealEditorStatus("Удаляем...");
-          await deleteMealItem(mealId, itemIndex);
-          await loadDay(activeMode, lastLoadedDateIso);
-          if (mealEditorOpen) renderMealEditor();
-          setMealEditorStatus("Изменения сохранены");
-        } catch (err) {
-          console.error(err);
-          setMealEditorStatus("Не удалось удалить блюдо");
-        }
+      mealEditorList?.addEventListener("focusout",e => {
+        if (e.target.matches("[data-action='grams-input']")) commitMealItemGrams(e.target);
       });
+      mealEditorList?.addEventListener("keydown",async e => {
+        if (e.key === "Enter" && e.target.matches("[data-action='grams-input']")) { e.preventDefault(); if (await commitMealItemGrams(e.target)) e.target.blur(); }
+      });
+      document.getElementById("meal-editor-retry")?.addEventListener("click",flushMealDrafts);
+      document.getElementById("meal-editor-discard")?.addEventListener("click",async () => {
+        if (!confirm("Отменить несохранённые изменения?")) return;
+        await mealWriteChain;
+        mealDrafts = {}; persistDrafts();
+        await loadDay(activeMode,lastLoadedDateIso); renderMealEditor(); setMealEditorStatus("");
+      });
+      mealEditorList?.addEventListener("click",async e => {
+        const btn = e.target.closest("[data-action='delete-item']");
+        if (!btn || btn.disabled || mealDeleteBusy) return;
+        mealDeleteBusy = true;
+        btn.disabled = true;
+        if (!await flushMealDrafts()) { btn.disabled = false; mealDeleteBusy = false; return; }
+        const mealId = Number(btn.dataset.mealId), itemIndex = Number(btn.dataset.itemIndex);
+        await enqueueMealWrite(async () => {
+          try {
+            const meal = lastDayData?.meals?.find(m => Number(m.id) === mealId);
+            await deleteMealItem(mealId,itemIndex,meal?.version);
+            await loadDay(activeMode,lastLoadedDateIso);
+            if (mealEditorOpen) renderMealEditor();
+            setMealEditorStatus("Блюдо удалено");
+          } catch (err) { setMealEditorStatus(err.message || "Не удалось удалить блюдо"); btn.disabled = false; }
+        });
+        mealDeleteBusy = false;
+      });
+      window.addEventListener("online",() => { if (mealEditorOpen) flushMealDrafts(); });
+      window.addEventListener("pagehide",persistDrafts);
 
       (async function init() {
 
@@ -2123,6 +2176,12 @@ function setActiveAnalyticsPreset(range) {
         try {
           const cfg = await fetchJson("/api/config");
           currentProjectKey = String(cfg?.project_key || "");
+          serverPlans = cfg?.plans || {};
+          for (const option of subPlanSelect?.options || []) {
+            const plan = serverPlans[option.value];
+            if (plan) option.textContent = `${plan.title} — ${plan.price_rub} ₽`;
+          }
+          document.querySelectorAll("[data-payg-cost]").forEach(el => el.textContent = String(cfg.payg_cost ?? 2));
         } catch (_) {}
 
         if (queryPayment) {
@@ -2134,7 +2193,7 @@ function setActiveAnalyticsPreset(range) {
             ? "После оплаты подписка активируется автоматически."
             : "После оплаты баланс PAYG пополнится автоматически.";
           forcePaymentScreen = true;
-          await fetchReceiptEmail();
+          try { await fetchReceiptEmail(); } catch { if (paymentStatusEl) paymentStatusEl.textContent = "Email пока не загрузился. Можно повторить позже."; }
           if (receiptOptIn) receiptOptIn.checked = false;
           syncPaymentEmailGate();
           btnPreparePayment?.addEventListener("click", async () => {
@@ -2161,9 +2220,10 @@ function setActiveAnalyticsPreset(range) {
         }
 
         document.addEventListener("visibilitychange", () => {
-          if (!document.hidden) checkPendingPaymentStatus({ silent: false });
+          if (!document.hidden) { checkPendingPaymentStatus({ silent: false }); if (!mealEditorOpen) loadDay(activeMode,selectedISO); }
         });
         window.addEventListener("focus", () => checkPendingPaymentStatus({ silent: false }));
+        setInterval(() => { if (!document.hidden && readPendingPayment()) checkPendingPaymentStatus({silent:true}); },10000);
 
         setActiveMode("today");
         showScreen(forcePaymentScreen ? "payment" : "today");

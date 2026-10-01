@@ -6,7 +6,7 @@
     <title>Возврат после оплаты</title>
     <style>
       body { font-family: system-ui, sans-serif; margin: 0; background: #0b0f18; color: #f5f5f5; }
-      .wrap { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+      .wrap { min-height: 100svh; display: grid; place-items: center; padding: 16px; }
       .card { max-width: 520px; background: rgba(15,23,42,.9); border: 1px solid rgba(148,163,184,.25); border-radius: 16px; padding: 20px; }
       a { color: #60a5fa; }
     </style>
@@ -14,8 +14,8 @@
   <body>
     <div class="wrap">
       <div class="card">
-        <h1>Оплата обработана</h1>
-        <p>Вернитесь в Telegram.</p>
+        <h1>Проверяем оплату</h1>
+        <p>Вернитесь в Telegram. После подтверждения оплаты подписка или баланс обновятся автоматически. Повторно оплачивать не нужно.</p>
         <p><a id="bot-link" href="#" target="_blank" rel="noopener">Открыть бота</a></p>
       </div>
     </div>
@@ -28,7 +28,7 @@
           username = String(cfg?.bot_username || '').replace(/^@/, '');
         } catch (_) {}
         const link = document.getElementById('bot-link');
-        const href = username ? `https://t.me/${username}` : 'https://t.me';
+        const href = /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}` : 'https://t.me';
         link.href = href;
         link.textContent = href;
       })();

@@ -1,4 +1,12 @@
 import os
+import asyncio
+from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
+import math
+from pathlib import Path
+import aiosqlite
+import billing
+from db import DB_PATH, BASE_DIR, create_tables
 import hmac
 import json
 import time
@@ -17,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
-load_dotenv("/srv/food_bot/.env")
+load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOOKASSA_PROVIDER_TOKEN = os.getenv("YOOKASSA_PROVIDER_TOKEN")
@@ -40,38 +48,49 @@ if not BOT_TOKEN:
     logging.error("BOT_TOKEN is not set. Please configure it in the environment or .env file.")
     raise RuntimeError("BOT_TOKEN is required for Telegram WebApp verification")
 
-DB_PATH = os.getenv("DB_PATH", "data/food_bot.sqlite3")
 logger = logging.getLogger(__name__)
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
 
-SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
-    "w1": {"title": "Одна неделя", "price_rub": 125, "days": 7},
-    "m1": {"title": "1 месяц", "price_rub": 399, "days": 30},
-    "m3": {"title": "3 месяца", "price_rub": 1000, "days": 90},
-    "m6": {"title": "6 месяцев", "price_rub": 1800, "days": 180},
-    "y1": {"title": "1 год", "price_rub": 3500, "days": 365},
-}
-PAYG_TOPUPS_RUB = {60, 100, 200, 400}
+@asynccontextmanager
+async def lifespan(app):
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+        await create_tables(db)
+    task = asyncio.create_task(_reconcile_payments())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
-app = FastAPI(title="FoodBot WebApp API")
+
+app = FastAPI(title="FoodBot WebApp API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.mount(
     WEBAPP_PUBLIC_PATH,
-    StaticFiles(directory="static/webapp", html=True),
+    StaticFiles(directory=str(BASE_DIR / "static" / "webapp"), html=True),
     name="webapp",
 )
 
 
 def parse_init_data(init_data: str) -> Dict[str, str]:
-    return {k: v for k, v in parse_qsl(init_data, keep_blank_values=True)}
+    if not isinstance(init_data, str) or len(init_data) > 16384:
+        raise HTTPException(401, "Invalid init data")
+    pairs = parse_qsl(init_data, keep_blank_values=True)
+    if len({k for k,v in pairs}) != len(pairs):
+        raise HTTPException(401, "Duplicate init data fields")
+    return dict(pairs)
 
 
 def build_data_check_string(params: Dict[str, str]) -> str:
@@ -86,33 +105,21 @@ def calc_hash(data_check_string: str, bot_token: str) -> str:
 
 def verify_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -> Dict[str, Any]:
     params = parse_init_data(init_data)
-    if "hash" not in params:
-        raise HTTPException(status_code=401, detail="Missing hash in init data")
-
-    received_hash = params["hash"]
-    data_check_string = build_data_check_string(params)
-    expected_hash = calc_hash(data_check_string, bot_token)
-
-    if not hmac.compare_digest(expected_hash, received_hash):
-        raise HTTPException(status_code=401, detail="Invalid init data signature")
-
-    auth_date = params.get("auth_date")
-    if auth_date is not None:
-        try:
-            auth_ts = int(auth_date)
-            if time.time() - auth_ts > max_age_sec:
-                raise HTTPException(status_code=401, detail="Init data expired")
-        except ValueError:
-            raise HTTPException(status_code=401, detail="Invalid auth_date")
-
-    user_raw = params.get("user")
-    if user_raw:
-        try:
-            params["user"] = json.loads(user_raw)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid user payload")
-
-    return params
+    signature = params.get("hash", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", signature):
+        raise HTTPException(401, "Invalid hash")
+    if not hmac.compare_digest(calc_hash(build_data_check_string(params), bot_token), signature.lower()):
+        raise HTTPException(401, "Invalid init data signature")
+    try:
+        auth_ts = int(params["auth_date"])
+        user = json.loads(params["user"])
+        if not -30 <= time.time() - auth_ts <= max_age_sec:
+            raise ValueError("expired")
+        if not isinstance(user, dict) or type(user.get("id")) is not int or not 0 < user["id"] < 2**63:
+            raise ValueError("user")
+    except (KeyError, ValueError, TypeError, OverflowError):
+        raise HTTPException(401, "Invalid or expired Telegram session")
+    return {**params, "user": user}
 
 
 def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> int:
@@ -143,13 +150,13 @@ def _normalize_email(email: str) -> str:
 
 def _validate_email_or_400(email: str) -> str:
     normalized = _normalize_email(email)
-    if not normalized or not EMAIL_RE.match(normalized):
+    if not normalized or len(normalized)>254 or not EMAIL_RE.fullmatch(normalized):
         raise HTTPException(status_code=400, detail="Укажите корректный email")
     return normalized
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -198,10 +205,6 @@ def _require_user_receipt_email(conn: sqlite3.Connection, user_id: int) -> str:
 
 
 
-def _widget_config_valid() -> bool:
-    return bool(YOOKASSA_WIDGET_ENABLED and YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY)
-
-
 def _widget_guard() -> None:
     if not YOOKASSA_WIDGET_ENABLED:
         raise HTTPException(status_code=503, detail="YooKassa Widget payments are disabled")
@@ -225,180 +228,74 @@ def _yookassa_headers(idempotence_key: Optional[str] = None) -> Dict[str, str]:
     return headers
 
 
-def _payment_amount_value(rub: int) -> str:
-    return f"{rub:.2f}"
-
-
-def _add_days_iso(base: Optional[str], days: int) -> str:
-    now = dt.datetime.now()
-    base_dt = now
-    if base:
-        try:
-            parsed = dt.datetime.fromisoformat(base)
-            if parsed > now:
-                base_dt = parsed
-        except Exception:
-            pass
-    return (base_dt + dt.timedelta(days=days)).isoformat()
-
-
-def _create_widget_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int) -> Dict[str, Any]:
-    _widget_guard()
-
-    title = ""
-    description = ""
-    metadata: Dict[str, Any] = {
-        "user_id": str(user_id),
-        "kind": kind,
-        "source": "telegram_webapp",
-    }
-
-    if kind == "subscription":
-        plan = SUBSCRIPTION_PLANS.get(plan_id or "")
-        if not plan:
-            raise HTTPException(status_code=400, detail="Unknown subscription plan")
-        rub = int(plan["price_rub"])
-        title = f"Подписка: {plan['title']}"
-        description = f"Оплата подписки «{plan['title']}»"
-        metadata["plan_id"] = plan_id
-    elif kind == "payg_topup":
-        if rub not in PAYG_TOPUPS_RUB:
-            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
-        title = f"PAYG пополнение: {rub}₽"
-        description = f"Пополнение PAYG баланса на {rub}₽"
-        metadata["rub"] = str(rub)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported payment kind")
-
-    payload = {
-        "amount": {"value": _payment_amount_value(rub), "currency": "RUB"},
-        "capture": True,
-        "confirmation": {"type": "embedded"},
-        "description": description,
-        "metadata": metadata,
-    }
-
-    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-    idem = f"widget-{user_id}-{kind}-{plan_id or rub}-{int(time.time() * 1000)}"
+def _provider_request(order, request):
+    # Persist the exact request before network I/O; retry with the same idempotence key.
+    with billing.connection(write=True) as conn:
+        saved = billing.get_order(order["id"], conn)
+        if saved["response_json"]:
+            return json.loads(saved["response_json"])
+        if saved["request_json"]:
+            request = json.loads(saved["request_json"])
+            if time.time() - saved["created_at"] >= 23 * 3600:
+                raise HTTPException(409, "Статус предыдущей оплаты неизвестен. Обратитесь в поддержку, не оплачивайте повторно.")
+        else:
+            conn.execute("UPDATE payment_orders SET request_json=? WHERE id=?", (json.dumps(request, ensure_ascii=False), order["id"]))
     try:
-        with httpx.Client(timeout=20.0, auth=auth) as client:
-            res = client.post(
-                "https://api.yookassa.ru/v3/payments",
-                headers=_yookassa_headers(idem),
-                json=payload,
-            )
-    except Exception as exc:
-        logger.exception("YooKassa create payment failed")
-        raise HTTPException(status_code=502, detail="YooKassa create payment failed") from exc
-
-    if res.status_code >= 400:
-        logger.error("YooKassa create payment HTTP %s: %s", res.status_code, res.text)
-        raise HTTPException(status_code=502, detail="YooKassa create payment error")
-
-    data = res.json()
-    payment_id = data.get("id")
-    confirmation_token = (data.get("confirmation") or {}).get("confirmation_token")
-    if not payment_id or not confirmation_token:
-        logger.error("YooKassa create payment malformed response: %s", data)
-        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
-
-    return {
-        "ok": True,
-        "payment_id": payment_id,
-        "confirmation_token": confirmation_token,
-        "amount_rub": rub,
-        "title": title,
-    }
+        with httpx.Client(timeout=20.0, auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)) as client:
+            res = client.post("https://api.yookassa.ru/v3/payments", headers=_yookassa_headers(order["id"]), json=request)
+        res.raise_for_status()
+        payment = res.json()
+        if not isinstance(payment, dict) or not isinstance(payment.get("id"), str):
+            raise ValueError("Invalid provider response")
+        if str((payment.get("metadata") or {}).get("order_id")) != order["id"]:
+            raise ValueError("Invalid provider order")
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Payment creation outcome unresolved for order %s: %s", order["id"], type(exc).__name__)
+        raise HTTPException(502, "Не удалось получить статус оплаты. Повторный запрос проверит тот же счёт.") from exc
+    with billing.connection(write=True) as conn:
+        saved = billing.get_order(order["id"], conn)
+        if saved["external_id"] and saved["external_id"] != payment["id"]:
+            raise HTTPException(502, "Provider payment mismatch")
+        conn.execute("UPDATE payment_orders SET external_id=?, response_json=? WHERE id=?",
+                     (payment["id"], json.dumps(payment, ensure_ascii=False), order["id"]))
+    return payment
 
 
-def _create_redirect_payment(
-    user_id: int,
-    kind: str,
-    plan_id: Optional[str],
-    rub: int,
-    *,
-    receipt_email: str,
-    wants_receipt: bool,
-    username: str,
-    full_name: str,
-) -> Dict[str, Any]:
-    _yookassa_guard()
-
-    title = ""
-    description = ""
-    metadata: Dict[str, Any] = {
-        "project_key": PROJECT_KEY,
-        "bot_username": BOT_USERNAME,
-        "user_id": str(user_id),
-        "kind": kind,
-        "source": "telegram_webapp",
-        "receipt_email": receipt_email,
-        "wants_receipt": "1" if wants_receipt else "0",
-        "username": username,
-        "full_name": full_name,
-    }
-
-    if kind == "subscription":
-        plan = SUBSCRIPTION_PLANS.get(plan_id or "")
-        if not plan:
-            raise HTTPException(status_code=400, detail="Unknown subscription plan")
-        rub = int(plan["price_rub"])
-        title = f"Подписка: {plan['title']}"
-        description = f"Оплата подписки «{plan['title']}»"
-        metadata["plan_id"] = str(plan_id)
-    elif kind == "payg_topup":
-        if rub not in PAYG_TOPUPS_RUB:
-            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
-        title = f"PAYG пополнение: {rub}₽"
-        description = f"Пополнение PAYG баланса на {rub}₽"
-        metadata["rub"] = str(rub)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported payment kind")
-
-    payload = {
-        "amount": {"value": _payment_amount_value(rub), "currency": "RUB"},
-        "capture": True,
-        "confirmation": {"type": "redirect", "return_url": YOOKASSA_RETURN_URL},
-        "description": description,
-        "metadata": metadata,
-    }
-
-    auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-    idem = f"redirect-{PROJECT_KEY}-{user_id}-{kind}-{plan_id or rub}-{int(time.time() * 1000)}"
+def _create_provider_payment(user_id, kind, plan_id, rub, *, embedded=False, **metadata):
+    _widget_guard() if embedded else _yookassa_guard()
     try:
-        with httpx.Client(timeout=20.0, auth=auth) as client:
-            res = client.post(
-                "https://api.yookassa.ru/v3/payments",
-                headers=_yookassa_headers(idem),
-                json=payload,
-            )
-    except Exception as exc:
-        logger.exception("YooKassa create redirect payment failed")
-        raise HTTPException(status_code=502, detail="YooKassa create payment failed") from exc
+        order = billing.create_order(user_id,kind,plan_id=plan_id,rub=rub,channel="yookassa")
+    except billing.PaymentError as exc:
+        raise HTTPException(400, str(exc))
+    meta = {**metadata,"project_key":PROJECT_KEY,"bot_username":BOT_USERNAME,"user_id":str(user_id),
+            "kind":kind,"source":"telegram_webapp","order_id":order["id"]}
+    meta["wants_receipt"] = "1" if metadata.get("wants_receipt") else "0"
+    if plan_id:
+        meta["plan_id"] = plan_id
+    if order["credit_rub"]:
+        meta["rub"] = str(order["credit_rub"])
+    request = {"amount":{"value":str(Decimal(order["amount"])/100),"currency":"RUB"},"capture":True,
+               "confirmation":{"type":"embedded"} if embedded else {"type":"redirect","return_url":YOOKASSA_RETURN_URL},
+               "description":order["title"],"metadata":meta}
+    payment = _provider_request(order, request)
+    confirmation = payment.get("confirmation") or {}
+    return {"ok":True,"payment_id":payment["id"],"confirmation_token":confirmation.get("confirmation_token"),
+            "confirmation_url":confirmation.get("confirmation_url"),"amount_rub":order["amount"]//100,
+            "title":order["title"],"project_key":PROJECT_KEY}
 
-    if res.status_code >= 400:
-        logger.error("YooKassa create redirect payment HTTP %s: %s", res.status_code, res.text)
-        raise HTTPException(status_code=502, detail="YooKassa create payment error")
 
-    data = res.json()
-    payment_id = data.get("id")
-    confirmation_url = (data.get("confirmation") or {}).get("confirmation_url")
-    if not payment_id or not confirmation_url:
-        logger.error("YooKassa create redirect malformed response: %s", data)
-        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
+def _create_widget_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int):
+    return _create_provider_payment(user_id,kind,plan_id,rub,embedded=True)
 
-    return {
-        "ok": True,
-        "payment_id": payment_id,
-        "confirmation_url": confirmation_url,
-        "amount_rub": rub,
-        "title": title,
-        "project_key": PROJECT_KEY,
-    }
+
+def _create_redirect_payment(user_id: int, kind: str, plan_id: Optional[str], rub: int, **metadata):
+    return _create_provider_payment(user_id,kind,plan_id,rub,**metadata)
 
 
 def _fetch_yookassa_payment(payment_id: str) -> Dict[str, Any]:
     _yookassa_guard()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,100}", payment_id):
+        raise HTTPException(400, "Invalid payment id")
     auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
     try:
         with httpx.Client(timeout=20.0, auth=auth) as client:
@@ -408,160 +305,89 @@ def _fetch_yookassa_payment(payment_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail="YooKassa status request failed") from exc
 
     if res.status_code >= 400:
-        logger.error("YooKassa status HTTP %s for %s: %s", res.status_code, payment_id, res.text)
+        logger.error("YooKassa status HTTP %s for %s", res.status_code, payment_id)
         raise HTTPException(status_code=502, detail="YooKassa status request error")
 
-    return res.json()
+    payment = res.json()
+    if not isinstance(payment, dict) or payment.get("id") != payment_id:
+        raise HTTPException(502, "Provider payment mismatch")
+    return payment
 
 
 def _finalize_widget_payment(user_id: int, payment: Dict[str, Any]) -> tuple[bool, str, str]:
-    payment_id = str(payment.get("id") or "")
-    if not payment_id:
-        raise HTTPException(status_code=502, detail="Missing payment id in YooKassa response")
-
     metadata = payment.get("metadata") or {}
     if str(metadata.get("project_key") or "") != PROJECT_KEY:
-        return False, "foreign_project", "Платёж относится к другому проекту"
-    kind = str(metadata.get("kind") or "")
-    amount_rub = int(round(float((payment.get("amount") or {}).get("value") or 0)))
-    created_at = str(payment.get("created_at") or "") or None
-    succeeded_at = str(payment.get("captured_at") or payment.get("paid_at") or dt.datetime.now().isoformat(timespec="seconds"))
-    receipt_email = _normalize_email(str(metadata.get("receipt_email") or ""))
-    receipt_email_status = "provided" if receipt_email else "missing"
-    wants_receipt = str(metadata.get("wants_receipt") or "0") == "1"
-    username = str(metadata.get("username") or "")
-    full_name = str(metadata.get("full_name") or "")
-    receipt_collected_at = dt.datetime.now().isoformat(timespec="seconds") if receipt_email else None
-
-    conn = get_conn()
+        raise HTTPException(403, "Платёж относится к другому проекту")
+    if str(metadata.get("user_id")) != str(user_id):
+        raise HTTPException(403, "Чужой платёж")
+    if payment.get("status") != "succeeded" or payment.get("paid") is not True:
+        raise HTTPException(409, "Платёж ещё не подтверждён")
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM payments WHERE provider_charge_id = ? LIMIT 1",
-            (payment_id,),
-        )
-        existed = cur.fetchone() is not None
-        if existed:
-            return False, kind or "unknown", "Платёж уже обработан ранее"
+        value = Decimal(str((payment.get("amount") or {}).get("value"))) * 100
+        if not value.is_finite() or value != value.to_integral_value() or not 0 < value < 1000000000:
+            raise ValueError("Invalid amount")
+        amount = int(value)
+        currency = payment["amount"]["currency"]
+        if currency != "RUB":
+            raise ValueError("Invalid currency")
+        order_id = metadata.get("order_id")
+        legacy = None
+        if not order_id:
+            legacy_payload = json.dumps({"type":"payg_topup","rub":int(metadata.get("rub",0))}) if metadata.get("kind")=="payg_topup" else f"sub:{metadata.get('plan_id')}:card"
+            legacy = billing.legacy_order(legacy_payload,user_id,amount,currency)
+        else:
+            order = billing.get_order(order_id)
+            if order["channel"] != "yookassa":
+                raise ValueError("Invalid payment channel")
+        applied = billing.settle(user_id=user_id,amount=amount,currency=currency,provider="yookassa",payload=json.dumps(metadata),
+                                 provider_id=payment.get("id"),order_id=order_id,legacy=legacy,
+                                 raw=json.dumps(payment,ensure_ascii=False),metadata={**metadata,"created_at":payment.get("created_at")})
+    except (ValueError, KeyError, TypeError, InvalidOperation) as exc:
+        raise HTTPException(409, "Не удалось сверить платёж. Не оплачивайте повторно; обратитесь в поддержку.") from exc
+    kind = str(metadata.get("kind"))
+    return applied, kind, "Подписка активирована ✅" if kind=="subscription" else "Баланс пополнен ✅"
 
-        now_ts = int(time.time())
-        raw = json.dumps(payment, ensure_ascii=False)
 
-        if kind == "subscription":
-            plan_id = str(metadata.get("plan_id") or "")
-            plan = SUBSCRIPTION_PLANS.get(plan_id)
-            if not plan:
-                raise HTTPException(status_code=400, detail="Unknown subscription plan in metadata")
-            product_title = f"Подписка: {plan['title']}"
+async def _reconcile_payments():
+    # A paid order is fulfilled even if the user closes the WebApp on the provider page.
+    while True:
+        try:
+            if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+                await asyncio.to_thread(_reconcile_batch)
+        except Exception:
+            logger.exception("Payment reconciliation will retry")
+        await asyncio.sleep(45)
 
-            cur.execute("SELECT premium_until FROM users WHERE telegram_id = ?", (user_id,))
-            row = cur.fetchone()
-            premium_until = row[0] if row else None
-            new_until = _add_days_iso(premium_until, int(plan["days"]))
 
-            cur.execute(
-                "UPDATE users SET is_premium = 1, premium_until = ? WHERE telegram_id = ?",
-                (new_until, user_id),
-            )
-            if plan_id == "w1":
-                cur.execute("UPDATE users SET paid_trial_used = 1 WHERE telegram_id = ?", (user_id,))
+def _reconcile_batch():
+    with billing.connection(write=True) as conn:
+        rows = conn.execute("SELECT * FROM payment_orders WHERE channel='yookassa' AND status='pending' "
+                            "AND request_json IS NOT NULL ORDER BY checked_at,created_at LIMIT 20").fetchall()
+        for row in rows:
+            conn.execute("UPDATE payment_orders SET checked_at=? WHERE id=?", (int(time.time()),row["id"]))
+    for row in rows:
+        try:
+            order = dict(row)
+            payment = _fetch_yookassa_payment(order["external_id"]) if order["external_id"] else _provider_request(order,json.loads(order["request_json"]))
+            _apply_provider_status(order["user_id"],payment)
+        except Exception as exc:
+            logger.warning("Unresolved payment order %s: %s", row["id"],type(exc).__name__)
 
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO payments
-                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
-                 currency, project_key, product_kind, product_title, username, full_name,
-                 payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
-                 receipt_email_collected_at, receipt_status, wants_receipt)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending', ?)
-                """,
-                (
-                    user_id,
-                    now_ts,
-                    "yookassa_widget",
-                    json.dumps({"kind": kind, "plan_id": plan_id}, ensure_ascii=False),
-                    amount_rub,
-                    raw,
-                    payment_id,
-                    PROJECT_KEY,
-                    kind,
-                    product_title,
-                    username or None,
-                    full_name or None,
-                    created_at,
-                    succeeded_at,
-                    receipt_email or None,
-                    receipt_email_status,
-                    receipt_collected_at,
-                    1 if wants_receipt else 0,
-                ),
-            )
-            if receipt_email:
-                cur.execute(
-                    """
-                    UPDATE users
-                    SET receipt_email = ?, receipt_email_status = 'provided',
-                        receipt_email_source = 'webapp', receipt_email_collected_at = ?
-                    WHERE telegram_id = ?
-                    """,
-                    (receipt_email, receipt_collected_at, user_id),
-                )
-            conn.commit()
-            return True, "subscription", f"Подписка {plan['title']} активирована"
 
-        if kind == "payg_topup":
-            rub = int(metadata.get("rub") or amount_rub)
-            product_title = f"PAYG пополнение: {rub}₽"
-            cur.execute(
-                "UPDATE users SET credits = COALESCE(credits,0) + ? WHERE telegram_id = ?",
-                (rub, user_id),
-            )
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO payments
-                (user_id, ts, provider, payload, amount_rub, amount_stars, raw, telegram_charge_id, provider_charge_id,
-                 currency, project_key, product_kind, product_title, username, full_name,
-                 payment_created_at, payment_succeeded_at, receipt_email, receipt_email_status, receipt_email_source,
-                 receipt_email_collected_at, receipt_status, wants_receipt)
-                VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, 'RUB', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'webapp', ?, 'pending', ?)
-                """,
-                (
-                    user_id,
-                    now_ts,
-                    "yookassa_widget",
-                    json.dumps({"kind": kind, "rub": rub}, ensure_ascii=False),
-                    rub,
-                    raw,
-                    payment_id,
-                    PROJECT_KEY,
-                    kind,
-                    product_title,
-                    username or None,
-                    full_name or None,
-                    created_at,
-                    succeeded_at,
-                    receipt_email or None,
-                    receipt_email_status,
-                    receipt_collected_at,
-                    1 if wants_receipt else 0,
-                ),
-            )
-            if receipt_email:
-                cur.execute(
-                    """
-                    UPDATE users
-                    SET receipt_email = ?, receipt_email_status = 'provided',
-                        receipt_email_source = 'webapp', receipt_email_collected_at = ?
-                    WHERE telegram_id = ?
-                    """,
-                    (receipt_email, receipt_collected_at, user_id),
-                )
-            conn.commit()
-            return True, "payg_topup", f"Баланс пополнен на {rub}₽"
+def _apply_provider_status(user_id, payment):
+    meta = payment.get("metadata") or {}
+    if str(meta.get("user_id")) != str(user_id) or meta.get("project_key") != PROJECT_KEY:
+        raise HTTPException(403,"Чужой платёж")
+    status = payment.get("status")
+    if status == "succeeded":
+        applied,kind,message = _finalize_widget_payment(user_id,payment)
+        return {"ok":True,"status":status,"finalized":True,"already_finalized":not applied,"effect":kind,"message":message,"project_key":PROJECT_KEY}
+    if status == "canceled" and meta.get("order_id"):
+        with billing.connection(write=True) as conn:
+            conn.execute("UPDATE payment_orders SET status='canceled' WHERE id=? AND user_id=? AND status='pending'",(meta["order_id"],user_id))
+    return {"ok":True,"status":status,"finalized":False,"project_key":PROJECT_KEY}
 
-        raise HTTPException(status_code=400, detail="Unsupported payment kind in metadata")
-    finally:
-        conn.close()
+
 def _safe_json_loads(value: str) -> Dict[str, Any]:
     value = (value or "").strip()
     if not value:
@@ -579,13 +405,21 @@ def _safe_json_loads(value: str) -> Dict[str, Any]:
     return {}
 
 
+def _food_number(value):
+    try:
+        number = float(value or 0)
+        return number if math.isfinite(number) and 0 <= number <= 1000000 else 0.0
+    except (TypeError,ValueError,OverflowError):
+        return 0.0
+
+
 def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, created_at, kcal, protein, fat, carbs, raw_json
+            SELECT id, created_at, kcal, protein, fat, carbs, raw_json, version
             FROM meals
             WHERE user_id = ? AND date = ?
             ORDER BY datetime(created_at) ASC, id ASC
@@ -616,23 +450,24 @@ def get_meals_for_user_day(user_id: int, day: str) -> List[Dict[str, Any]]:
                 name = str(item.get("name") or "").strip()
                 if not name:
                     continue
-                grams = float(item.get("grams") or item.get("weight_g") or 0)
+                grams = _food_number(item.get("grams") or item.get("weight_g") or 0)
                 meal_items.append({
                     "name": name,
                     "grams": grams,
-                    "kcal": float(item.get("kcal_total") or item.get("kcal") or 0),
-                    "protein": float(item.get("protein_g") or item.get("protein") or 0),
-                    "fat": float(item.get("fat_g") or item.get("fat") or 0),
-                    "carbs": float(item.get("carbs_g") or item.get("carbs") or 0),
+                    "kcal": _food_number(item.get("kcal_total") or item.get("kcal") or 0),
+                    "protein": _food_number(item.get("protein_g") or item.get("protein") or 0),
+                    "fat": _food_number(item.get("fat_g") or item.get("fat") or 0),
+                    "carbs": _food_number(item.get("carbs_g") or item.get("carbs") or 0),
                 })
 
         meals.append({
             "id": int(row["id"]),
+            "version": int(row["version"] or 0),
             "time": meal_time,
-            "kcal": float(row["kcal"] or 0),
-            "protein": float(row["protein"] or 0),
-            "fat": float(row["fat"] or 0),
-            "carbs": float(row["carbs"] or 0),
+            "kcal": _food_number(row["kcal"] or 0),
+            "protein": _food_number(row["protein"] or 0),
+            "fat": _food_number(row["fat"] or 0),
+            "carbs": _food_number(row["carbs"] or 0),
             "items": meal_items,
         })
 
@@ -645,14 +480,14 @@ def _normalize_item(item: Dict[str, Any]) -> Optional[Dict[str, float | str]]:
     name = str(item.get("name") or "").strip()
     if not name:
         return None
-    grams = float(item.get("grams") or item.get("weight_g") or 0)
+    grams = _food_number(item.get("grams") or item.get("weight_g") or 0)
     return {
         "name": name,
         "grams": max(0.0, grams),
-        "kcal": float(item.get("kcal_total") or item.get("kcal") or 0),
-        "protein": float(item.get("protein_g") or item.get("protein") or 0),
-        "fat": float(item.get("fat_g") or item.get("fat") or 0),
-        "carbs": float(item.get("carbs_g") or item.get("carbs") or 0),
+        "kcal": _food_number(item.get("kcal_total") or item.get("kcal") or 0),
+        "protein": _food_number(item.get("protein_g") or item.get("protein") or 0),
+        "fat": _food_number(item.get("fat_g") or item.get("fat") or 0),
+        "carbs": _food_number(item.get("carbs_g") or item.get("carbs") or 0),
     }
 
 
@@ -694,9 +529,12 @@ def _rebuild_meal_payload(raw_payload: Dict[str, Any], items: List[Dict[str, Any
 
 
 def _load_meal_for_update(conn: sqlite3.Connection, meal_id: int, user_id: int) -> sqlite3.Row:
+    if not 0 < meal_id < 2**63:
+        raise HTTPException(404, "Приём пищи не найден")
+    conn.execute("BEGIN IMMEDIATE")
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, user_id, raw_json FROM meals WHERE id = ?",
+        "SELECT id, user_id, raw_json, version FROM meals WHERE id = ?",
         (meal_id,),
     )
     row = cur.fetchone()
@@ -708,7 +546,8 @@ def _load_meal_for_update(conn: sqlite3.Connection, meal_id: int, user_id: int) 
 
 
 class MealItemUpdateRequest(BaseModel):
-    grams: float = Field(..., ge=0, le=5000)
+    grams: float = Field(..., gt=0, le=5000, allow_inf_nan=False)
+    version: int = Field(..., ge=0, le=2**63-1)
 
 
 @app.patch("/api/meals/{meal_id}/items/{item_index}")
@@ -721,6 +560,8 @@ def update_meal_item(
     conn = get_conn()
     try:
         row = _load_meal_for_update(conn, meal_id, user_id)
+        if row["version"] != payload.version:
+            raise HTTPException(409, "Блюдо изменено. Обновите данные и повторите правку.")
         raw_payload = _safe_json_loads(row["raw_json"] or "")
         raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else []
         if not isinstance(raw_items, list) or not raw_items:
@@ -735,7 +576,9 @@ def update_meal_item(
         current = items[item_index]
         new_grams = float(payload.grams)
         old_grams = float(current.get("grams") or 0)
-        ratio = (new_grams / old_grams) if old_grams > 0 else 0
+        if old_grams <= 0:
+            raise HTTPException(400, "Исходный вес неизвестен. Добавьте блюдо заново с указанной порцией.")
+        ratio = new_grams / old_grams
         current["grams"] = new_grams
         current["kcal"] = float(current.get("kcal") or 0) * ratio
         current["protein"] = float(current.get("protein") or 0) * ratio
@@ -748,7 +591,7 @@ def update_meal_item(
         conn.execute(
             """
             UPDATE meals
-            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?
+            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?, version = version + 1
             WHERE id = ?
             """,
             (
@@ -761,7 +604,7 @@ def update_meal_item(
             ),
         )
         conn.commit()
-        return {"ok": True}
+        return {"ok": True, "version": row["version"]+1}
     finally:
         conn.close()
 
@@ -770,11 +613,14 @@ def update_meal_item(
 def delete_meal_item(
     meal_id: int,
     item_index: int,
+    version: int = Query(..., ge=0, le=2**63-1),
     user_id: int = Depends(get_verified_user_id),
 ) -> Dict[str, Any]:
     conn = get_conn()
     try:
         row = _load_meal_for_update(conn, meal_id, user_id)
+        if row["version"] != version:
+            raise HTTPException(409, "Блюдо изменено. Обновите данные и повторите удаление.")
         raw_payload = _safe_json_loads(row["raw_json"] or "")
         raw_items = raw_payload.get("items") if isinstance(raw_payload, dict) else []
         if not isinstance(raw_items, list) or not raw_items:
@@ -795,7 +641,7 @@ def delete_meal_item(
         conn.execute(
             """
             UPDATE meals
-            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?
+            SET kcal = ?, protein = ?, fat = ?, carbs = ?, raw_json = ?, version = version + 1
             WHERE id = ?
             """,
             (
@@ -808,7 +654,7 @@ def delete_meal_item(
             ),
         )
         conn.commit()
-        return {"ok": True, "meal_deleted": False}
+        return {"ok": True, "meal_deleted": False, "version": row["version"]+1}
     finally:
         conn.close()
 
@@ -1057,6 +903,8 @@ def get_history_for_user_between(user_id: int, start_date: dt.date, end_date: dt
                 "carbs": totals["carbs"],
             }
         )
+        if current == end_date:
+            break
         current += dt.timedelta(days=1)
 
     return result
@@ -1101,7 +949,10 @@ def stats_day(
     Если дата не передана — используется сегодня.
     """
 
-    day = date or _today_str()
+    try:
+        day = dt.date.fromisoformat(date or _today_str()).isoformat()
+    except ValueError:
+        raise HTTPException(400,"Invalid date")
     return _build_stats_for_day(user_id, day)
 
 
@@ -1170,6 +1021,8 @@ def stats_advanced(
     if start > end:
         raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
 
+    if (end-start).days > 3660:
+        raise HTTPException(400,"Выберите период не больше 10 лет")
     items = get_history_for_user_between(user_id, start, end)
     goal = get_goal_for_user(user_id)
 
@@ -1250,6 +1103,8 @@ def api_config() -> Dict[str, Any]:
         "bot_username": BOT_USERNAME,
         "project_key": PROJECT_KEY,
         "payments_external_only": PAYMENTS_EXTERNAL_ONLY,
+        "plans": billing.plans(),
+        "payg_cost": billing.settings()["payg_cost"],
     }
 
 
@@ -1345,7 +1200,9 @@ def create_redirect_payment(
     username = str(user.get("username") or "")
     full_name = " ".join([str(user.get("first_name") or "").strip(), str(user.get("last_name") or "").strip()]).strip()
     kind = str((body or {}).get("kind") or "").strip()
-    wants_receipt = bool((body or {}).get("wants_receipt"))
+    wants_receipt = (body or {}).get("wants_receipt",False)
+    if type(wants_receipt) is not bool:
+        raise HTTPException(400,"wants_receipt must be boolean")
     receipt_email = ""
     if wants_receipt:
         conn = get_conn()
@@ -1372,7 +1229,9 @@ def create_redirect_payment(
     if kind == "payg_topup":
         rub_raw = (body or {}).get("rub")
         try:
-            rub = int(rub_raw)
+            if type(rub_raw) is not int:
+                raise ValueError
+            rub = rub_raw
         except Exception:
             raise HTTPException(status_code=400, detail="rub must be integer")
         return _create_redirect_payment(
@@ -1394,36 +1253,9 @@ def yookassa_payment_status(
     payment_id: str = Query(..., min_length=3),
     user_id: int = Depends(get_verified_user_id),
 ) -> Dict[str, Any]:
-    payment = _fetch_yookassa_payment(payment_id)
-    status = str(payment.get("status") or "unknown")
+    return _apply_provider_status(user_id, _fetch_yookassa_payment(payment_id))
 
-    metadata = payment.get("metadata") or {}
-    if str(metadata.get("user_id") or "") != str(user_id):
-        raise HTTPException(status_code=403, detail="Payment does not belong to this user")
 
-    payment_project_key = str(metadata.get("project_key") or "")
-    if payment_project_key != PROJECT_KEY:
-        return {
-            "ok": True,
-            "status": status,
-            "finalized": False,
-            "project_key": PROJECT_KEY,
-            "message": "Платёж относится к другому проекту",
-        }
-
-    if status != "succeeded":
-        return {"ok": True, "status": status, "finalized": False, "project_key": PROJECT_KEY}
-
-    finalized, effect, message = _finalize_widget_payment(user_id=user_id, payment=payment)
-    return {
-        "ok": True,
-        "status": status,
-        "finalized": effect != "foreign_project",
-        "effect": effect,
-        "message": message,
-        "project_key": PROJECT_KEY,
-        "already_finalized": not finalized,
-    }
 @app.post("/api/payments/widget/create")
 def create_widget_payment(
     body: Dict[str, Any],
@@ -1444,7 +1276,9 @@ def create_widget_payment(
     if kind == "payg_topup":
         rub_raw = (body or {}).get("rub")
         try:
-            rub = int(rub_raw)
+            if type(rub_raw) is not int:
+                raise ValueError
+            rub = rub_raw
         except Exception:
             raise HTTPException(status_code=400, detail="rub must be integer")
         return _create_widget_payment(user_id=user_id, kind=kind, plan_id=None, rub=rub)
@@ -1457,25 +1291,9 @@ def widget_payment_status(
     payment_id: str = Query(..., min_length=3),
     user_id: int = Depends(get_verified_user_id),
 ) -> Dict[str, Any]:
-    payment = _fetch_yookassa_payment(payment_id)
-    status = str(payment.get("status") or "unknown")
+    return _apply_provider_status(user_id, _fetch_yookassa_payment(payment_id))
 
-    metadata = payment.get("metadata") or {}
-    if str(metadata.get("user_id") or "") != str(user_id):
-        raise HTTPException(status_code=403, detail="Payment does not belong to this user")
 
-    if status != "succeeded":
-        return {"ok": True, "status": status, "finalized": False}
-
-    finalized, effect, message = _finalize_widget_payment(user_id=user_id, payment=payment)
-    return {
-        "ok": True,
-        "status": status,
-        "finalized": True,
-        "effect": effect,
-        "message": message,
-        "already_finalized": not finalized,
-    }
 @app.get("/api/payments/invoice-link")
 def create_payment_invoice_link(
     mode: str = Query(..., description="sub|payg"),
@@ -1485,49 +1303,16 @@ def create_payment_invoice_link(
     if not YOOKASSA_PROVIDER_TOKEN:
         raise HTTPException(status_code=503, detail="Card payments are temporarily unavailable")
 
-    if mode == "sub":
-        plans = {
-            "w1": ("Одна неделя", 125),
-            "m1": ("1 месяц", 399),
-            "m3": ("3 месяца", 1000),
-            "m6": ("6 месяцев", 1800),
-            "y1": ("1 год", 3500),
-        }
-        plan = plans.get(value)
-        if not plan:
-            raise HTTPException(status_code=400, detail="Unknown subscription plan")
-
-        title, rub = plan
-        link = _create_invoice_link(
-            title=f"Подписка на {title}",
-            description="Подписка на умный дневник питания с фото, голосом и текстом.",
-            payload=f"sub:{value}:card",
-            currency="RUB",
-            provider_token=YOOKASSA_PROVIDER_TOKEN,
-            prices=[{"label": title, "amount": rub * 100}],
-        )
-        return {"ok": True, "invoice_link": link, "mode": mode, "value": value, "user_id": user_id}
-
-    if mode == "payg":
-        topups = {60, 100, 200, 400}
-        try:
-            rub = int(value)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid PAYG amount")
-        if rub not in topups:
-            raise HTTPException(status_code=400, detail="Unsupported PAYG amount")
-
-        link = _create_invoice_link(
-            title="Грамм — Pay-as-you-go",
-            description=f"Пополнение баланса на +{rub}₽. Списание: 2₽ за запрос.",
-            payload=json.dumps({"type": "payg_topup", "rub": rub, "method": "card", "source": "webapp"}),
-            currency="RUB",
-            provider_token=YOOKASSA_PROVIDER_TOKEN,
-            prices=[{"label": f"PAYG +{rub}₽", "amount": rub * 100}],
-        )
-        return {"ok": True, "invoice_link": link, "mode": mode, "value": rub, "user_id": user_id}
-
-    raise HTTPException(status_code=400, detail="Unsupported mode")
+    try:
+        rub = int(value) if mode == "payg" else 0
+        if mode not in {"sub","payg"}:
+            raise ValueError("Неизвестный режим")
+        order = billing.create_order(user_id,"subscription" if mode=="sub" else "payg_topup",plan_id=value if mode=="sub" else None,rub=rub)
+    except ValueError as exc:
+        raise HTTPException(400,str(exc))
+    link = _create_invoice_link(title=order["title"],description=order["title"],payload="food:"+order["id"],currency=order["currency"],
+                                provider_token=YOOKASSA_PROVIDER_TOKEN,prices=[{"label":order["title"],"amount":order["amount"]}])
+    return {"ok":True,"invoice_link":link,"mode":mode,"value":value,"user_id":user_id}
 
 
 @app.get("/api/whoami")
