@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 import aiosqlite
+import nutrients
 from dotenv import load_dotenv
 
 # Путь к базе: ./data/food_bot.sqlite3
@@ -240,6 +241,7 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     # Old Telegram subscription helper stored kopecks in amount_rub; PAYG stored rubles.
     await db.execute("UPDATE payments SET amount_rub=amount_rub/100,currency='RUB' WHERE currency IS NULL "
                      "AND raw LIKE 'currency=RUB; amount=%' AND payload LIKE 'sub:%' AND amount_rub % 100 = 0")
+    await db.executescript(nutrients.SCHEMA)
     await db.commit()
 
 
@@ -380,6 +382,8 @@ async def get_premium_until(
 
 
 async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
+    from progressor_client import bundle_until
+    if bundle_until(DB_PATH, user_id): return True
     async with db.execute(
         "SELECT is_premium, premium_until FROM users WHERE telegram_id = ?",
         (user_id,),
@@ -398,6 +402,14 @@ async def is_premium_user(db: aiosqlite.Connection, user_id: int) -> bool:
     except Exception:
         return False
     return dt >= datetime.utcnow()
+
+async def get_effective_premium_until(db: aiosqlite.Connection, user_id: int) -> Optional[datetime]:
+    """For display only; grants and gifts keep using the native subscription expiry."""
+    from progressor_client import bundle_until
+    native = await get_premium_until(db, user_id)
+    bundle = bundle_until(DB_PATH, user_id)
+    shared = bundle.replace(tzinfo=None) if bundle else None
+    return max(native, shared) if native and shared else native or shared
 
 
 
@@ -798,7 +810,8 @@ async def add_meal(
         """,
         (telegram_id, date_str, kcal, protein, fat, carbs, raw_json),
     )
-
+    for values in nutrients.saving_rows(cur.lastrowid, raw_json):
+        await db.execute(nutrients.SAVE_SQL, values)
     await db.commit()
     return int(cur.lastrowid)
 
