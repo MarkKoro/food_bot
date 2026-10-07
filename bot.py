@@ -63,7 +63,7 @@ from db import (
     get_last_menu_message_id,
     set_last_menu_message_id,
     set_premium_until,
-    get_premium_until,
+    get_effective_premium_until as get_premium_until,
     is_premium_user,
     get_trial_info,
     consume_trial_request,
@@ -306,12 +306,14 @@ async def db_get_user_row(db, user_id: int) -> dict:
     await cur.close()
     if not row:
         return {}
+    from progressor_client import bundle_until
+    bundle = bundle_until(DB_PATH, user_id)
     return {
         "telegram_id": row[0],
         "credits": row[1] or 0,
-        "payment_mode": (row[2] or "sub"),
-        "is_premium": int(row[3] or 0),
-        "premium_until": row[4],
+        "payment_mode": "sub" if bundle else (row[2] or "sub"),
+        "is_premium": 1 if bundle else int(row[3] or 0),
+        "premium_until": bundle.replace(tzinfo=None).isoformat() if bundle else row[4],
         "trial_until": row[5],
         "trial_used_count": int(row[6] or 0),
         "paid_trial_used": int(row[7] or 0),
@@ -413,6 +415,7 @@ if not JOIN_URL:
 
 def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
+        [InlineKeyboardButton("Progressor · 3 продукта", callback_data="pg:menu")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
     ]
@@ -767,6 +770,81 @@ TEXT_FOOD_USER_INSTRUCTIONS = (
     "Если указана граммовка, размер порции или способ приготовления — обязательно учитывай это.\n"
     "Название каждого блюда (поле name) пиши только на русском и понятно для человека."
 )
+
+# Progressor nutrient JSON v1: AI estimates composition; Python computes portion amounts.
+NUTRIENT_ANALYSIS_INSTRUCTIONS = """
+In the SAME meal analysis, preserve the existing items, portions, calories and macros and additionally estimate nutritional composition for each recognized food item.
+Return top-level nutrient_schema_version: 1. Each item must contain nutrients_per_100g, an object using ALL the registered codes below. Values are amounts per 100 grams in the fixed canonical units. Use null when a value cannot reasonably be estimated; unknown is never zero.
+Use typical composition estimates based on the identified food, ingredients, preparation and user description; use explicit food label values when supplied. These are approximate AI estimates, not verified lab measurements. Do not invent a reference URL or claim a food database was consulted.
+The backend multiplies each per-100g value by item grams / 100 and sums known components. Do not mix per-portion values into nutrients_per_100g. Preserve the recognized portion in grams (the existing grams or weight_g field).
+Do not add compounds with different forms together: folate DFE, folic acid, retinol and vitamin A RAE are distinct. Do not convert IU without the exact substance form. Do not add clinical deficiency diagnoses, dosing, or medical recommendations.
+Registered codes and units:
+fiber: g
+sugar: g
+saturated_fat: g
+monounsaturated_fat: g
+polyunsaturated_fat: g
+trans_fat: g
+omega_3: g
+omega_6: g
+epa: mg
+dha: mg
+ala: g
+cholesterol: mg
+water: g
+alcohol: g
+calcium: mg
+iron: mg
+magnesium: mg
+phosphorus: mg
+potassium: mg
+sodium: mg
+zinc: mg
+copper: mg
+manganese: mg
+selenium: ug
+iodine: ug
+chromium: ug
+molybdenum: ug
+chloride: mg
+vitamin_a_rae: ug
+retinol: ug
+beta_carotene: ug
+vitamin_b1: mg
+vitamin_b2: mg
+vitamin_b3: mg
+vitamin_b5: mg
+vitamin_b6: mg
+biotin: ug
+folate_dfe: ug
+folic_acid: ug
+vitamin_b12: ug
+vitamin_c: mg
+vitamin_d: ug
+vitamin_e: mg
+vitamin_k: ug
+choline: mg
+leucine: g
+isoleucine: g
+valine: g
+lysine: g
+methionine: g
+phenylalanine: g
+threonine: g
+tryptophan: g
+histidine: g
+Example for the structure only: {"nutrient_schema_version":1,"items":[{"name":"recognized food","grams":150,"kcal":100,"protein_g":5,"fat_g":3,"carbs_g":12,"nutrients_per_100g":{"iron":1.2,"vitamin_d":null}}],"totals":{"kcal":100,"protein_g":5,"fat_g":3,"carbs_g":12}}. Include the full registered code set in actual outputs, not just the example codes.
+Return compact JSON with no prose outside JSON.
+"""
+FOOD_SYSTEM_PROMPT += NUTRIENT_ANALYSIS_INSTRUCTIONS
+FOOD_SYSTEM_PROMPT_FALLBACK += NUTRIENT_ANALYSIS_INSTRUCTIONS
+FOOD_USER_INSTRUCTIONS += NUTRIENT_ANALYSIS_INSTRUCTIONS
+TEXT_FOOD_SYSTEM_PROMPT += NUTRIENT_ANALYSIS_INSTRUCTIONS
+TEXT_FOOD_USER_INSTRUCTIONS += NUTRIENT_ANALYSIS_INSTRUCTIONS
+try:
+    FOOD_ANALYSIS_MAX_TOKENS = max(3000, min(20000, int(os.getenv("FOOD_ANALYSIS_MAX_TOKENS", "9000"))))
+except ValueError:
+    FOOD_ANALYSIS_MAX_TOKENS = 9000
 
 SURVEYS = {
     "short": [
@@ -1470,7 +1548,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         payload = {
             "model": VISION_MODEL,
             "messages": messages,
-            "max_completion_tokens": 3000,
+            "max_completion_tokens": FOOD_ANALYSIS_MAX_TOKENS,
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
@@ -1494,7 +1572,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         except Exception:
             logging.exception("Failed to parse vision JSON")
             return {}
-        logging.debug("Food JSON raw: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+        logging.debug("Food analysis parsed; nutrient schema=%s", parsed.get("nutrient_schema_version") if isinstance(parsed, dict) else None)
         return parsed
 
     data = await _call(FOOD_SYSTEM_PROMPT)
@@ -1554,7 +1632,7 @@ async def analyze_food_text(description: str) -> dict:
     payload = {
         "model": TEXT_MODEL,
         "messages": messages,
-        "max_completion_tokens": 3000,
+        "max_completion_tokens": FOOD_ANALYSIS_MAX_TOKENS,
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
@@ -1574,7 +1652,7 @@ async def analyze_food_text(description: str) -> dict:
 
     content = data["choices"][0]["message"]["content"].strip()
     parsed = _safe_json_loads(content)
-    logging.debug("Food text JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+    logging.debug("Food text analysis parsed; nutrient schema=%s", parsed.get("nutrient_schema_version") if isinstance(parsed, dict) else None)
     return parsed
 
 
@@ -2355,7 +2433,7 @@ async def ask_current_survey_question(update: Update, ctx: ContextTypes.DEFAULT_
     await edit_menu_message(update, ctx, "\n\n".join(info_lines), kb)
 
 
-async def generate_goal_from_survey(answers: dict) -> dict:
+async def generate_goal_from_survey(answers: dict, user_id: int | None = None) -> dict:
     """
     На основе ответов опроса вызывает TEXT_MODEL и получает JSON с полями:
     kcal, protein_g, fat_g, carbs_g.
@@ -2389,6 +2467,10 @@ async def generate_goal_from_survey(answers: dict) -> dict:
         "на дистанции, без экстремальных голодовок или переедания."
     )
 
+    from progressor_client import ai_context
+    shared_context = await ai_context("food", user_id) if user_id else None
+    if shared_context:
+        user_prompt += "\nДополнительный контекст (ответы этого опроса приоритетнее старых самооценок):\n" + json.dumps(shared_context, ensure_ascii=False)
     payload = {
         "model": TEXT_MODEL,
         "messages": [
@@ -2412,6 +2494,7 @@ async def generate_goal_from_survey(answers: dict) -> dict:
     content = data["choices"][0]["message"]["content"].strip()
     parsed = _safe_json_loads(content)
     logging.debug("Survey goal JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
+    if isinstance(parsed, dict) and shared_context: parsed["context_sources"] = shared_context["sources"]
     return parsed
 
 
@@ -2424,7 +2507,7 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     answers = ctx.user_data.get("survey_answers") or {}
 
     try:
-        goal_data = await generate_goal_from_survey(answers)
+        goal_data = await generate_goal_from_survey(answers, uid)
     except Exception:
         logging.exception("generate_goal_from_survey failed for %s", uid)
         ctx.user_data["state"] = None
@@ -2470,6 +2553,8 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"{format_totals_short(goal_totals)}\n\n"
         "Это ориентировочная цель, её всегда можно скорректировать в «⚙️ Настройки»."
     )
+    used_sources = [x["source"] for x in goal_data.get("context_sources", [])]
+    if used_sources: notice += "\nПри запросе ИИ использованы ваши данные из: " + ", ".join(used_sources) + "."
     await show_main_menu(update, ctx, notice=notice)
 
 
@@ -5125,6 +5210,8 @@ def main() -> None:
     application.add_handler(CommandHandler("admin", persistent_handler(cmd_admin)))
 
     # Команды
+    from progressor_bot import install as install_progressor
+    install_progressor(application, "food", DB_PATH)
     application.add_handler(CommandHandler("start", persistent_handler(cmd_start)))
     application.add_handler(CommandHandler("help", persistent_handler(cmd_help)))
     application.add_handler(CommandHandler("pay", persistent_handler(cmd_pay)))

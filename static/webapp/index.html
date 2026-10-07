@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="ru">
   <head>
+  <script data-progressor-source="food" src="/progressor/assets/navigation.v1.js"></script>
     <meta charset="utf-8" />
     <title>FoodBot — статистика</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -827,7 +828,7 @@
     <script>
       const tg = window.Telegram?.WebApp;
       tg?.ready?.();
-      const tgInitData = tg?.initData || "";
+      const tgInitData = tg?.initData || window.Progressor?.launchData || "";
       const tgUserId = tg?.initDataUnsafe?.user?.id || null;
       const storagePrefix = `food:${location.pathname}:${tgUserId || "guest"}:`;
       const memoryStorage = new Map();
@@ -2245,5 +2246,6 @@ function setActiveAnalyticsPreset(range) {
         await checkPendingPaymentStatus({ silent: true });
       })();
     </script>
-  </body>
+    <script src="/webapp/nutrients.v1.js"></script>
+</body>
 </html>

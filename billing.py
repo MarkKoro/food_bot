@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import db as database
+import nutrients
 
 PLANS = {
     "w1": {"title": "Одна неделя", "days": 7, "months": 0, "price_rub": 125, "price_stars": 84},
@@ -328,6 +329,9 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
         if kind and not admin:
             values = settings(conn)
             user = conn.execute("SELECT * FROM users WHERE telegram_id=?",(user_id,)).fetchone()
+            from progressor_client import bundle_until
+            bundle = bundle_until(database.DB_PATH, user_id)
+            if bundle: mode = "sub"
             if mode == "payg":
                 charge = cost if cost is not None else values["payg_cost"]
                 if type(charge) is not int or charge < 1:
@@ -340,7 +344,7 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
                 if used >= values["daily_limit"]:
                     raise PaymentError("Дневной лимит исчерпан. Баланс не списан.")
                 premium = user["is_premium"] and user["premium_until"] and utc_datetime(user["premium_until"]) > utc_datetime()
-                if not premium:
+                if not premium and not bundle:
                     trial = user["trial_until"] and utc_datetime(user["trial_until"]) > utc_datetime() and user["trial_used_count"] < values["trial_limit"]
                     if not trial:
                         raise PaymentError("Пробный период закончился. Выберите режим оплаты.")
@@ -349,4 +353,5 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
             conn.execute("INSERT INTO requests(user_id,kind,pay_mode,cost_rub) VALUES (?,?,?,?)",(user_id,kind,"admin" if admin else mode,charge))
         cur = conn.execute("INSERT INTO meals(user_id,date,kcal,protein,fat,carbs,raw_json,source_key) VALUES (?,?,?,?,?,?,?,?)",
                            (user_id,day or datetime.now().date().isoformat(),totals["kcal"],totals["protein_g"],totals["fat_g"],totals["carbs_g"],raw_json,source_key))
+        nutrients.save_automatic(conn, cur.lastrowid, raw_json)
         return cur.lastrowid

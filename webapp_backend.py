@@ -1,3 +1,4 @@
+from progressor_bridge import current_claims, install_auth_bridge
 import os
 import asyncio
 from contextlib import asynccontextmanager
@@ -5,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 import math
 from pathlib import Path
 import aiosqlite
+import nutrients
 import billing
 from db import DB_PATH, BASE_DIR, create_tables
 import hmac
@@ -68,6 +70,9 @@ async def lifespan(app):
 
 
 app = FastAPI(title="FoodBot WebApp API", lifespan=lifespan)
+install_auth_bridge(app, "food")
+from progressor_client import install_cache_worker
+install_cache_worker(app, "food", DB_PATH)
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,6 +128,9 @@ def verify_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -
 
 
 def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> int:
+    shared = current_claims()
+    if shared:
+        return int(shared["sub"])
     if not init_data:
         raise HTTPException(status_code=401, detail="Missing Telegram init data")
 
@@ -135,6 +143,9 @@ def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) 
 
 
 def get_verified_user(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> Dict[str, Any]:
+    shared = current_claims()
+    if shared:
+        return shared["user"]
     if not init_data:
         raise HTTPException(status_code=401, detail="Missing Telegram init data")
     params = verify_init_data(init_data, BOT_TOKEN)
@@ -488,6 +499,7 @@ def _normalize_item(item: Dict[str, Any]) -> Optional[Dict[str, float | str]]:
         "protein": _food_number(item.get("protein_g") or item.get("protein") or 0),
         "fat": _food_number(item.get("fat_g") or item.get("fat") or 0),
         "carbs": _food_number(item.get("carbs_g") or item.get("carbs") or 0),
+        "nutrients_per_100g": nutrients.clean_composition(item.get("nutrients_per_100g")),
     }
 
 
@@ -510,6 +522,7 @@ def _serialize_items_for_raw(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "protein_g": float(item.get("protein") or 0),
             "fat_g": float(item.get("fat") or 0),
             "carbs_g": float(item.get("carbs") or 0),
+            "nutrients_per_100g": item.get("nutrients_per_100g") or {},
         }
         for item in items
     ]
@@ -603,6 +616,7 @@ def update_meal_item(
                 meal_id,
             ),
         )
+        nutrients.save_automatic(conn, meal_id, json.dumps(rebuilt_payload, ensure_ascii=False), row['version'] + 1)
         conn.commit()
         return {"ok": True, "version": row["version"]+1}
     finally:
@@ -653,6 +667,7 @@ def delete_meal_item(
                 meal_id,
             ),
         )
+        nutrients.save_automatic(conn, meal_id, json.dumps(rebuilt_payload, ensure_ascii=False), row['version'] + 1)
         conn.commit()
         return {"ok": True, "meal_deleted": False, "version": row["version"]+1}
     finally:
@@ -1318,3 +1333,6 @@ def create_payment_invoice_link(
 @app.get("/api/whoami")
 def whoami(user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
     return {"user_id": user_id, "ok": True}
+
+from nutrient_api import install_nutrient_api
+install_nutrient_api(app, get_verified_user_id, get_conn)
