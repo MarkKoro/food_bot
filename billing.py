@@ -295,7 +295,10 @@ def settle(*, user_id, amount, currency, provider, payload, telegram_id=None, pr
                       "webapp" if metadata.get("receipt_email") else None,utc_datetime().isoformat() if metadata.get("receipt_email") else None,
                       "pending",int(str(metadata.get("wants_receipt","0"))=="1")))
         if order["kind"] == "subscription":
-            extend_subscription(conn,user_id,order["days"])
+            until=extend_subscription(conn,user_id,order["days"])
+            from progressor_native_subscription import record_paid
+            payment_id=conn.execute('SELECT id FROM payments WHERE telegram_charge_id=? OR provider_charge_id=?',(telegram_id,provider_id)).fetchone()[0]
+            record_paid(conn,'food:'+str(payment_id),user_id,utc_datetime(until)-timedelta(days=order['days']),until,currency,amount)
             if order["plan_id"] == "w1":
                 conn.execute("UPDATE users SET paid_trial_used=1 WHERE telegram_id=?", (user_id,))
         else:

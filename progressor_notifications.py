@@ -8,11 +8,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.error import Forbidden, RetryAfter
 from progressor_client import call, configured
 from progressor_preferences import opted_in, get_settings, reserve, delivery_status
+from progressor_bot import NotificationDeferred
 
 log=logging.getLogger(__name__)
 
 
-async def deliver(path,bot,item,pref,webapp_url):
+async def deliver(path,bot,item,pref,webapp_url,sender=None):
     uid=int(item['user_id'])
     current=await asyncio.to_thread(get_settings,path,uid)
     field='workout_enabled' if item['kind']=='post_workout' else 'nutrient_enabled'
@@ -22,7 +23,11 @@ async def deliver(path,bot,item,pref,webapp_url):
     if not await asyncio.to_thread(reserve,path,uid,item['day'],item['kind'],item['delivery_key']): return False
     markup=InlineKeyboardMarkup([[InlineKeyboardButton('Проверить питание',web_app=WebAppInfo(url=webapp_url))]])
     try:
-        await bot.send_message(chat_id=uid,text=item['text'],reply_markup=markup)
+        if sender:await sender(uid,item['text'],markup)
+        else:await bot.send_message(chat_id=uid,text=item['text'],reply_markup=markup)
+    except NotificationDeferred:
+        await asyncio.to_thread(delivery_status,path,uid,item['day'],'retry',time.time()+60)
+        return False
     except RetryAfter as error:
         delay=error.retry_after.total_seconds() if hasattr(error.retry_after,'total_seconds') else float(error.retry_after)
         await asyncio.to_thread(delivery_status,path,uid,item['day'],'retry',time.time()+delay+1)
@@ -40,7 +45,7 @@ async def deliver(path,bot,item,pref,webapp_url):
     return True
 
 
-async def cycle(path,bot,webapp_url,control=call,after=0):
+async def cycle(path,bot,webapp_url,control=call,after=0,sender=None):
     cursor=after;sent=0
     # At most four private requests per pass, with fair continuation next minute.
     for _ in range(4):
@@ -56,13 +61,13 @@ async def cycle(path,bot,webapp_url,control=call,after=0):
             if not isinstance(item.get('text'),str) or not 1<=len(item['text'])<=3500 or not isinstance(item.get('delivery_key'),str) or len(item['delivery_key'])>160: continue
             try: date.fromisoformat(item['day'])
             except (ValueError,TypeError,KeyError): continue
-            sent+=await deliver(path,bot,item,by_id[uid],webapp_url)
+            sent+=await deliver(path,bot,item,by_id[uid],webapp_url,sender)
         cursor=rows[-1]['user_id']
         await asyncio.sleep(.05)
     return sent,cursor
 
 
-def install(application,path,webapp_url):
+def install(application,path,webapp_url,*,sender=None):
     if not configured(): return
     original_init=application.post_init;original_stop=application.post_stop
     task=None
@@ -72,7 +77,7 @@ def install(application,path,webapp_url):
         async def worker():
             cursor=0
             while True:
-                try: _,cursor=await cycle(path,app.bot,webapp_url,after=cursor)
+                try: _,cursor=await cycle(path,app.bot,webapp_url,after=cursor,sender=sender)
                 except Exception: log.warning('food_reminder_cycle_unavailable')
                 await asyncio.sleep(60)
         task=asyncio.create_task(worker())

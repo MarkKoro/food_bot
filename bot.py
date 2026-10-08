@@ -473,6 +473,7 @@ def kb_settings() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("💳 Режим оплаты", callback_data="pay_mode")],
+            [InlineKeyboardButton("Общая подписка · 3 продукта",callback_data="pg:menu")],
             [InlineKeyboardButton("🎁 Подарочный код", callback_data="gift_code")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="main")],
         ]
@@ -603,6 +604,7 @@ def kb_premium_plans_rub(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
         )
 
     buttons.append([InlineKeyboardButton("⭐ Купить за звезды", callback_data="premium_menu_stars")])
+    buttons.append([InlineKeyboardButton("Общая подписка · доплатить",callback_data="pg:menu")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(buttons)
 
@@ -620,6 +622,7 @@ def kb_premium_plans_stars(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
         )
 
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="premium_menu")])
+    buttons.insert(0,[InlineKeyboardButton("Общая подписка · доплатить",callback_data="pg:menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1046,7 +1049,28 @@ async def build_main_keyboard(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> I
 
 # ── Сервисные хелперы сообщений ───────────────────────
 
-async def edit_menu_message(
+_menu_locks: dict[int, asyncio.Lock] = {}
+
+async def edit_menu_message(update,ctx,text,reply_markup=None):
+    if not update.effective_chat:return
+    async with _menu_locks.setdefault(update.effective_chat.id,asyncio.Lock()):
+        return await _edit_menu_unlocked(update,ctx,text,reply_markup)
+
+async def send_new_menu_message(ctx,chat_id,text,reply_markup=None,user_id=None):
+    async with _menu_locks.setdefault(chat_id,asyncio.Lock()):
+        return await _send_menu_unlocked(ctx,chat_id,text,reply_markup,user_id)
+
+async def _progressor_render(update,ctx,text,markup):
+    await edit_menu_message(update,ctx,text,markup)
+
+async def _progressor_scheduled_send(application,user_id,text,markup):
+    from telegram.ext import CallbackContext
+    from progressor_bot import notification_preflight
+    notification_preflight(application,user_id,'food')
+    ctx=CallbackContext(application,chat_id=user_id,user_id=user_id)
+    await send_new_menu_message(ctx,user_id,text,markup,user_id=user_id)
+
+async def _edit_menu_unlocked(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     text: str,
@@ -1096,16 +1120,14 @@ async def edit_menu_message(
             reply_markup=reply_markup,
         )
     if msg_id:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except BadRequest:
-            pass
+        from progressor_bot import retire_owned_menu
+        await retire_owned_menu(ctx.bot,chat_id,msg_id)
     chat_data["menu_message_id"] = msg.message_id
     if uid:
         await set_last_menu_message_id(db, uid, msg.message_id)
 
 
-async def send_new_menu_message(
+async def _send_menu_unlocked(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     text: str,
@@ -1135,10 +1157,8 @@ async def send_new_menu_message(
         )
 
     if old_id:
-        try:
-            await ctx.bot.delete_message(chat_id=chat_id, message_id=old_id)
-        except BadRequest:
-            pass
+        from progressor_bot import retire_owned_menu
+        await retire_owned_menu(ctx.bot,chat_id,old_id)
 
     chat_data["menu_message_id"] = msg.message_id
     if uid:
@@ -1262,6 +1282,7 @@ def kb_payment_offer(
         )
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
+    rows.insert(0,[InlineKeyboardButton("Общая подписка · 3 продукта",callback_data="pg:menu")])
 
     return InlineKeyboardMarkup(rows)
 
@@ -2023,6 +2044,7 @@ def kb_save_template_after_meal(*, meal_date: str | None = None, meal_id: int | 
         [InlineKeyboardButton("💾 Сохранить как шаблон", callback_data="save_result_template")],
     ]
     if meal_date and meal_id:
+        rows.append([InlineKeyboardButton('Все нутриенты',callback_data=f'mealnut:{meal_id}:0')])
         rows.append(
             [
                 InlineKeyboardButton(
@@ -3281,7 +3303,10 @@ async def _process_meal_calculation(
         "\n_Это приблизительная оценка по фото и данным, которые ты указал._"
     )
 
-    msg = "\n".join(lines)
+    from progressor_meal_reply import extension
+    addition=await extension(DB_PATH,uid,meal_id,today_totals,dict(goal) if goal else None,date.today().isoformat())
+    msg = _bounded_meal_reply('\n'.join(lines),addition)
+    ctx.user_data['progressor_last_meal']={'meal_id':meal_id,'date':date.today().isoformat(),'text':msg}
     ctx.user_data["last_meal_for_template"] = {
         "data": data,
         "totals": totals,
@@ -3501,6 +3526,10 @@ async def process_meal_description(
         payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
 
     msg = "\n".join(lines) + payg_footer
+    from progressor_meal_reply import extension
+    addition=await extension(DB_PATH,uid,meal_id,today_totals,dict(goal) if goal else None,date.today().isoformat())
+    msg=_bounded_meal_reply(msg,addition)
+    ctx.user_data['progressor_last_meal']={'meal_id':meal_id,'date':date.today().isoformat(),'text':msg}
     ctx.user_data["last_meal_for_template"] = {
         "data": data,
         "totals": totals,
@@ -3515,6 +3544,44 @@ async def process_meal_description(
 
 
 # ── Текст: цель / уточнения / остальное ──────────────
+
+def _bounded_meal_reply(original,addition):
+    tail='\n'+escape_md(addition) if addition else ''
+    if len(original)+len(tail)<=3900:return original+tail
+    lines=[];budget=max(500,3800-len(tail))
+    for row in original.splitlines():
+        if len('\n'.join([*lines,row]))>budget:break
+        lines.append(row)
+    return '\n'.join(lines)+'\n… Полная запись доступна в мини-приложении.\n'+tail
+
+async def progressor_nutrient_page(update,ctx):
+    from telegram.ext import ApplicationHandlerStop
+    try:await _progressor_nutrient_page(update,ctx)
+    finally:raise ApplicationHandlerStop
+
+async def _progressor_nutrient_page(update,ctx):
+    query=update.callback_query;await query.answer()
+    if not update.effective_chat or update.effective_chat.type!='private':return
+    try:
+        _,meal,page=query.data.split(':');meal_id=int(meal)
+        from progressor_meal_reply import saved,line
+        value=await asyncio.to_thread(saved,DB_PATH,update.effective_user.id,meal_id)
+        if not value:
+            await edit_menu_message(update,ctx,'Запись не найдена.',kb_back_to_main());return
+        previous=ctx.user_data.get('progressor_last_meal') or {}
+        if page=='r':
+            text=previous['text'] if previous.get('meal_id')==meal_id else f"Записанный приём: {value['meal']['kcal']:g} ккал, Б {value['meal']['protein']:g} г, Ж {value['meal']['fat']:g} г, У {value['meal']['carbs']:g} г."
+            await edit_menu_message(update,ctx,text,kb_save_template_after_meal(meal_date=value['meal']['date'],meal_id=meal_id));return
+        page=int(page);rows=value['rows'];pages=max(1,(len(rows)+7)//8)
+        if not 0<=page<pages:return
+        text=f"Нутриенты записанной порции · {page+1}/{pages}\n\n"+'\n'.join(line(r) for r in rows[page*8:(page+1)*8])+"\n\nОценка состава приблизительная. Неизвестные и частичные показатели не считаются нулём."
+        buttons=[];nav=[]
+        if page:nav.append(InlineKeyboardButton('◀️',callback_data=f'mealnut:{meal_id}:{page-1}'))
+        if page+1<pages:nav.append(InlineKeyboardButton('▶️',callback_data=f'mealnut:{meal_id}:{page+1}'))
+        if nav:buttons.append(nav)
+        buttons.extend([[InlineKeyboardButton('К результату',callback_data=f'mealnut:{meal_id}:r')],[InlineKeyboardButton('В меню',callback_data='main')]])
+        await edit_menu_message(update,ctx,escape_md(text),InlineKeyboardMarkup(buttons))
+    except (ValueError,KeyError,TypeError):return
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if ctx.user_data.get("state") == "admin_setting":
@@ -5213,9 +5280,10 @@ def main() -> None:
 
     # Команды
     from progressor_bot import install as install_progressor
-    install_progressor(application, "food", DB_PATH)
+    install_progressor(application, "food", DB_PATH,render=_progressor_render,back_callback='main',notify=lambda uid,text,kb:_progressor_scheduled_send(application,uid,text,kb))
+    application.add_handler(CallbackQueryHandler(progressor_nutrient_page,pattern=r'^mealnut:'),group=-10)
     from progressor_notifications import install as install_reminders
-    install_reminders(application,DB_PATH,FOOD_WEBAPP_URL)
+    install_reminders(application,DB_PATH,FOOD_WEBAPP_URL,sender=lambda uid,text,kb:_progressor_scheduled_send(application,uid,text,kb))
     application.add_handler(CommandHandler("start", persistent_handler(cmd_start)))
     application.add_handler(CommandHandler("help", persistent_handler(cmd_help)))
     application.add_handler(CommandHandler("pay", persistent_handler(cmd_pay)))

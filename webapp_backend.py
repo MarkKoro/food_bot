@@ -72,7 +72,7 @@ async def lifespan(app):
 app = FastAPI(title="FoodBot WebApp API", lifespan=lifespan)
 install_auth_bridge(app, "food")
 from progressor_client import install_cache_worker
-install_cache_worker(app, "food", DB_PATH)
+install_cache_worker(app, "food", DB_PATH,lambda:{'RUB':billing.plans()['m1']['price_rub']*100,'XTR':billing.plans()['m1']['price_stars']})
 
 app.add_middleware(
     CORSMiddleware,
