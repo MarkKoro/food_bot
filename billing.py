@@ -318,6 +318,46 @@ def validate_totals(totals):
     return result
 
 
+def check_meal_budget(conn, user_id, *, mode='sub', admin=False, cost=None, consume=False):
+    if admin: return mode,0
+    values=settings(conn)
+    user=conn.execute('SELECT * FROM users WHERE telegram_id=?',(user_id,)).fetchone()
+    if not user: raise PaymentError('Профиль не найден. Откройте /start.')
+    from progressor_client import bundle_until
+    bundle=bundle_until(database.DB_PATH,user_id)
+    if bundle: mode='sub'
+    charge=0
+    if mode=='payg':
+        charge=cost if cost is not None else values['payg_cost']
+        if type(charge) is not int or charge<1: raise ValueError('Invalid charge')
+        if (user['credits'] or 0)<charge: raise PaymentError('Недостаточно средств. Пополните PAYG и повторите запрос.')
+        if consume:
+            changed=conn.execute('UPDATE users SET credits=credits-? WHERE telegram_id=? AND credits>=?',(charge,user_id,charge))
+            if changed.rowcount!=1: raise PaymentError('Недостаточно средств. Пополните PAYG и повторите запрос.')
+    else:
+        used=conn.execute("SELECT COUNT(*) FROM requests WHERE user_id=? AND date(created_at)=date('now','localtime')",(user_id,)).fetchone()[0]
+        if used>=values['daily_limit']: raise PaymentError('Дневной лимит исчерпан. Баланс не списан.')
+        premium=user['is_premium'] and user['premium_until'] and utc_datetime(user['premium_until'])>utc_datetime()
+        if not premium and not bundle:
+            trial=user['trial_until'] and utc_datetime(user['trial_until'])>utc_datetime() and (user['trial_used_count'] or 0)<values['trial_limit']
+            if not trial: raise PaymentError('Пробный период закончился. Выберите режим оплаты.')
+            if consume: conn.execute('UPDATE users SET trial_used_count=COALESCE(trial_used_count,0)+1 WHERE telegram_id=?',(user_id,))
+    return mode,charge
+
+
+def preflight_meal(user_id, source_key, *, mode='sub', admin=False, cost=None):
+    with connection() as conn:
+        existing=conn.execute('SELECT id FROM meals WHERE user_id=? AND source_key=?',(user_id,source_key)).fetchone()
+        if existing: return {'existing_meal_id':existing[0]}
+        check_meal_budget(conn,user_id,mode=mode,admin=admin,cost=cost)
+    return {'existing_meal_id':None}
+
+
+def meal_is_saved(user_id, source_key):
+    with connection() as conn:
+        return bool(conn.execute('SELECT 1 FROM meals WHERE user_id=? AND source_key=?',(user_id,source_key)).fetchone())
+
+
 def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", admin=False, cost=None, day=None):
     totals = validate_totals(totals)
     charge = 0
@@ -326,29 +366,8 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
         if row:
             return row[0]
         conn.execute("INSERT OR IGNORE INTO users(telegram_id) VALUES (?)",(user_id,))
-        if kind and not admin:
-            values = settings(conn)
-            user = conn.execute("SELECT * FROM users WHERE telegram_id=?",(user_id,)).fetchone()
-            from progressor_client import bundle_until
-            bundle = bundle_until(database.DB_PATH, user_id)
-            if bundle: mode = "sub"
-            if mode == "payg":
-                charge = cost if cost is not None else values["payg_cost"]
-                if type(charge) is not int or charge < 1:
-                    raise ValueError("Invalid charge")
-                changed = conn.execute("UPDATE users SET credits=credits-? WHERE telegram_id=? AND credits>=?",(charge,user_id,charge))
-                if changed.rowcount != 1:
-                    raise PaymentError("Недостаточно средств. Пополните PAYG и повторите запрос.")
-            else:
-                used = conn.execute("SELECT COUNT(*) FROM requests WHERE user_id=? AND date(created_at)=date('now','localtime')",(user_id,)).fetchone()[0]
-                if used >= values["daily_limit"]:
-                    raise PaymentError("Дневной лимит исчерпан. Баланс не списан.")
-                premium = user["is_premium"] and user["premium_until"] and utc_datetime(user["premium_until"]) > utc_datetime()
-                if not premium and not bundle:
-                    trial = user["trial_until"] and utc_datetime(user["trial_until"]) > utc_datetime() and user["trial_used_count"] < values["trial_limit"]
-                    if not trial:
-                        raise PaymentError("Пробный период закончился. Выберите режим оплаты.")
-                    conn.execute("UPDATE users SET trial_used_count=COALESCE(trial_used_count,0)+1 WHERE telegram_id=?",(user_id,))
+        if kind:
+            mode,charge=check_meal_budget(conn,user_id,mode=mode,admin=admin,cost=cost,consume=True)
         if kind:
             conn.execute("INSERT INTO requests(user_id,kind,pay_mode,cost_rub) VALUES (?,?,?,?)",(user_id,kind,"admin" if admin else mode,charge))
         cur = conn.execute("INSERT INTO meals(user_id,date,kcal,protein,fat,carbs,raw_json,source_key) VALUES (?,?,?,?,?,?,?,?)",

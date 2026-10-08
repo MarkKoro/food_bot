@@ -1610,7 +1610,7 @@ async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg"
         _OPENAI_SEM.release()
 
     text = payload.get("text", "").strip()
-    logging.debug("Voice transcript: %s", text[:500])
+    logging.debug("Voice transcription completed")
     return text
 
 
@@ -2433,6 +2433,45 @@ async def ask_current_survey_question(update: Update, ctx: ContextTypes.DEFAULT_
     await edit_menu_message(update, ctx, "\n\n".join(info_lines), kb)
 
 
+# A single user action is guarded through transcription, analysis and atomic save.
+# Nested helpers in the same task reuse the lease; another task cannot inherit it.
+from contextvars import ContextVar
+from functools import wraps
+from progressor_ai_guard import acquire as _ai_acquire, finish as _ai_finish, AttemptLimited
+_food_ai_action=ContextVar('food_ai_action',default=None)
+
+def _guard_food_ai(kind):
+    def decorate(function):
+        @wraps(function)
+        async def guarded(update,ctx,*args,**kwargs):
+            uid=update.effective_user.id
+            if _food_ai_action.get()==(uid,asyncio.current_task()):
+                return await function(update,ctx,*args,**kwargs)
+            try:
+                if kind!='goal':
+                    pending=ctx.user_data.get('pending_meal') or {}
+                    source_key=(f"photo:{pending.get('chat_id')}:{pending.get('photo_msg_id')}" if kind=='photo'
+                                else f"message:{update.effective_chat.id}:{update.message.message_id}")
+                    user=await db_get_user_row(get_db(ctx),uid)
+                    checked=await asyncio.to_thread(billing.preflight_meal,uid,source_key,mode=user.get('payment_mode','sub'),admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    if checked['existing_meal_id']:
+                        await edit_menu_message(update,ctx,'Этот приём уже записан. Повторный расчёт не нужен.',await build_main_keyboard(ctx,uid))
+                        return
+                token=await asyncio.to_thread(_ai_acquire,DB_PATH,uid,'food_goal' if kind=='goal' else 'food_analysis',
+                                             hourly=6 if kind=='goal' else 18,daily=6 if kind=='goal' else 100,cooldown=15,success_cooldown=None if kind=='goal' else 0)
+            except (AttemptLimited,billing.PaymentError) as exc:
+                await edit_menu_message(update,ctx,str(exc),await build_main_keyboard(ctx,uid))
+                return
+            marker=_food_ai_action.set((uid,asyncio.current_task()))
+            try: return await function(update,ctx,*args,**kwargs)
+            finally:
+                _food_ai_action.reset(marker)
+                saved=await asyncio.to_thread(billing.meal_is_saved,uid,source_key) if kind!='goal' else False
+                await asyncio.to_thread(_ai_finish,DB_PATH,token,successful=saved)
+        return guarded
+    return decorate
+
+
 async def generate_goal_from_survey(answers: dict, user_id: int | None = None) -> dict:
     """
     На основе ответов опроса вызывает TEXT_MODEL и получает JSON с полями:
@@ -2498,6 +2537,7 @@ async def generate_goal_from_survey(answers: dict, user_id: int | None = None) -
     return parsed
 
 
+@_guard_food_ai("goal")
 async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Завершает опрос: вызывает generate_goal_from_survey, записывает цель и показывает её пользователю.
@@ -3089,6 +3129,7 @@ async def export_stats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pe
 
 # ── Обработка приёма пищи (общий helper) ─────────────-
 
+@_guard_food_ai("photo")
 async def _process_meal_calculation(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -3399,6 +3440,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_image_message(update, ctx, photo_file_id=photo.file_id)
 
 
+@_guard_food_ai("text")
 async def process_meal_description(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -3746,6 +3788,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Голосовые ─────────────────────────────────────────
 
+@_guard_food_ai("voice")
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Принимает голосовое с описанием приёма пищи, расшифровывает его и

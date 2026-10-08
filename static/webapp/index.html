@@ -602,6 +602,7 @@
         <canvas id="today-ring"></canvas>
       </div>
 
+      <div id="progressor-inline-host" hidden></div>
       <div class="card" id="card-today-meals">
         <div class="today-meals-header">
           <h2>Что съедено за день</h2>
@@ -988,11 +989,17 @@
       let mealEditorTargetMealId = null;
       let saveStatusTimer = null;
 
+      window.ProgressorDomain={version:1,
+        hintHost:()=>document.getElementById('progressor-inline-host'),
+        eligible:context=>document.getElementById('screen-today')?.classList.contains('active') && activeMode==='today' && (!lastLoadedDateIso || lastLoadedDateIso===(context?.activity?.date||new Date().toLocaleDateString('sv-SE',{timeZone:'Europe/Moscow'}))),
+        perform:action=>{ if(!['food_log','open_food'].includes(action.kind)) return false; const target=document.getElementById(action.kind==='open_food'?'card-week':'card-today-meals'); if(target){target.style.scrollMarginTop='calc(var(--progressor-bar-height) + 16px)';target.setAttribute('tabindex','-1');target.focus({preventScroll:true});target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});} return true; }
+      };
       function showScreen(name) {
         screenToday?.classList.toggle("active", name === "today");
         screenSubscription?.classList.toggle("active", name === "subscription");
         screenAnalytics?.classList.toggle("active", name === "analytics");
         screenPayment?.classList.toggle("active", name === "payment");
+        window.Progressor?.refreshSurface?.();
       }
 
       function openDrawer() {
@@ -1520,6 +1527,7 @@
         const f = totals.fat || 0;
         const c = totals.carbs || 0;
         const sumMacros = p + f + c;
+        if (todayRingEl) todayRingEl.style.display = sumMacros > 0 && typeof Chart !== "undefined" ? "block" : "none";
 
         if (sumMacros > 0 && todayRingEl && typeof Chart !== "undefined") {
           todayRing = new Chart(todayRingEl.getContext("2d"), {
@@ -1659,6 +1667,7 @@
           selectedISO = effectiveDate;
         }
         lastLoadedDateIso = effectiveDate;
+        window.Progressor?.refreshSurface?.();
         if (selectedDateLabel) {
           selectedDateLabel.textContent = formatHuman(effectiveDate);
         }

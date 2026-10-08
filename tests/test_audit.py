@@ -484,6 +484,8 @@ class AuditTest(unittest.TestCase):
                     await bot.process_meal_description(update,ctx,'Рис',**kwargs)
                     self.assertEqual(self.query('SELECT credits FROM users'),[(10,)])
                     self.assertEqual(self.query('SELECT COUNT(*) FROM meals'),[(0,)])
+                    # Simulate waiting after the failed request, without a real sleep.
+                    self.query('UPDATE progressor_ai_attempts SET started=started-20')
                     await bot.process_meal_description(update,ctx,'Рис',**kwargs)
                     await bot.process_meal_description(update,ctx,'Рис',**kwargs)
                 self.assertEqual(self.query('SELECT credits FROM users'),[(8,)])
