@@ -2473,78 +2473,37 @@ def _guard_food_ai(kind):
 
 
 async def generate_goal_from_survey(answers: dict, user_id: int | None = None) -> dict:
-    """
-    На основе ответов опроса вызывает TEXT_MODEL и получает JSON с полями:
-    kcal, protein_g, fat_g, carbs_g.
-    """
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    system_prompt = (
-        "Ты — нутрициолог и тренер по образу жизни. "
-        "На основе описания человека тебе нужно прикинуть комфортную дневную норму "
-        "калорий и БЖУ для здорового темпа прогресса.\n\n"
-        "Опираться можно на усреднённые формулы (Mifflin-St Jeor и т.п.), "
-        "но главное — дать реалистичные цифры, подходящие под образ жизни и цель.\n\n"
-        "Выводи ТОЛЬКО JSON без пояснений, строго в формате:\n"
-        "{\n"
-        "  \"kcal\": 2300,\n"
-        "  \"protein_g\": 150,\n"
-        "  \"fat_g\": 70,\n"
-        "  \"carbs_g\": 250\n"
-        "}\n\n"
-        "Белки обычно 1.6–2.2 г на кг массы тела, жиры не опускай слишком низко, "
-        "углеводы подстраивай под оставшиеся калории."
-    )
-
-    user_prompt = (
-        "Данные пользователя:\n"
-        f"{build_survey_block(answers)}\n\n"
-        "Подбери дневную норму так, чтобы она была комфортной и устойчивой "
-        "на дистанции, без экстремальных голодовок или переедания."
-    )
-
-    from progressor_client import ai_context
-    shared_context = await ai_context("food", user_id) if user_id else None
-    if shared_context:
-        user_prompt += "\nДополнительный контекст (ответы этого опроса приоритетнее старых самооценок):\n" + json.dumps(shared_context, ensure_ascii=False)
-    payload = {
-        "model": TEXT_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_completion_tokens": 3000,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    content = data["choices"][0]["message"]["content"].strip()
-    parsed = _safe_json_loads(content)
-    logging.debug("Survey goal JSON: %s", json.dumps(parsed, ensure_ascii=False)[:1500])
-    if isinstance(parsed, dict) and shared_context: parsed["context_sources"] = shared_context["sources"]
-    return parsed
+    """A stable formula needs no LLM request, quota or invented missing input."""
+    from progressor_nutrition_plan import normalize_profile, calculate_plan
+    from progressor_client import call
+    profile=normalize_profile(answers);used=[]
+    result=calculate_plan(profile)
+    if result['status']=='incomplete_profile' and user_id:
+        try:
+            shared=await call('food','/internal/v1/profile',{'user_id':str(user_id)},timeout=.8)
+            if not shared['conflicts']:
+                for field,value in shared['values'].items():
+                    if field not in profile:
+                        profile[field]=value
+                        provenance=shared['provenance'].get(field)
+                        if provenance and provenance['source']!='food': used.append(provenance['source'])
+                result=calculate_plan(profile)
+        except Exception: pass
+    if result['status']!='estimated': raise ValueError(result['status'])
+    t=result['targets']
+    return {'kcal':t['kcal'],'protein_g':t['protein'],'fat_g':t['fat'],'carbs_g':t['carbs'],
+        'calculation':result,'context_sources':[{'source':v} for v in sorted(set(used))]}
 
 
-@_guard_food_ai("goal")
 async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Завершает опрос: вызывает generate_goal_from_survey, записывает цель и показывает её пользователю.
+    Завершает опрос: считает ориентир без ИИ, сохраняет профиль и выбранную цель.
     """
     db = get_db(ctx)
     uid = update.effective_user.id
     answers = ctx.user_data.get("survey_answers") or {}
+    from progressor_preferences import save_profile
+    await asyncio.to_thread(save_profile,DB_PATH,uid,answers)
 
     try:
         goal_data = await generate_goal_from_survey(answers, uid)
@@ -2554,8 +2513,8 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_menu_message(
             update,
             ctx,
-            "Не смог подобрать норму по опросу 😕\n\n"
-            "Попробуй чуть позже или задай цель вручную в настройках.",
+            "Для расчёта нужны корректные пол, возраст, рост, вес, активность и цель.\n\n"
+            "При особых ограничениях задайте согласованную цель вручную в настройках.",
             kb_settings(),
         )
         return
@@ -2589,12 +2548,12 @@ async def finish_survey(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     notice = (
         "Готово ✅\n\n"
-        "Я подобрал цель по опросу. Ты в главном меню, вот твоя дневная норма:\n"
+        "Ориентир по формуле и вашим ответам:\n"
         f"{format_totals_short(goal_totals)}\n\n"
-        "Это ориентировочная цель, её всегда можно скорректировать в «⚙️ Настройки»."
+        "Обычная активность уже учтена. Цель можно скорректировать в «⚙️ Настройки»."
     )
     used_sources = [x["source"] for x in goal_data.get("context_sources", [])]
-    if used_sources: notice += "\nПри запросе ИИ использованы ваши данные из: " + ", ".join(used_sources) + "."
+    if used_sources: notice += "\nДля расчёта использованы ваши данные из: " + ", ".join(used_sources) + "."
     await show_main_menu(update, ctx, notice=notice)
 
 
@@ -5255,6 +5214,8 @@ def main() -> None:
     # Команды
     from progressor_bot import install as install_progressor
     install_progressor(application, "food", DB_PATH)
+    from progressor_notifications import install as install_reminders
+    install_reminders(application,DB_PATH,FOOD_WEBAPP_URL)
     application.add_handler(CommandHandler("start", persistent_handler(cmd_start)))
     application.add_handler(CommandHandler("help", persistent_handler(cmd_help)))
     application.add_handler(CommandHandler("pay", persistent_handler(cmd_pay)))

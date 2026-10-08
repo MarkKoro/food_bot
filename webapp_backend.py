@@ -172,6 +172,52 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+@app.get('/api/progressor/preferences')
+def progressor_preferences(user_id:int=Depends(get_verified_user_id)):
+    from progressor_preferences import get_settings
+    return get_settings(DB_PATH,user_id)
+
+
+@app.post('/api/progressor/preferences')
+def progressor_preferences_save(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from progressor_preferences import save_preferences
+    try: return save_preferences(DB_PATH,user_id,payload['workout_enabled'],payload['nutrient_enabled'],payload['timezone'])
+    except (KeyError,ValueError,TypeError) as error: raise HTTPException(422,str(error))
+
+
+@app.post('/api/progressor/profile')
+def progressor_profile_save(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from progressor_preferences import save_profile
+    try: return save_profile(DB_PATH,user_id,payload['profile'],payload['sharing_enabled'])
+    except (KeyError,ValueError,TypeError) as error: raise HTTPException(422,str(error))
+
+
+@app.post('/api/progressor/profile/plan')
+async def progressor_profile_plan(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from progressor_preferences import get_settings
+    from progressor_nutrition_plan import calculate_plan
+    from progressor_client import call
+    settings=await asyncio.to_thread(get_settings,DB_PATH,user_id)
+    profile=dict(settings['profile']);provenance={k:{'source':'food','observed_at':settings['profile_updated_at']} for k in profile};conflicts=[]
+    if type(payload.get('use_shared',False)) is not bool or type(payload.get('apply',False)) is not bool: raise HTTPException(422,'Некорректный выбор')
+    if payload.get('use_shared'):
+        try:
+            shared=await call('food','/internal/v1/profile',{'user_id':str(user_id)},timeout=.8)
+            conflicts=shared['conflicts']
+            for field,value in shared['values'].items():
+                if field not in profile: profile[field]=value;provenance[field]=shared['provenance'].get(field)
+        except Exception: raise HTTPException(503,'Общий профиль пока недоступен; можно заполнить поля Food')
+    result=calculate_plan(profile) if not conflicts else {'status':'conflicting_profile','missing_fields':[]}
+    result['provenance']=provenance;result['conflicts']=conflicts
+    if payload.get('apply'):
+        if result['status']!='estimated': raise HTTPException(422,'Уточните профиль или задайте цель вручную в боте')
+        from db import set_goal
+        async with aiosqlite.connect(DB_PATH,timeout=5) as conn:
+            t=result['targets'];await set_goal(conn,user_id,t['kcal'],t['protein'],t['fat'],t['carbs'])
+        result['saved']=True
+    return result
+
+
 def _today_str() -> str:
     return dt.date.today().isoformat()
 

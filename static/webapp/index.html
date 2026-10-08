@@ -548,6 +548,15 @@
       #meal-editor-status { min-height: 20px; margin: 4px 0; }
       .meal-editor-header { flex-shrink: 0; }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+      .food-context-settings summary { min-height:48px; cursor:pointer; font-weight:600; display:flex; align-items:center; }
+      .food-context-settings form { display:grid; gap:12px; margin:16px 0; }
+      .food-context-settings label { display:grid; gap:6px; font-size:14px; }
+      .food-context-settings select,.food-context-settings input:not([type=checkbox]) { width:100%; min-height:48px; border:1px solid var(--border,rgba(148,163,184,.25)); border-radius:12px; padding:8px 12px; background:var(--card,#0f172a); color:inherit; color-scheme:dark; font:inherit; box-sizing:border-box; }
+      .food-context-settings .food-context-check { display:flex; align-items:center; gap:10px; min-height:48px; margin:8px 0; cursor:pointer; }
+      .food-context-check input { width:20px; height:20px; flex-shrink:0; }
+      .food-context-settings button { min-height:48px; margin:4px 4px 4px 0; }
+      .food-context-settings button[hidden] { display:none; }
+      .food-context-settings :focus-visible { outline:2px solid var(--accent,#3b82f6); outline-offset:3px; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -603,6 +612,32 @@
       </div>
 
       <div id="progressor-inline-host" hidden></div>
+      <details class="card food-context-settings" id="food-context-settings">
+        <summary>Профиль и напоминания</summary>
+        <p class="hint">Ответы Food используются первыми. Недостающие поля можно взять из доступных разделов с вашим согласием.</p>
+        <form>
+          <label>Пол для расчёта<select name="sex_at_birth"><option value="">Не указан</option><option value="male">Мужской</option><option value="female">Женский</option></select></label>
+          <label>Возраст<input name="age_years" type="number" min="1" max="110" step="1" inputmode="numeric" /></label>
+          <label>Рост, см<input name="height_cm" type="number" min="100" max="230" step="0.1" inputmode="decimal" /></label>
+          <label>Вес, кг<input name="weight_kg" type="number" min="30" max="250" step="0.1" inputmode="decimal" /></label>
+          <label>Обычная активность<select name="activity"><option value="">Не указана</option><option value="sedentary">Сидячая</option><option value="light">Лёгкая</option><option value="moderate">Средняя</option><option value="high">Высокая</option></select></label>
+          <label>Цель<select name="goal"><option value="">Не указана</option><option value="lose">Похудеть</option><option value="maintain">Поддерживать</option><option value="gain">Набрать</option></select></label>
+          <label>Тренировки<select name="training"><option value="">Не указаны</option><option value="none">Нет</option><option value="cardio">Кардио</option><option value="strength">Силовые</option><option value="mixed">Смешанные</option></select></label>
+          <label class="food-context-check"><input name="has_special_constraints" type="checkbox" />Особые ограничения, беременность или питание по назначению</label>
+          <label class="food-context-check"><input name="sharing_enabled" type="checkbox" />Разрешить другим доступным разделам учитывать этот профиль</label>
+          <button class="pill pill-secondary" type="submit">Сохранить профиль</button>
+          <small data-profile-date></small>
+        </form>
+        <label class="food-context-check"><input name="use_shared" type="checkbox" />Учесть недостающие данные из других доступных разделов</label>
+        <button class="pill pill-secondary" type="button" data-calculate>Рассчитать ориентир</button>
+        <button class="pill pill-primary" type="button" data-apply hidden>Сохранить как цель питания</button>
+        <div data-reminders>
+          <label class="food-context-check"><input name="workout_enabled" type="checkbox" />Напоминать о питании после записанной тренировки</label>
+          <label class="food-context-check"><input name="nutrient_enabled" type="checkbox" />Присылать недельный обзор источников нутриентов</label>
+          <p class="hint">Сообщение придёт, если вы не увидели подсказку и не скрыли её. Не чаще одного в день; обзор — не чаще раза в неделю. Тихие часы 22:00–08:00 по вашему часовому поясу. Нужны доступные данные соответствующих разделов.</p>
+        </div>
+        <p role="status" aria-live="polite"></p>
+      </details>
       <div class="card" id="card-today-meals">
         <div class="today-meals-header">
           <h2>Что съедено за день</h2>
@@ -1932,6 +1967,10 @@ function setActiveAnalyticsPreset(range) {
         loadDay("yesterday");
       });
 
+      document.addEventListener("food:goal-updated", () => {
+        if (!mealEditorOpen) loadDay(activeMode, selectedISO);
+      });
+
       burgerBtn?.addEventListener("click", openDrawer);
       drawerBackdrop?.addEventListener("click", closeDrawer);
       navToday?.addEventListener("click", () => {
@@ -2256,5 +2295,6 @@ function setActiveAnalyticsPreset(range) {
       })();
     </script>
     <script src="/webapp/nutrients.v1.js"></script>
+    <script src="/webapp/progressor-settings.v1.js"></script>
 </body>
 </html>
