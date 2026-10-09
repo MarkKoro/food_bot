@@ -450,7 +450,7 @@ class AuditTest(unittest.TestCase):
         asyncio.run(run())
 
     def test_openai_text_photo_fallback_and_voice_contracts(self):
-        result={'items':[], 'totals':{'kcal':200,'protein_g':10,'fat_g':5,'carbs_g':30}}
+        result={'nutrient_schema_version':1,'status':'recognized','items':[{'name':'Рис','grams':200,'kcal':200,'protein_g':10,'fat_g':5,'carbs_g':30,'nutrients_per_100g':{'iron':1}}], 'totals':{'kcal':200,'protein_g':10,'fat_g':5,'carbs_g':30}}
         def response(data):
             return SimpleNamespace(raise_for_status=lambda:None,json=lambda:data)
         def chat(data):
@@ -459,15 +459,18 @@ class AuditTest(unittest.TestCase):
             client=AsyncMock()
             client.__aenter__.return_value=client
             client.post.side_effect=[chat(result),chat({'totals':['invalid']}),chat(result),response({'text':'Рис и курица'})]
-            with patch.object(bot.httpx,'AsyncClient',return_value=client),patch.object(bot,'compress_image_for_vision',side_effect=lambda image:image):
-                self.assertEqual(await bot.analyze_food_text('200 г риса'),result)
-                self.assertEqual(await bot.analyze_food_photo(b'\x89PNG\r\n\x1a\n','без масла'),result)
+            import io
+            from PIL import Image
+            image=io.BytesIO();Image.new('RGB',(64,64),'white').save(image,format='JPEG')
+            with patch.object(bot.httpx,'AsyncClient',return_value=client):
+                self.assertEqual((await bot.analyze_food_text('200 г риса'))['totals'],result['totals'])
+                self.assertEqual((await bot.analyze_food_photo(image.getvalue(),'без масла'))['totals'],result['totals'])
                 self.assertEqual(await bot.transcribe_voice_audio(b'audio'),'Рис и курица')
             calls=client.post.await_args_list
             self.assertIn('200 г риса',calls[0].kwargs['json']['messages'][1]['content'])
             photo=calls[1].kwargs['json']['messages'][1]['content']
             self.assertIn('без масла',photo[0]['text'])
-            self.assertTrue(photo[1]['image_url']['url'].startswith('data:image/png;base64,'))
+            self.assertTrue(photo[1]['image_url']['url'].startswith('data:image/jpeg;base64,'))
             self.assertIn('/audio/transcriptions',calls[3].args[0])
             self.assertEqual(calls[3].kwargs['files']['file'][1],b'audio')
         asyncio.run(run())

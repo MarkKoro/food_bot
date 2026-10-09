@@ -1988,7 +1988,11 @@ function setActiveAnalyticsPreset(range) {
         showScreen("analytics");
         loadAdvancedStats(activeAnalyticsRange);
       });
-      btnOpenSub?.addEventListener("click", () => goToPaymentScreen({ kind: "subscription", plan_id: subPlanSelect?.value || "m1" }));
+      btnOpenSub?.addEventListener("click", () => {
+        setModalOpen(subModal,false);
+        if(window.Progressor?.openProductSubscriptions)window.Progressor.openProductSubscriptions('food');
+        else goToPaymentScreen({kind:'subscription',plan_id:subPlanSelect?.value||'m1'});
+      });
       btnOpenSubModal?.addEventListener("click", () => setModalOpen(subModal, true));
       btnOpenPaygModal?.addEventListener("click", () => setModalOpen(paygModal, true));
       receiptOptIn?.addEventListener("change", async () => {
@@ -2295,6 +2299,7 @@ function setActiveAnalyticsPreset(range) {
       })();
     </script>
     <script src="/webapp/nutrients.v1.js"></script>
+    <script src="/webapp/subscriptions.v1.js"></script>
     <script src="/webapp/progressor-settings.v1.js"></script>
 </body>
 </html>

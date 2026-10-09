@@ -1355,6 +1355,21 @@ def widget_payment_status(
     return _apply_provider_status(user_id, _fetch_yookassa_payment(payment_id))
 
 
+@app.post("/api/payments/stars/create")
+def create_stars_payment(body: Dict[str, Any], user_id: int = Depends(get_verified_user_id)) -> Dict[str, Any]:
+    """Use the same owner quote and existing Telegram receipt consumer as the bot."""
+    if set(body) != {'plan_id'} or not isinstance(body.get('plan_id'), str):
+        raise HTTPException(422, 'Выберите тариф подписки')
+    try:
+        order = billing.create_order(user_id, 'subscription', plan_id=body['plan_id'], currency='XTR', channel='telegram')
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    link = _create_invoice_link(title=order['title'], description=order['title'],
+                               payload='food:'+order['id'], currency='XTR', provider_token='',
+                               prices=[{'label':order['title'],'amount':order['amount']}])
+    return {'invoice_link':link, 'order_id':order['id'], 'amount':order['amount'], 'currency':'XTR'}
+
+
 @app.get("/api/payments/invoice-link")
 def create_payment_invoice_link(
     mode: str = Query(..., description="sub|payg"),

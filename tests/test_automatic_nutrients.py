@@ -1,10 +1,12 @@
 """Mocked photo/text -> the real owner transaction; no external AI or bot consumer."""
 import asyncio
+import io
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from PIL import Image
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
@@ -71,9 +73,10 @@ class AutomaticNutrients(unittest.TestCase):
         async def run():
             bot._OPENAI_SEM=asyncio.Semaphore(3)
             text=await bot.analyze_food_text('Рис и соус')
-            photo=await bot.analyze_food_photo(b'fake-image')
+            image=io.BytesIO();Image.new('RGB',(32,32),'white').save(image,format='JPEG')
+            photo=await bot.analyze_food_photo(image.getvalue())
             return text,photo
-        with patch.object(bot.httpx,'AsyncClient',lambda **kwargs: Client()), patch.object(bot,'compress_image_for_vision',lambda value:value):
+        with patch.object(bot.httpx,'AsyncClient',lambda **kwargs: Client()):
             results=asyncio.run(run())
         for payload in recorded:
             prompt=payload['messages'][0]['content']
