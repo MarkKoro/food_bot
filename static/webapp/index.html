@@ -607,6 +607,7 @@
         <div id="today-summary"></div>
         <div id="today-macros"></div>
         <p class="hint" id="today-hint"></p>
+        <div id="day-review" class="hint" aria-live="polite"></div>
         <p class="error" id="today-error"></p>
         <canvas id="today-ring"></canvas>
       </div>
@@ -1719,6 +1720,7 @@
           const stats = await fetchJson(url);
           if (requestId !== dayRequest) return;
           renderToday(stats, title, caption);
+          updateDayReview(effectiveDate,requestId);
           storage.setItem(`day:${effectiveDate}`,JSON.stringify({ts:Date.now(),data:stats}));
         } catch (err) {
           console.error(err);
@@ -1726,6 +1728,20 @@
           if (requestId === dayRequest) todayErrorEl.textContent = err.message || "Ошибка загрузки данных.";
         }
       }
+
+      async function updateDayReview(day,requestId){
+        const box=document.getElementById('day-review');
+        try{
+          const v=await fetchJson('/api/day-status?day='+encodeURIComponent(day));
+          if(requestId!==dayRequest)return;box.replaceChildren();const p=document.createElement('p');p.textContent=v.message;box.appendChild(p);
+          if(v.meal_count&&!v.complete&&day>=isoDaysAgo(7)&&day<=isoToday()){
+            const b=document.createElement('button');b.type='button';b.className='pill pill-secondary';b.textContent=day===isoToday()?'На сегодня всё':'Подтвердить все приёмы этого дня';b.style.minHeight='44px';
+            b.addEventListener('click',async()=>{b.disabled=true;try{const r=await fetchJson('/api/day-status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({day})});if(requestId===dayRequest){p.textContent=r.message; b.remove();}}catch(e){p.textContent=e.message||'Не удалось подтвердить день';b.disabled=false;}});box.appendChild(b);
+          }
+        }catch(e){if(requestId===dayRequest)box.textContent='Итог по сохранённым блюдам. Полнота дня не подтверждена.';}
+      }
+      function isoDaysAgo(days){const d=new Date(isoToday()+'T12:00:00');d.setDate(d.getDate()-days);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+      window.addEventListener('progressor:meal-saved',()=>loadDay('today'));
 
       function buildWeekChart(history) {
         if (typeof Chart === "undefined") return;

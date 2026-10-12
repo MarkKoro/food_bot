@@ -353,6 +353,9 @@ async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
 
     for table in tables_with_user_id:
         await db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+    for table in ('progressor_ai_cache','progressor_link_cache','progressor_owner_commands','progressor_recent_intents','progressor_day_closure','progressor_evening_questions'):
+        cursor=await db.execute('SELECT 1 FROM sqlite_master WHERE name=?',(table,))
+        if await cursor.fetchone():await db.execute(f'DELETE FROM {table} WHERE user_id=?',(str(user_id),))
 
     # Keep the account, paid entitlements, receipt and redemption history.
     await db.execute("UPDATE users SET last_menu_message_id=NULL WHERE telegram_id=?", (user_id,))
@@ -1019,12 +1022,15 @@ async def get_goal(db: aiosqlite.Connection, telegram_id: int) -> dict | None:
     await cur.close()
     if not row:
         return None
-    return {
+    base={
         "kcal": int(row[0]),
         "protein": float(row[1]),
         "fat": float(row[2]),
         "carbs": float(row[3]),
     }
+    from progressor_links import day_goal
+    import asyncio
+    return await asyncio.to_thread(day_goal,DB_PATH,telegram_id,base)
 
 
 async def set_goal(

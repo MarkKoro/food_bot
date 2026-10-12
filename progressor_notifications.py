@@ -15,9 +15,18 @@ log=logging.getLogger(__name__)
 
 async def deliver(path,bot,item,pref,webapp_url,sender=None):
     uid=int(item['user_id'])
+    from progressor_links import notifications_allowed
+    if not await asyncio.to_thread(notifications_allowed,path,uid):return False
     current=await asyncio.to_thread(get_settings,path,uid)
-    field='workout_enabled' if item['kind']=='post_workout' else 'nutrient_enabled'
-    if not current[field] or current['enabled_at']!=pref['enabled_at']: return False
+    if item['kind'] in ('weekly_plan','weight_review'):
+        from progressor_links import settings
+        policy=await asyncio.to_thread(settings,path,uid)
+        field='weekly_plan' if item['kind']=='weekly_plan' else 'weight_notifications'
+        if not policy.get(field) or not policy.get('hints',True):return False
+        if time.time()-policy.get('synced_at',0)>120:return False
+    else:
+        field='workout_enabled' if item['kind']=='post_workout' else 'nutrient_enabled'
+        if not current[field] or current['enabled_at']!=pref['enabled_at']: return False
     now=datetime.now(timezone.utc);local=now.astimezone(ZoneInfo(current['timezone']))
     if not 8<=local.hour<22 or item['day']!=local.date().isoformat(): return False
     if not await asyncio.to_thread(reserve,path,uid,item['day'],item['kind'],item['delivery_key']): return False
@@ -57,7 +66,7 @@ async def cycle(path,bot,webapp_url,control=call,after=0,sender=None):
         by_id={str(r['user_id']):r for r in rows}
         for item in response.get('items',[])[:50]:
             uid=item.get('user_id')
-            if uid not in by_id or item.get('kind') not in ('post_workout','nutrient_review'): continue
+            if uid not in by_id or item.get('kind') not in ('post_workout','nutrient_review','weekly_plan','weight_review'): continue
             if not isinstance(item.get('text'),str) or not 1<=len(item['text'])<=3500 or not isinstance(item.get('delivery_key'),str) or len(item['delivery_key'])>160: continue
             try: date.fromisoformat(item['day'])
             except (ValueError,TypeError,KeyError): continue

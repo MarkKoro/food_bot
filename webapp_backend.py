@@ -171,11 +171,46 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+@app.get('/api/meals/recent')
+def recent_meals_list(user_id:int=Depends(get_verified_user_id)):
+    from recent_meals import list_recent
+    return {'items':list_recent(DB_PATH,user_id)}
+
+@app.get('/api/day-status')
+def food_day_status(day:str|None=None,user_id:int=Depends(get_verified_user_id)):
+    from day_review import status
+    try:return status(DB_PATH,user_id,day)
+    except ValueError:raise HTTPException(422,'Некорректный день')
+
+@app.post('/api/day-status')
+def food_day_close(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from day_review import close_day
+    try:return close_day(DB_PATH,user_id,payload.get('day'))
+    except (ValueError,TypeError) as error:raise HTTPException(409,str(error))
+
+@app.post('/api/meals/recent/preview')
+def recent_meal_preview(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from recent_meals import preview
+    try:return preview(DB_PATH,user_id,payload['meal_id'],payload['portion'])
+    except (ValueError,KeyError,TypeError) as error:raise HTTPException(409,str(error))
+
+@app.post('/api/meals/recent/confirm')
+def recent_meal_confirm(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from recent_meals import confirm
+    try:return confirm(DB_PATH,user_id,payload['id'])
+    except (ValueError,KeyError,TypeError) as error:raise HTTPException(409,str(error))
+
 
 @app.get('/api/progressor/preferences')
 def progressor_preferences(user_id:int=Depends(get_verified_user_id)):
     from progressor_preferences import get_settings
     return get_settings(DB_PATH,user_id)
+
+@app.post('/api/integrations/timezone')
+def integration_timezone(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    from progressor_timezone import change
+    try:return change(DB_PATH,user_id,payload)
+    except ValueError:raise HTTPException(409,'Пояс изменился или недоступен. Обновите предпросмотр.')
 
 
 @app.post('/api/progressor/preferences')
@@ -721,7 +756,7 @@ def delete_meal_item(
 
 def _build_stats_for_day(user_id: int, day: str) -> Dict[str, Any]:
     totals = get_daily_totals_for_user(user_id, day)
-    goal = get_goal_for_user(user_id)
+    goal = get_goal_for_user(user_id,day)
 
     def perc(value: float, target: float) -> Optional[int]:
         if not target or target <= 0:
@@ -749,7 +784,7 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-def get_goal_for_user(user_id: int) -> Optional[Dict[str, float]]:
+def get_goal_for_user(user_id: int, day: str|None=None) -> Optional[Dict[str, float]]:
     """
     Возвращает цель КБЖУ для пользователя в виде словаря или None, если цели нет.
     Используй реальную таблицу целей из db.py (посмотри её имя и поля).
@@ -779,12 +814,14 @@ def get_goal_for_user(user_id: int) -> Optional[Dict[str, float]]:
     if row is None:
         return None
 
-    return {
+    base={
         "kcal": float(row["kcal"]),
         "protein": float(row["protein"]),
         "fat": float(row["fat"]),
         "carbs": float(row["carbs"]),
     }
+    from progressor_links import day_goal
+    return day_goal(DB_PATH,user_id,base,day) if day else base
 
 
 def get_daily_totals_for_user(user_id: int, day: str) -> Dict[str, float]:

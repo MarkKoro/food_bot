@@ -415,7 +415,10 @@ if not JOIN_URL:
 
 def kb_main(mode: str = "sub", *, has_templates: bool = False) -> InlineKeyboardMarkup:
     keyboard = [
+        [InlineKeyboardButton("🕘 Выбрать из недавних", callback_data="recent:menu")],
+        [InlineKeyboardButton('Итог дня',callback_data='day:summary')],
         [InlineKeyboardButton("Progressor · 3 продукта", callback_data="pg:menu")],
+        [InlineKeyboardButton("Связь продуктов",callback_data="pg:settings")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
     ]
@@ -1352,20 +1355,28 @@ async def _food_model_request(model, system_prompt, user_message):
 
 
 async def analyze_food_photo(image_bytes: bytes, extra_description: str | None = None) -> dict:
+    import hashlib
     # Preparation is CPU work and must not stall the existing consumer's loop.
     image_bytes = await asyncio.to_thread(compress_image_for_vision, image_bytes)
     mime = _guess_image_mime(image_bytes)
     note = (extra_description or '').strip()[:2000]
+    from progressor_ai_cache import get,put,key
+    owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
+    request_key=key({'mode':'photo','model':VISION_MODEL,'detail':VISION_DETAIL,'prompt':FOOD_SYSTEM_PROMPT,'instructions':FOOD_USER_INSTRUCTIONS,'image_sha256':hashlib.sha256(image_bytes).hexdigest(),'note':note})
+    cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
+    if cached:return {**cached,'_progressor_cache_hit':True}
     user_message = {"role": "user", "content": [
         {"type": "text", "text": FOOD_USER_INSTRUCTIONS + "\nFOOD_NOTE=" + json.dumps(note, ensure_ascii=False)},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(image_bytes).decode('ascii'), "detail": VISION_DETAIL}}]}
     try:
-        return await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT, user_message)
+        result=await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT, user_message)
     except FoodFormatError:
         # One format-repair attempt only. No retry for a legitimate non-food
         # result, unreadable image, refusal, truncated answer or HTTP timeout.
         logging.info("food_vision_format_repair")
-        return await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT_FALLBACK, user_message)
+        result=await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT_FALLBACK, user_message)
+    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
+    return result
 
 
 async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
@@ -1403,8 +1414,15 @@ async def analyze_food_text(description: str) -> dict:
     text = (description or '').strip()
     if not text or len(text) > 12000:
         raise FoodAnalysisError('Опишите один приём пищи и примерную порцию.')
-    return await _food_model_request(TEXT_MODEL, TEXT_FOOD_SYSTEM_PROMPT,
+    from progressor_ai_cache import get,put,key
+    owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
+    request_key=key({'mode':'text','model':TEXT_MODEL,'prompt':TEXT_FOOD_SYSTEM_PROMPT,'instructions':TEXT_FOOD_USER_INSTRUCTIONS,'description':text})
+    cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
+    if cached:return {**cached,'_progressor_cache_hit':True}
+    result=await _food_model_request(TEXT_MODEL, TEXT_FOOD_SYSTEM_PROMPT,
         {"role": "user", "content": TEXT_FOOD_USER_INSTRUCTIONS + "\nFOOD_DESCRIPTION=" + json.dumps(text, ensure_ascii=False)})
+    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
+    return result
 
 
 def extract_totals(data: dict) -> dict:
@@ -2955,7 +2973,7 @@ async def _process_meal_calculation(
 
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
-                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind="photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind=None if data.get('_progressor_cache_hit') else "photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
         await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Повторите расчёт.",kb_meal_extras(extras))
@@ -3049,11 +3067,13 @@ async def _process_meal_calculation(
         "totals": totals,
         "extras": extras,
     }
+    from day_review import decorate
+    msg,meal_keyboard=await asyncio.to_thread(decorate,DB_PATH,uid,msg,kb_save_template_after_meal(meal_date=date.today().isoformat(),meal_id=meal_id),date.today().isoformat(),not bool(addition))
     await edit_menu_message(
         update,
         ctx,
         msg,
-        kb_save_template_after_meal(meal_date=date.today().isoformat(), meal_id=meal_id),
+        meal_keyboard,
     )
 
 
@@ -3195,7 +3215,7 @@ async def process_meal_description(
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
                     source_key=f"message:{update.effective_chat.id}:{update.message.message_id}",
-                    kind="voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    kind=None if data.get('_progressor_cache_hit') else "voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
         await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Отправьте сообщение повторно.",main_kb)
@@ -3269,11 +3289,13 @@ async def process_meal_description(
         "totals": totals,
         "extras": {},
     }
+    from day_review import decorate
+    msg,meal_keyboard=await asyncio.to_thread(decorate,DB_PATH,uid,msg,kb_save_template_after_meal(meal_date=date.today().isoformat(),meal_id=meal_id),date.today().isoformat(),not bool(addition))
     await edit_menu_message(
         update,
         ctx,
         msg,
-        kb_save_template_after_meal(meal_date=date.today().isoformat(), meal_id=meal_id),
+        meal_keyboard,
     )
 
 
@@ -3775,6 +3797,45 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data == "main":
         await show_main_menu(update, ctx)
+    elif data.startswith('day:'):
+        import day_review
+        uid=update.effective_user.id
+        try:
+            if data=='day:more':
+                await asyncio.to_thread(day_review.more_food,DB_PATH,uid)
+                await show_main_menu(update,ctx,notice='День остаётся открытым. Добавляйте еду как обычно.',notice_at_bottom=True)
+            else:
+                value=await asyncio.to_thread(day_review.close_day,DB_PATH,uid,data.split(':',2)[2]) if data.startswith('day:close:') else await asyncio.to_thread(day_review.status,DB_PATH,uid)
+                text=value['day']+'\n'+value['message']
+                if value['totals']:
+                    t=value['totals'];text+=f"\n{t['kcal']:g} ккал; Б {t['protein']:g}, Ж {t['fat']:g}, У {t['carbs']:g} г."
+                rows=[[InlineKeyboardButton('На сегодня всё',callback_data='day:close:'+value['day'])]] if not value['complete'] and value['meal_count'] else []
+                rows.append([InlineKeyboardButton('⬅️ В меню',callback_data='main')])
+                await edit_menu_message(update,ctx,text,InlineKeyboardMarkup(rows))
+        except ValueError as error:await show_main_menu(update,ctx,notice=str(error),notice_at_bottom=True)
+    elif data.startswith('recent:'):
+        import recent_meals
+        uid=update.effective_user.id
+        try:
+            parts=data.split(':')
+            if parts[1]=='menu':
+                meals=await asyncio.to_thread(recent_meals.list_recent,DB_PATH,uid)
+                rows=[[InlineKeyboardButton(m['name'][:48]+' · '+str(round(m['totals']['kcal']))+' ккал',callback_data=f"recent:portion:{m['id']}")] for m in meals]
+                rows.append([InlineKeyboardButton('⬅️ Назад',callback_data='main')])
+                await edit_menu_message(update,ctx,'Последние 6 приёмов пищи. Выберите блюдо; затем порцию и подтверждение.' if meals else 'Сначала сохраните фото или описание еды — здесь появятся последние 6 приёмов.',InlineKeyboardMarkup(rows))
+            elif parts[1]=='portion':
+                meal_id=int(parts[2]);rows=[[InlineKeyboardButton(f'× {p:g}',callback_data=f'recent:preview:{meal_id}:{p:g}') for p in recent_meals.PORTIONS]]
+                rows.append([InlineKeyboardButton('⬅️ К недавним',callback_data='recent:menu')])
+                await edit_menu_message(update,ctx,'Какую часть сохранённой порции повторить?',InlineKeyboardMarkup(rows))
+            elif parts[1]=='preview':
+                value=await asyncio.to_thread(recent_meals.preview,DB_PATH,uid,int(parts[2]),float(parts[3]))
+                text=f"{value['name']} · × {value['portion']:g}\n{format_totals_short(value['totals'])}\n\n{value['note']}"
+                await edit_menu_message(update,ctx,text,InlineKeyboardMarkup([[InlineKeyboardButton('✅ Добавить в дневник',callback_data='recent:save:'+value['id'])],[InlineKeyboardButton('⬅️ К недавним',callback_data='recent:menu')]]))
+            elif parts[1]=='save':
+                result=await asyncio.to_thread(recent_meals.confirm,DB_PATH,uid,parts[2])
+                await show_main_menu(update,ctx,notice='Этот приём уже сохранён.' if result['already_saved'] else '✅ Приём пищи сохранён из недавних. Состав и порция учтены.',notice_at_bottom=True)
+        except (ValueError,IndexError) as error:
+            await edit_menu_message(update,ctx,str(error),InlineKeyboardMarkup([[InlineKeyboardButton('К недавним',callback_data='recent:menu')]]))
     elif data == "templates":
         ctx.user_data["state"] = None
         ctx.user_data["templates_page"] = 0

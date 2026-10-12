@@ -59,7 +59,11 @@ def save_profile(path,user_id,values,sharing=None):
 def opted_in(path,after=0,limit=50):
     with closing(sqlite3.connect(path,timeout=5)) as db:
         db.row_factory=sqlite3.Row
-        return [dict(r) for r in db.execute('SELECT p.* FROM progressor_food_preferences p JOIN users u ON u.telegram_id=p.user_id WHERE (p.workout_enabled=1 OR p.nutrient_enabled=1) AND p.user_id>? ORDER BY p.user_id LIMIT ?',(after,limit))]
+        # Weekly plans are Core-owned opt-ins, cached locally. Existing sender
+        # keeps fair pagination and rechecks the cache before each delivery.
+        has_cache=db.execute("SELECT 1 FROM sqlite_master WHERE name='progressor_link_cache'").fetchone()
+        extra=" OR EXISTS(SELECT 1 FROM progressor_link_cache c WHERE c.user_id=CAST(p.user_id AS TEXT) AND (json_extract(c.body,'$.weekly_plan')=1 OR json_extract(c.body,'$.weight_notifications')=1))" if has_cache else ''
+        return [dict(r) for r in db.execute('SELECT p.* FROM progressor_food_preferences p JOIN users u ON u.telegram_id=p.user_id WHERE (p.workout_enabled=1 OR p.nutrient_enabled=1'+extra+') AND p.user_id>? ORDER BY p.user_id LIMIT ?',(after,limit))]
 
 
 def reserve(path,user_id,day,kind,key,now=None):
@@ -72,7 +76,8 @@ def reserve(path,user_id,day,kind,key,now=None):
             db.execute("UPDATE progressor_food_deliveries SET status='reserved',reserved_at=?,retry_at=NULL WHERE user_id=? AND day=?",(stamp,user_id,day))
         else:
             # Nutrient reviews are bounded to once per week as well as once per day.
-            if kind=='nutrient_review' and db.execute("SELECT 1 FROM progressor_food_deliveries WHERE user_id=? AND kind=? AND reserved_at>? LIMIT 1",(user_id,kind,stamp-7*86400)).fetchone(): return False
+            if kind in ('nutrient_review','weekly_plan') and db.execute("SELECT 1 FROM progressor_food_deliveries WHERE user_id=? AND kind=? AND reserved_at>? LIMIT 1",(user_id,kind,stamp-6.5*86400)).fetchone(): return False
+            if db.execute('SELECT 1 FROM progressor_food_deliveries WHERE user_id=? AND delivery_key=?',(user_id,key)).fetchone():return False
             db.execute('INSERT INTO progressor_food_deliveries VALUES(?,?,?,?,?,?,NULL,NULL)',(user_id,day,kind,key,'reserved',stamp))
         db.execute('DELETE FROM progressor_food_deliveries WHERE reserved_at<?',(stamp-180*86400,))
         return True
