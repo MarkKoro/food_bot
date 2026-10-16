@@ -44,3 +44,21 @@ class SubscriptionChoice(unittest.TestCase):
         with patch.object(api,'_create_invoice_link') as provider:
             self.assertEqual(self.client.post('/api/payments/stars/create',json={'plan_id':'m1'}).status_code,401)
             provider.assert_not_called()
+    def test_native_menu_pairs_three_periods_with_current_owner_prices(self):
+        from urllib.parse import parse_qs, urlsplit
+        billing.set_setting('price_m1_rub',459,1)
+        billing.set_setting('price_m1_stars',309,1)
+        menu=bot.kb_premium_plans_rub(paid_trial_used=False).inline_keyboard
+        self.assertEqual(len(menu[:3]),3)
+        for row,plan in zip(menu[:3],('m1','m6','y1')):
+            self.assertEqual(len(row),2)
+            self.assertEqual(parse_qs(urlsplit(row[0].web_app.url).query)['plan_id'],[plan])
+            self.assertEqual(row[1].callback_data,'buy_stars:'+plan)
+        self.assertIn('459 ₽',menu[0][0].text);self.assertIn('309 ⭐',menu[0][1].text)
+        self.assertEqual(bot.kb_premium_plans_stars(paid_trial_used=False),bot.kb_premium_plans_rub(paid_trial_used=False))
+    def test_other_periods_preserve_weekly_eligibility_and_back_path(self):
+        for used,expected in ((False,['w1','m3']),(True,['m3'])):
+            menu=bot.kb_premium_plans_rub(paid_trial_used=used,other_periods=True).inline_keyboard
+            actual=[row[1].callback_data.removeprefix('buy_stars:') for row in menu if len(row)==2]
+            self.assertEqual(actual,expected)
+            self.assertIn('premium_menu',[b.callback_data for row in menu for b in row])

@@ -585,48 +585,40 @@ def payg_topups_text() -> str:
 
 def _available_subscription_plans(*, paid_trial_used: bool) -> list[tuple[str, SubscriptionPlan]]:
     plans: list[tuple[str, SubscriptionPlan]] = []
-    for plan_id, plan in SUB_PLANS.items():
+    for plan_id, value in billing.plans().items():
         if plan_id == "w1" and paid_trial_used:
             continue
+        plan = SubscriptionPlan(plan_id, value['title'], value['months'], value['price_rub'], value['price_stars'])
         plans.append((plan_id, plan))
     return plans
 
 
-def kb_premium_plans_rub(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
+def kb_premium_plans_rub(*, paid_trial_used: bool, other_periods: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for plan_id, plan in _available_subscription_plans(paid_trial_used=paid_trial_used):
+        if (plan_id in {'m1', 'm6', 'y1'}) == other_periods:
+            continue
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"🧾 {plan.title} — {plan.price_rub}₽",
+                    f"{plan.title} · {plan.price_rub} ₽",
                     web_app=WebAppInfo(
                         url=build_webapp_payment_url(kind="subscription", plan_id=plan_id)
                     ),
-                )
+                ),
+                InlineKeyboardButton(f"{plan.title} · {plan.price_stars} ⭐", callback_data=f"buy_stars:{plan_id}"),
             ]
         )
 
-    buttons.append([InlineKeyboardButton("⭐ Купить за звезды", callback_data="premium_menu_stars")])
+    buttons.append([InlineKeyboardButton("Основные сроки" if other_periods else "Другие сроки", callback_data="premium_menu" if other_periods else "premium_other")])
     buttons.append([InlineKeyboardButton("Общая подписка · доплатить",callback_data="pg:menu")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="pay_mode")])
     return InlineKeyboardMarkup(buttons)
 
 
 def kb_premium_plans_stars(*, paid_trial_used: bool) -> InlineKeyboardMarkup:
-    buttons = []
-    for plan_id, plan in _available_subscription_plans(paid_trial_used=paid_trial_used):
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"⭐ {plan.title} — {plan.price_stars}⭐",
-                    callback_data=f"buy_stars:{plan_id}",
-                )
-            ]
-        )
-
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="premium_menu")])
-    buttons.insert(0,[InlineKeyboardButton("Общая подписка · доплатить",callback_data="pg:menu")])
-    return InlineKeyboardMarkup(buttons)
+    # Existing messages and invoice back buttons keep their route after upgrade.
+    return kb_premium_plans_rub(paid_trial_used=paid_trial_used)
 
 
 def kb_sub() -> InlineKeyboardMarkup:
@@ -1342,6 +1334,11 @@ def _truncate_description(text: str, max_sentences: int = 5, max_chars: int = 60
     return result
 
 
+def _analysis_was_cached(data):
+    from food_analysis import FoodAnalysisResult
+    return isinstance(data, FoodAnalysisResult) and data.cache_hit
+
+
 async def _food_model_request(model, system_prompt, user_message):
     payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, user_message],
                "max_completion_tokens": FOOD_ANALYSIS_MAX_TOKENS, "temperature": 0,
@@ -1364,7 +1361,9 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
     owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
     request_key=key({'mode':'photo','model':VISION_MODEL,'detail':VISION_DETAIL,'prompt':FOOD_SYSTEM_PROMPT,'instructions':FOOD_USER_INSTRUCTIONS,'image_sha256':hashlib.sha256(image_bytes).hexdigest(),'note':note})
     cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
-    if cached:return {**cached,'_progressor_cache_hit':True}
+    if cached:
+        from food_analysis import FoodAnalysisResult
+        return FoodAnalysisResult(cached, cache_hit=True)
     user_message = {"role": "user", "content": [
         {"type": "text", "text": FOOD_USER_INSTRUCTIONS + "\nFOOD_NOTE=" + json.dumps(note, ensure_ascii=False)},
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(image_bytes).decode('ascii'), "detail": VISION_DETAIL}}]}
@@ -1376,7 +1375,8 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         logging.info("food_vision_format_repair")
         result=await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT_FALLBACK, user_message)
     if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
-    return result
+    from food_analysis import FoodAnalysisResult
+    return FoodAnalysisResult(result, cache_hit=False)
 
 
 async def transcribe_voice_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
@@ -1418,11 +1418,14 @@ async def analyze_food_text(description: str) -> dict:
     owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
     request_key=key({'mode':'text','model':TEXT_MODEL,'prompt':TEXT_FOOD_SYSTEM_PROMPT,'instructions':TEXT_FOOD_USER_INSTRUCTIONS,'description':text})
     cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
-    if cached:return {**cached,'_progressor_cache_hit':True}
+    if cached:
+        from food_analysis import FoodAnalysisResult
+        return FoodAnalysisResult(cached, cache_hit=True)
     result=await _food_model_request(TEXT_MODEL, TEXT_FOOD_SYSTEM_PROMPT,
         {"role": "user", "content": TEXT_FOOD_USER_INSTRUCTIONS + "\nFOOD_DESCRIPTION=" + json.dumps(text, ensure_ascii=False)})
     if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
-    return result
+    from food_analysis import FoodAnalysisResult
+    return FoodAnalysisResult(result, cache_hit=False)
 
 
 def extract_totals(data: dict) -> dict:
@@ -2973,7 +2976,7 @@ async def _process_meal_calculation(
 
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
-                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind=None if data.get('_progressor_cache_hit') else "photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind=None if _analysis_was_cached(data) else "photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
         await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Повторите расчёт.",kb_meal_extras(extras))
@@ -3215,7 +3218,7 @@ async def process_meal_description(
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
                     source_key=f"message:{update.effective_chat.id}:{update.message.message_id}",
-                    kind=None if data.get('_progressor_cache_hit') else "voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    kind=None if _analysis_was_cached(data) else "voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
         await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Отправьте сообщение повторно.",main_kb)
@@ -3723,7 +3726,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith("admin:") and data != "admin:paychecks":
         await admin_callback(update,ctx,data)
         return
-    if data in {"main","settings","stats","pay_mode","premium_menu","premium_menu_stars"}:
+    if data in {"main","settings","stats","pay_mode","premium_menu","premium_menu_stars","premium_other"}:
         ctx.user_data.pop("admin_setting",None)
         ctx.user_data["state"] = None
 
@@ -3975,6 +3978,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     elif data == "premium_menu":
         await on_premium_menu(update, ctx)
+    elif data == "premium_other":
+        await on_premium_menu(update, ctx, other_periods=True)
     elif data == "premium_menu_stars":
         await on_premium_menu_stars(update, ctx)
     elif data == "sub_stars:invoice_back":
@@ -4187,7 +4192,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Оплата ───────────────────────────────────────────
 
-async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, other_periods: bool = False):
     db = get_db(ctx)
     user_id = update.effective_user.id
 
@@ -4197,34 +4202,17 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⭐ Подписка\n\n"
         "Подписка — это фиксированная оплата за выбранный срок. Пока она активна, "
         "ты используешь бота каждый день в рамках лимита и не платишь отдельно за каждый запрос.\n\n"
-        "Рублёвая оплата откроется на безопасной внешней странице YooKassa — это основной путь для RUB. "
-        "Оплата Stars остаётся отдельным способом внутри Telegram.\n\n"
-        "Есть одноразовый вариант «Одна неделя» (если ещё не покупал), "
-        "и обычные подписки.\n\n"
-        "Выбери тариф в рублях:"
+        "Рубли — на внешней платёжной странице ЮKassa, Stars — внутри Telegram. "
+        "Выбери удобный способ в строке нужного срока.\n\n"
+        "В разделе «Другие сроки» доступны три месяца и одноразовый вариант «Одна неделя», если ещё не покупал."
     )
     await edit_menu_message(
-        update, ctx, text, kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used))
+        update, ctx, text, kb_premium_plans_rub(paid_trial_used=bool(paid_trial_used), other_periods=other_periods)
     )
 
 
 async def on_premium_menu_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    db = get_db(ctx)
-    user_id = update.effective_user.id
-
-    _, _, paid_trial_used = await get_trial_info(db, user_id)
-
-    text = (
-        "⭐ Подписка за звёзды\n\n"
-        "Здесь доступны те же тарифы, но оплата проходит внутри Telegram Stars.\n\n"
-        "Выбери тариф:"
-    )
-    await edit_menu_message(
-        update,
-        ctx,
-        text,
-        kb_premium_plans_stars(paid_trial_used=bool(paid_trial_used)),
-    )
+    await on_premium_menu(update, ctx)
 
 
 async def _send_order_invoice(update, ctx, kind, *, plan_id=None, rub=0, currency="XTR"):

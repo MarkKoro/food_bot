@@ -114,12 +114,12 @@ class PhotoQuality(unittest.TestCase):
                     finally:bot._food_ai_action.reset(marker)
                 with patch.object(bot,'_food_model_request',provider):
                     a=await owned(1,'Рис 150 г');self.assertNotIn('_progressor_cache_hit',a)
-                    b=await owned(1,'Рис 150 г');self.assertTrue(b['_progressor_cache_hit']);self.assertEqual(provider.await_count,1)
+                    b=await owned(1,'Рис 150 г');self.assertTrue(b.cache_hit);self.assertEqual(provider.await_count,1)
                     await owned(2,'Рис 150 г');await owned(1,'Рис 200 г');self.assertEqual(provider.await_count,3)
                     purge(bot.DB_PATH,1);await owned(1,'Рис 150 г');self.assertEqual(provider.await_count,4)
                     marker=bot._food_ai_action.set((1,asyncio.current_task()))
                     try:
                         c=await bot.analyze_food_photo(picture());d=await bot.analyze_food_photo(picture())
-                        self.assertNotIn('_progressor_cache_hit',c);self.assertTrue(d['_progressor_cache_hit']);self.assertEqual(provider.await_count,5)
+                        self.assertNotIn('_progressor_cache_hit',c);self.assertTrue(d.cache_hit);self.assertEqual(provider.await_count,5)
                     finally:bot._food_ai_action.reset(marker)
             asyncio.run(run())

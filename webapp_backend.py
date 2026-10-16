@@ -1200,6 +1200,7 @@ def api_config() -> Dict[str, Any]:
     return {
         "bot_username": BOT_USERNAME,
         "project_key": PROJECT_KEY,
+        "diary_timezone": "Europe/Moscow",
         "payments_external_only": PAYMENTS_EXTERNAL_ONLY,
         "plans": billing.plans(),
         "payg_cost": billing.settings()["payg_cost"],

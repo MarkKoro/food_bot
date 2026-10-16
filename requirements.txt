@@ -1,8 +1,13 @@
-python-telegram-bot[rate-limiter]==21.*
-httpx
-python-dotenv
-Pillow
-aiosqlite
-openpyxl
-fastapi>=0.115,<1
-uvicorn>=0.30,<1
+# Runtime roots, Python 3.12. Install from this repository directory.
+# Complete tested versions are bounded by constraints.txt.
+-c constraints.txt
+python-telegram-bot[rate-limiter]==21.11.1
+httpx==0.28.1
+python-dotenv==1.2.2
+Pillow==12.3.0
+aiosqlite==0.21.0
+openpyxl==3.1.5
+openai==2.9.0
+fastapi==0.139.0
+uvicorn[standard]==0.49.0
+pip==26.2.1

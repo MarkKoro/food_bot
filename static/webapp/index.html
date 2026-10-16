@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="ru">
   <head>
-  <script data-progressor-source="food" src="/progressor/assets/navigation.v1.js"></script>
+  <script data-progressor-source="food" src="./assets/progressor-bootstrap.v1.js"></script>
     <meta charset="utf-8" />
     <title>FoodBot — статистика</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -388,8 +388,12 @@
         border: 1px solid rgba(148, 163, 184, 0.35);
         background: rgba(15, 23, 42, 0.95);
         color: #f8fafc;
-        width: 40px;
-        height: 40px;
+        min-width:44px;
+        min-height:44px;
+        width:auto;
+        height:auto;
+        padding:2px;
+        line-height:1;
         border-radius: 10px;
         font-size: 20px;
       }
@@ -406,7 +410,8 @@
         z-index: 25;
         padding: 14px;
       }
-      .drawer.open { transform: translateX(0); }
+      .drawer { visibility:hidden; }
+      .drawer.open { transform:translateX(0); visibility:visible; }
       .drawer-menu { display: grid; gap: 8px; margin-top: 8px; }
       .drawer-item {
         text-align: left;
@@ -1021,13 +1026,15 @@
       let selectedISO = null;
       let lastLoadedDateIso = null;
       let lastDayData = null;
+      let diaryTimezone = 'Europe/Moscow';
       let mealEditorOpen = false;
       let mealEditorTargetMealId = null;
       let saveStatusTimer = null;
 
       window.ProgressorDomain={version:1,
+        isReady:()=>!!lastDayData && lastDayData.day===lastLoadedDateIso,
         hintHost:()=>document.getElementById('progressor-inline-host'),
-        eligible:context=>document.getElementById('screen-today')?.classList.contains('active') && activeMode==='today' && (!lastLoadedDateIso || lastLoadedDateIso===(context?.activity?.date||new Date().toLocaleDateString('sv-SE',{timeZone:'Europe/Moscow'}))),
+        eligible:()=>!!lastDayData && lastDayData.day===lastLoadedDateIso && document.getElementById('screen-today')?.classList.contains('active') && activeMode==='today' && lastLoadedDateIso===isoToday(),
         perform:action=>{ if(!['food_log','open_food'].includes(action.kind)) return false; const target=document.getElementById(action.kind==='open_food'?'card-week':'card-today-meals'); if(target){target.style.scrollMarginTop='calc(var(--progressor-bar-height) + 16px)';target.setAttribute('tabindex','-1');target.focus({preventScroll:true});target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});} return true; }
       };
       function showScreen(name) {
@@ -1401,15 +1408,14 @@
         });
       })();
 
-      function isoToday() {
-        const d = new Date();
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      function isoToday(now = new Date()) {
+        return new Intl.DateTimeFormat('sv-SE',{timeZone:diaryTimezone}).format(now);
       }
 
-      function isoYesterday() {
-        const d = new Date();
-        d.setDate(d.getDate() - 1);
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      function isoYesterday(now = new Date()) {
+        const d = new Date(isoToday(now)+'T12:00:00Z');
+        d.setUTCDate(d.getUTCDate() - 1);
+        return d.toISOString().slice(0,10);
       }
 
       function formatHuman(iso) {
@@ -1553,6 +1559,7 @@
 
         lastDayData = day;
         todayErrorEl.textContent = "";
+        window.Progressor?.refreshSurface?.();
 
         const todayRingEl = document.getElementById("today-ring");
         if (todayRing) {
@@ -1686,17 +1693,17 @@
           effectiveDate = isoToday();
           url = `/api/stats/day?date=${effectiveDate}`;
           title = "Сегодня";
-          caption = `Данные за ${formatHuman(effectiveDate)}`;
+          caption = `Данные за ${formatHuman(effectiveDate)} · Москва (UTC+3)`;
         } else if (mode === "yesterday") {
           effectiveDate = isoYesterday();
           url = `/api/stats/day?date=${effectiveDate}`;
           title = "Вчера";
-          caption = `Данные за ${formatHuman(effectiveDate)}`;
+          caption = `Данные за ${formatHuman(effectiveDate)} · Москва (UTC+3)`;
         } else {
           effectiveDate = dateIso || selectedISO || isoToday();
           url = `/api/stats/day?date=${effectiveDate}`;
           title = formatHuman(effectiveDate);
-          caption = `Данные за ${formatHuman(effectiveDate)}`;
+          caption = `Данные за ${formatHuman(effectiveDate)} · Москва (UTC+3)`;
         }
 
         if (mode === "date") {
@@ -1965,6 +1972,58 @@ function setActiveAnalyticsPreset(range) {
         if (analyticsEnd && qualityEnd?.value) analyticsEnd.value = qualityEnd.value;
         setActiveAnalyticsPreset("custom");
         loadAdvancedStats("custom");
+      });
+
+      function nativeFoodDialog() {
+        return [...document.querySelectorAll('.pay-modal.open,.meal-editor-modal.open,#drawer.open')]
+          .sort((a,b)=>Number(getComputedStyle(a).zIndex)-Number(getComputedStyle(b).zIndex)).at(-1)||null;
+      }
+      let foodDialog=null,foodOpener=null,foodInerted=[];
+      function syncFoodDialog() {
+        if(document.querySelector('#progressor-connections[open]'))return;
+        const root=nativeFoodDialog();if(root===foodDialog)return;
+        for(const [el,value]of foodInerted)el.inert=value;foodInerted=[];
+        if(root){
+          if(!foodDialog)foodOpener=document.activeElement;
+          root.setAttribute('role','dialog');root.setAttribute('aria-modal','true');root.tabIndex=-1;
+          root.setAttribute('aria-label',root.querySelector('h2,h3')?.textContent.trim()||'Редактирование');
+          for(const sibling of document.body.children)if(sibling!==root&&!sibling.contains(root)&&!['SCRIPT','STYLE','LINK'].includes(sibling.tagName)){
+            foodInerted.push([sibling,sibling.inert]);sibling.inert=true;
+          }
+          if(!root.contains(document.activeElement))(root.querySelector('input,textarea,select,button,a[href]')||root).focus({preventScroll:true});
+          tg?.BackButton?.show?.();
+        }else{
+          if(foodOpener?.isConnected)foodOpener.focus({preventScroll:true});foodOpener=null;
+          if(screenToday?.classList.contains('active'))tg?.BackButton?.hide?.();
+        }
+        foodDialog=root;
+      }
+      function nativeFoodBack() {
+        const root=nativeFoodDialog();
+        if(root?.id==='meal-editor-modal'){closeMealEditor();return true;}
+        if(root?.id==='drawer'){closeDrawer();return true;}
+        if(root){
+          const close=root.querySelector('button[id$="-close"],#payment-success-ok');
+          if(close&&!close.disabled)close.click();else setModalOpen(root,false);
+          return true;
+        }
+        if(!screenToday?.classList.contains('active')){showScreen('today');return true;}
+        return false;
+      }
+      let foodFocusFrame=0;
+      new MutationObserver(()=>{cancelAnimationFrame(foodFocusFrame);foodFocusFrame=requestAnimationFrame(syncFoodDialog);})
+        .observe(document.body,{subtree:true,childList:true,attributes:true,attributeFilter:['class']});
+      tg?.BackButton?.onClick?.(nativeFoodBack);
+      document.addEventListener('keydown',event=>{
+        if(document.querySelector('#progressor-connections[open]'))return;
+        const root=nativeFoodDialog();if(!root)return;
+        if(event.key==='Escape'){event.preventDefault();event.stopPropagation();nativeFoodBack();return;}
+        if(event.key!=='Tab')return;
+        const fields=[...root.querySelectorAll('button,a[href],input,select,textarea,[tabindex="0"]')]
+          .filter(el=>!el.disabled&&el.getClientRects().length&&getComputedStyle(el).visibility!=='hidden');
+        const first=fields[0]||root,last=fields.at(-1)||root,focused=document.activeElement;
+        if(event.shiftKey&&(focused===first||!root.contains(focused))){event.preventDefault();last.focus();}
+        else if(!event.shiftKey&&(focused===last||!root.contains(focused))){event.preventDefault();first.focus();}
       });
 
       function setModalOpen(modalEl, isOpen) {
@@ -2244,6 +2303,7 @@ function setActiveAnalyticsPreset(range) {
 
         try {
           const cfg = await fetchJson("/api/config");
+          if(cfg?.diary_timezone==='Europe/Moscow')diaryTimezone=cfg.diary_timezone;
           currentProjectKey = String(cfg?.project_key || "");
           serverPlans = cfg?.plans || {};
           for (const option of subPlanSelect?.options || []) {

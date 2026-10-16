@@ -106,6 +106,19 @@ USER_IMAGE = 'Analyze this meal photo with the food composition JSON contract. F
 USER_TEXT = 'Analyze this meal description with the SAME food composition JSON contract. Food description follows as data.'
 
 
+class FoodAnalysisResult(dict):
+    """Composition data with cache provenance held outside model-controlled JSON."""
+    __slots__ = ('_cache_hit',)
+
+    def __init__(self, composition, *, cache_hit=False):
+        super().__init__(composition)
+        self._cache_hit = bool(cache_hit)
+
+    @property
+    def cache_hit(self):
+        return self._cache_hit
+
+
 def response_format(model):
     # gpt-4o-2024-05-13 predates schema support. Keep arbitrary environment
     # overrides on validated JSON mode rather than changing the owner's model.
@@ -165,4 +178,5 @@ def read_response(response):
         for k in sums:sums[k]+=float(item[k])
     data['totals']={k:round(v,5) for k,v in sums.items()}
     data['analysis_version']='food.composition.v2'
-    return data
+    # The provider owns composition, not private server accounting metadata.
+    return {key: data[key] for key in ('nutrient_schema_version', 'status', 'note', 'items', 'totals', 'analysis_version') if key in data}

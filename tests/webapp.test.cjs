@@ -24,6 +24,9 @@ async function fixture(t, query='') {
     const url=new URL(route.request().url());
     const json=data => route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
     if (url.hostname!=='food.test') return route.fulfill({status:200,body:''});
+    const asset=path.basename(url.pathname);
+    if (asset==='progressor-bootstrap.v1.js') return route.fulfill({status:200,contentType:'application/javascript',body:fs.readFileSync(path.join(__dirname,'../static/webapp/assets',asset),'utf8')});
+    if (['subscriptions.v1.js','progressor-settings.v1.js','nutrients.v1.js'].includes(asset)) return route.fulfill({status:200,contentType:'application/javascript',body:fs.readFileSync(path.join(__dirname,'../static/webapp',asset),'utf8')});
     if (url.pathname.startsWith('/webapp')) return route.fulfill({status:200,contentType:'text/html',body:html});
     if (url.pathname==='/api/config') return json({project_key:'food_bot',plans:{m1:{title:'1 месяц',price_rub:555}},payg_cost:3});
     if (url.pathname==='/api/payments/receipt-email') return json({receipt_email_status:'missing'});
