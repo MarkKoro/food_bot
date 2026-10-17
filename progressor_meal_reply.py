@@ -38,7 +38,7 @@ def workout_text(context,totals,goal,day):
     hint=(context or {}).get('inline_hint') or {};activity=(context or {}).get('activity') or {}
     if hint.get('key')!='workout_today.v1' or activity.get('date')!=day:return ''
     workouts=activity.get('workouts',[])
-    if not workouts:return ''
+    if not any(w.get('session_complete',True) for w in workouts):return ''
     sets=sum((w.get('strength_metrics') or {}).get('working_sets',w.get('strength_sets',0)) for w in workouts)
     completed=sum(w.get('session_complete',True) for w in workouts)
     text=f"\nПо дневнику Gym сегодня завершено занятий: {completed}; тренировочных записей: {len(workouts)}."
@@ -48,7 +48,7 @@ def workout_text(context,totals,goal,day):
         left={k:max(goal[k]-totals[k],0) for k in goal if k in ('kcal','protein','fat','carbs')}
         text+=f" До вашей цели по внесённым блюдам: {left['kcal']:.0f} ккал, Б {left['protein']:.0f} г, Ж {left['fat']:.0f} г, У {left['carbs']:.0f} г."
     else:text+=' Для сравнения питания можно задать личную цель КБЖУ.'
-    return text+' Проверьте полноту записей. Обычная активность уже может входить в цель; расход тренировки к ней автоматически не прибавляется.'
+    return text+' Этот приём пищи уже входит в итог Food. Обычная активность может быть учтена в цели; расход тренировки к ней автоматически не прибавляется.'
 
 def reserve_inline(path,user_id,day):
     with closing(sqlite3.connect(path,timeout=2)) as db,db:

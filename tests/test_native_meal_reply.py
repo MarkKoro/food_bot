@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock,patch
 os.environ.setdefault('BOT_TOKEN','123:OFFLINE');os.environ.setdefault('OPENAI_API_KEY','offline');os.environ.setdefault('CHANNEL_ID','-1001')
 import aiosqlite,db,bot
 import progressor_client as client
-from progressor_meal_reply import saved,brief,extension
+from progressor_meal_reply import saved,brief,extension,workout_text
 from progressor_native_subscription import prepare_metadata,record_paid_async
 from telegram.ext import ApplicationHandlerStop
 from telegram.error import RetryAfter
@@ -52,6 +52,15 @@ class NativeMealReply(unittest.IsolatedAsyncioTestCase):
         self.ctx.bot.delete_message.side_effect=RetryAfter(30)
         await bot.send_new_menu_message(self.ctx,123,'Напоминание',user_id=123)
         self.assertEqual(await db.get_last_menu_message_id(self.conn,123),88);self.ctx.bot.send_message.assert_awaited_once()
+
+    async def test_ongoing_workout_does_not_add_completed_guidance_to_saved_meal(self):
+        day=date.today().isoformat();totals={'kcal':500,'protein':20,'fat':10,'carbs':70};goal={'kcal':2000,'protein':100,'fat':70,'carbs':250}
+        value={'inline_hint':{'key':'workout_today.v1'},'activity':{'date':day,'workouts':[{'session_complete':False,'strength_sets':12}]}}
+        self.assertEqual(workout_text(value,totals,goal,day),'')
+        value['activity']['workouts'][0]['session_complete']=True
+        text=workout_text(value,totals,goal,day)
+        self.assertIn('Этот приём пищи уже входит в итог Food',text)
+        self.assertIn('1500 ккал',text)
     async def test_owner_paid_grant_transaction_and_revocation_do_not_credit_gifts(self):
         # Gift access alone creates no payment evidence.
         prepare_metadata(self.path,'food',{'RUB':39900,'XTR':266})
