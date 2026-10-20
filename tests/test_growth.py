@@ -47,7 +47,7 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False}).status_code,200)
         result=self.client.post('/api/progressor/profile/plan',json={'apply':False}).json();self.assertEqual(result['targets']['kcal'],2725)
         self.assertIsNone(await db.get_goal(self.conn,123))
-        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True}).status_code,200)
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':result['preview_id']}).status_code,200)
         self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2725)
         self.assertFalse(preferences.get_settings(self.path,123)['sharing_enabled'])
     async def test_formula_calls_no_provider_and_survey_persists_structured_fields(self):
@@ -59,10 +59,36 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot,'show_main_menu',AsyncMock()):await bot.finish_survey(update,ctx)
         provider.assert_not_awaited();self.assertEqual(result['kcal'],2725)
         self.assertEqual(preferences.get_settings(self.path,123)['profile']['weight_kg'],80)
+    async def test_dedicated_confirm_route_requires_preview_and_preserves_later_goal(self):
+        route='/api/progressor/profile/plan/confirm'
+        self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False})
+        self.assertEqual(self.client.post(route,json={}).status_code,422)
+        self.assertEqual(self.client.post(route,json={'apply':True}).status_code,409)
+        self.assertIsNone(await db.get_goal(self.conn,123))
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        command={'apply':True,'preview_id':preview['preview_id'],'user_id':999}
+        response=self.client.post(route,json=command)
+        self.assertEqual(response.status_code,200);self.assertEqual(response.json()['targets'],preview['targets'])
+        await db.set_goal(self.conn,123,2400,110,80,280)
+        replay=self.client.post(route,json=command)
+        self.assertTrue(replay.json()['duplicate']);self.assertFalse(replay.json()['current_goal_matches'])
+        self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2400)
+        self.assertIsNone(await db.get_goal(self.conn,999))
+    async def test_dedicated_confirm_route_keeps_owner_and_native_auth_guards(self):
+        route='/api/progressor/profile/plan/confirm'
+        self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False})
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        command={'apply':True,'preview_id':preview['preview_id']}
+        api.app.dependency_overrides[api.get_verified_user_id]=lambda:999
+        self.assertEqual(self.client.post(route,json=command).status_code,409)
+        api.app.dependency_overrides.clear()
+        self.assertEqual(self.client.post(route,json=command).status_code,401)
+        self.assertIsNone(await db.get_goal(self.conn,123))
+        api.app.dependency_overrides[api.get_verified_user_id]=lambda:123
     async def test_invalid_missing_profile_does_not_replace_manual_goal(self):
         await db.set_goal(self.conn,123,2200,100,80,250)
         self.client.post('/api/progressor/profile',json={'profile':{'weight_kg':80},'sharing_enabled':True})
-        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True}).status_code,422)
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True}).status_code,409)
         self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2200)
         self.assertEqual(self.client.post('/api/progressor/profile',json={'profile':{'weight_kg':True},'sharing_enabled':False}).status_code,422)
     async def test_shared_missing_fields_only_and_outage_has_no_goal_write(self):
@@ -72,7 +98,81 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
             result=self.client.post('/api/progressor/profile/plan',json={'use_shared':True,'apply':False}).json()
         self.assertEqual(result['targets']['protein'],128);self.assertEqual(result['provenance']['weight_kg']['source'],'food')
         with patch('progressor_client.call',AsyncMock(side_effect=RuntimeError('offline'))):
-            self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'use_shared':True,'apply':True}).status_code,503)
+            self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'use_shared':True,'apply':True,'preview_id':result['preview_id']}).status_code,503)
+        self.assertIsNone(await db.get_goal(self.conn,123))
+
+    async def test_old_preview_cannot_apply_a_parallel_profile_or_native_goal_edit(self):
+        await db.set_goal(self.conn,123,2200,100,80,250)
+        self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False})
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        self.client.post('/api/progressor/profile',json={'profile':{**PROFILE,'weight_kg':100},'sharing_enabled':False})
+        response=self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':preview['preview_id']})
+        self.assertEqual(response.status_code,409);self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2200)
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        await db.set_goal(self.conn,123,2400,110,80,280)
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':preview['preview_id']}).status_code,409)
+        self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2400)
+
+    async def test_apply_uses_server_preview_once_and_keeps_a_later_goal(self):
+        self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False})
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        body={'apply':True,'preview_id':preview['preview_id'],'targets':{'kcal':9999},'user_id':999}
+        first=self.client.post('/api/progressor/profile/plan',json=body).json()
+        self.assertEqual(first['targets'],preview['targets']);self.assertFalse(first['duplicate'])
+        await db.set_goal(self.conn,123,2400,110,80,280)
+        retry=self.client.post('/api/progressor/profile/plan',json=body)
+        self.assertEqual(retry.status_code,200);self.assertTrue(retry.json()['duplicate'])
+        self.assertFalse(retry.json()['current_goal_matches'])
+        self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2400)
+        self.assertIsNone(await db.get_goal(self.conn,999))
+
+    async def test_shared_profile_change_or_revocation_requires_another_preview(self):
+        self.client.post('/api/progressor/profile',json={'profile':{'weight_kg':80,'activity':'moderate','goal':'maintain'},'sharing_enabled':False})
+        shared={'values':PROFILE,'provenance':{k:{'source':'supply','event_id':'old'} for k in PROFILE},'conflicts':[]}
+        with patch('progressor_client.call',AsyncMock(return_value=shared)):
+            preview=self.client.post('/api/progressor/profile/plan',json={'use_shared':True}).json()
+        for changed in ({**shared,'values':{**PROFILE,'height_cm':190}},{'values':{},'provenance':{},'conflicts':[]}):
+            with patch('progressor_client.call',AsyncMock(return_value=changed)):
+                response=self.client.post('/api/progressor/profile/plan',json={'use_shared':True,'apply':True,'preview_id':preview['preview_id']})
+            self.assertEqual(response.status_code,409)
+        self.assertIsNone(await db.get_goal(self.conn,123))
+
+    async def test_shared_recheck_holds_no_owner_write_lock_and_detects_racing_goal(self):
+        self.client.post('/api/progressor/profile',json={'profile':{'weight_kg':80,'activity':'moderate','goal':'maintain'},'sharing_enabled':False})
+        shared={'values':PROFILE,'provenance':{k:{'source':'supply','event_id':'old'} for k in PROFILE},'conflicts':[]}
+        with patch('progressor_client.call',AsyncMock(return_value=shared)):
+            preview=self.client.post('/api/progressor/profile/plan',json={'use_shared':True}).json()
+        async def concurrent_native_edit(*args,**kwargs):
+            with closing(sqlite3.connect(self.path,timeout=.1)) as owner,owner:
+                owner.execute('BEGIN IMMEDIATE')
+                owner.execute('INSERT INTO goals(user_id,kcal,protein,fat,carbs) VALUES(123,2400,110,80,280)')
+            return shared
+        with patch('progressor_client.call',concurrent_native_edit):
+            response=self.client.post('/api/progressor/profile/plan',json={'use_shared':True,'apply':True,'preview_id':preview['preview_id']})
+        self.assertEqual(response.status_code,409)
+        self.assertEqual((await db.get_goal(self.conn,123))['kcal'],2400)
+
+    async def test_applied_shared_preview_retries_without_reading_revoked_context(self):
+        self.client.post('/api/progressor/profile',json={'profile':{'weight_kg':80,'activity':'moderate','goal':'maintain'},'sharing_enabled':False})
+        shared={'values':PROFILE,'provenance':{k:{'source':'supply','event_id':'old'} for k in PROFILE},'conflicts':[]}
+        with patch('progressor_client.call',AsyncMock(return_value=shared)):
+            preview=self.client.post('/api/progressor/profile/plan',json={'use_shared':True}).json()
+            body={'use_shared':True,'apply':True,'preview_id':preview['preview_id']}
+            self.assertEqual(self.client.post('/api/progressor/profile/plan',json=body).status_code,200)
+        blocked=AsyncMock(side_effect=AssertionError('Receipt must not reread shared data'))
+        with patch('progressor_client.call',blocked):retry=self.client.post('/api/progressor/profile/plan',json=body)
+        self.assertEqual(retry.status_code,200);self.assertTrue(retry.json()['duplicate'])
+        self.assertNotIn('provenance',retry.json());blocked.assert_not_awaited()
+
+    async def test_expired_foreign_and_missing_previews_do_not_write_goal(self):
+        self.client.post('/api/progressor/profile',json={'profile':PROFILE,'sharing_enabled':False})
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        api.app.dependency_overrides[api.get_verified_user_id]=lambda:999
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':preview['preview_id']}).status_code,409)
+        api.app.dependency_overrides[api.get_verified_user_id]=lambda:123
+        await self.conn.execute('UPDATE progressor_goal_previews SET expires_at=0');await self.conn.commit()
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':preview['preview_id']}).status_code,409)
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True}).status_code,409)
         self.assertIsNone(await db.get_goal(self.conn,123))
     async def test_duplicate_delivery_restart_and_daily_cap(self):
         prefs=self.optin();item=self.item()
@@ -104,5 +204,10 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(preferences.reserve(self.path,123,'2026-10-08','nutrient_review','week',now=1000000))
         self.assertFalse(preferences.reserve(self.path,123,'2026-10-09','nutrient_review','week2',now=1000000+86400))
         self.optin();preferences.save_profile(self.path,123,PROFILE,True)
+        preview=self.client.post('/api/progressor/profile/plan',json={}).json()
+        self.assertEqual(self.client.post('/api/progressor/profile/plan',json={'apply':True,'preview_id':preview['preview_id']}).status_code,200)
         await db.purge_user(self.conn,123)
         self.assertEqual(preferences.get_settings(self.path,123)['profile'],{});self.assertEqual(preferences.opted_in(self.path),[])
+        for table in ('progressor_goal_previews','progressor_goal_versions','progressor_profile_versions'):
+            row=await (await self.conn.execute('SELECT count(*) FROM '+table+' WHERE user_id=123')).fetchone()
+            self.assertEqual(row[0],0)

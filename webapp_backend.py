@@ -229,13 +229,20 @@ def progressor_profile_save(payload:dict,user_id:int=Depends(get_verified_user_i
 
 @app.post('/api/progressor/profile/plan')
 async def progressor_profile_plan(payload:dict,user_id:int=Depends(get_verified_user_id)):
-    from progressor_preferences import get_settings
+    import goal_preview as previews
     from progressor_nutrition_plan import calculate_plan
     from progressor_client import call
-    settings=await asyncio.to_thread(get_settings,DB_PATH,user_id)
+    use_shared=payload.get('use_shared',False);apply=payload.get('apply',False)
+    if type(use_shared) is not bool or type(apply) is not bool: raise HTTPException(422,'Некорректный выбор')
+    conflict='Профиль, цель или данные для расчёта изменились либо предпросмотр истёк. Рассчитайте ориентир ещё раз: цель не заменена.'
+    if apply:
+        try:
+            receipt=await asyncio.to_thread(previews.inspect,DB_PATH,user_id,payload.get('preview_id'),use_shared)
+        except previews.PreviewConflict:raise HTTPException(409,conflict)
+        if receipt:return receipt
+    settings=await asyncio.to_thread(previews.snapshot,DB_PATH,user_id)
     profile=dict(settings['profile']);provenance={k:{'source':'food','observed_at':settings['profile_updated_at']} for k in profile};conflicts=[]
-    if type(payload.get('use_shared',False)) is not bool or type(payload.get('apply',False)) is not bool: raise HTTPException(422,'Некорректный выбор')
-    if payload.get('use_shared'):
+    if use_shared:
         try:
             shared=await call('food','/internal/v1/profile',{'user_id':str(user_id)},timeout=.8)
             conflicts=shared['conflicts']
@@ -244,13 +251,22 @@ async def progressor_profile_plan(payload:dict,user_id:int=Depends(get_verified_
         except Exception: raise HTTPException(503,'Общий профиль пока недоступен; можно заполнить поля Food')
     result=calculate_plan(profile) if not conflicts else {'status':'conflicting_profile','missing_fields':[]}
     result['provenance']=provenance;result['conflicts']=conflicts
-    if payload.get('apply'):
-        if result['status']!='estimated': raise HTTPException(422,'Уточните профиль или задайте цель вручную в боте')
-        from db import set_goal
-        async with aiosqlite.connect(DB_PATH,timeout=5) as conn:
-            t=result['targets'];await set_goal(conn,user_id,t['kcal'],t['protein'],t['fat'],t['carbs'])
-        result['saved']=True
+    context_hash=previews.fingerprint({'profile':profile,'provenance':provenance,'conflicts':conflicts,'use_shared':use_shared})
+    try:
+        if apply:
+            return await asyncio.to_thread(previews.apply,DB_PATH,user_id,payload['preview_id'],use_shared,context_hash,result)
+        if result['status']=='estimated':
+            result={**result,**await asyncio.to_thread(previews.prepare,DB_PATH,user_id,settings['version'],context_hash,use_shared,result)}
+    except previews.PreviewConflict:raise HTTPException(409,conflict)
     return result
+
+
+@app.post('/api/progressor/profile/plan/confirm')
+async def progressor_profile_plan_confirm(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    # A distinct path is a capability boundary. A loaded new client must receive
+    # 404 on an older API, never an old writer silently ignoring preview_id.
+    if payload.get('apply') is not True:raise HTTPException(422,'Требуется подтверждение показанного ориентира')
+    return await progressor_profile_plan(payload,user_id)
 
 
 def _today_str() -> str:

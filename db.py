@@ -145,6 +145,8 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     await db.executescript(SCHEMA)
     from progressor_preferences import SCHEMA as PROGRESSOR_PREFERENCES_SCHEMA
     await db.executescript(PROGRESSOR_PREFERENCES_SCHEMA)
+    from goal_preview import SCHEMA as GOAL_PREVIEW_SCHEMA
+    await db.executescript(GOAL_PREVIEW_SCHEMA)
     await db.execute("BEGIN IMMEDIATE")
     # Миграции: добавляем новые столбцы в users, если их ещё нет
     cur = await db.execute("PRAGMA table_info(users)")
@@ -349,6 +351,9 @@ async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
         "progressor_food_profile",
         "progressor_food_preferences",
         "progressor_food_deliveries",
+        "progressor_goal_previews",
+        "progressor_goal_versions",
+        "progressor_profile_versions",
     ]
 
     for table in tables_with_user_id:

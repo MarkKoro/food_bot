@@ -6,7 +6,10 @@
   const status=root.querySelector('[role=status]');
   const form=root.querySelector('form');
   const reminders=root.querySelector('[data-reminders]');
-  let loaded=false,loading=false,settings=null,plan=null;
+  let loaded=false,loading=false,settings=null,plan=null,editRevision=0,actionRevision=0,profileBusy=false;
+  const applyButton=root.querySelector('[data-apply]');
+  const calculateButton=root.querySelector('[data-calculate]');
+  const saveButton=form.querySelector('button[type=submit]');
   const fields=['sex_at_birth','age_years','height_cm','weight_kg','activity','goal','training'];
   const input=name=>root.querySelector('[name="'+name+'"]');
   async function api(path,body){
@@ -17,7 +20,11 @@
     try{
       const response=await fetch('/api/progressor/'+path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,cache:'no-store',signal:controller.signal});
       const data=await response.json();
-      if(!response.ok) throw new Error(typeof data.detail==='string'?data.detail:'Не удалось сохранить. Попробуйте ещё раз.');
+      if(!response.ok){
+        const unavailable=path==='profile/plan/confirm'&&[404,405].includes(response.status);
+        const error=new Error(unavailable?'Версия сервера изменилась. Обновите экран перед сохранением; цель этим запросом не заменена.':typeof data.detail==='string'?data.detail:'Не удалось сохранить. Попробуйте ещё раз.');
+        error.status=response.status;throw error;
+      }
       return data;
     }finally{clearTimeout(timeout);}
   }
@@ -38,26 +45,42 @@
     finally{loading=false;}
   }
   root.addEventListener('toggle',()=>{if(root.open) load();});
+  if(root.open)load();
   function values(){
     const p={...settings?.profile};
     for(const k of fields){p[k]=input(k).value;}
     p.has_special_constraints=input('has_special_constraints').checked;
     return p;
   }
-  async function save(){
+  function clearPlan(){plan=null;applyButton.hidden=true;}
+  function profilePending(pending){
+    profileBusy=pending;saveButton.disabled=pending;calculateButton.disabled=pending;
+  }
+  async function save(revision){
     if(!loaded) throw new Error('Сначала дождитесь загрузки профиля.');
-    fill(await api('profile',{profile:values(),sharing_enabled:input('sharing_enabled').checked}));
-    plan=null;root.querySelector('[data-apply]').hidden=true;
+    const saved=await api('profile',{profile:values(),sharing_enabled:input('sharing_enabled').checked});
+    settings=saved;
+    // Keep edits entered while the request was pending. They still need saving.
+    if(revision!==editRevision)return false;
+    fill(saved);return true;
   }
   form.addEventListener('submit',async event=>{
-    event.preventDefault();const button=event.submitter;button.disabled=true;
-    try{await save();status.textContent='Профиль сохранён. Цель питания не менялась.';}
-    catch(e){status.textContent=e.message;}finally{button.disabled=false;}
+    event.preventDefault();if(profileBusy)return;
+    const action=++actionRevision,revision=editRevision;clearPlan();profilePending(true);
+    const current=()=>action===actionRevision&&revision===editRevision;
+    try{if(await save(revision)&&current())status.textContent='Профиль сохранён. Цель питания не менялась.';}
+    catch(e){if(current())status.textContent=e.message;}finally{profilePending(false);}
   });
-  root.querySelector('[data-calculate]').addEventListener('click',async event=>{
-    const button=event.currentTarget;button.disabled=true;
+  calculateButton.addEventListener('click',async()=>{
+    if(profileBusy)return;
+    const action=++actionRevision,revision=editRevision,useShared=input('use_shared').checked;
+    const current=()=>action===actionRevision&&revision===editRevision;
+    clearPlan();profilePending(true);
     try{
-      await save();plan=await api('profile/plan',{use_shared:input('use_shared').checked,apply:false});
+      if(!await save(revision)||!current())return;
+      const calculated=await api('profile/plan',{use_shared:useShared,apply:false});
+      if(!current())return;
+      plan=calculated;
       if(plan.status!=='estimated'){
         const names={sex_at_birth:'пол',age_years:'возраст',height_cm:'рост',weight_kg:'вес',activity:'активность',goal:'цель'};
         status.textContent=plan.status==='incomplete_profile'?'Укажите: '+plan.missing_fields.map(k=>names[k]||k).join(', ')+'.':plan.status==='conflicting_profile'?'Недавние значения профилей расходятся. Уточните их перед расчётом.':'Задайте согласованную цель вручную в настройках бота.';
@@ -67,17 +90,28 @@
       const names={food:'Food',supply:'Supply',gym:'Gym'};
       const sources=[...new Set(Object.values(plan.provenance||{}).map(v=>v?.source).filter(Boolean))];
       status.textContent=`Ориентир: ${t.kcal} ккал · Б ${t.protein} г · Ж ${t.fat} г · У ${t.carbs} г. Обычная активность уже учтена. Источники: ${sources.map(s=>names[s]||s).join(', ')}. Сохранение заменит текущую цель.`;
-      root.querySelector('[data-apply]').hidden=false;
-    }catch(e){status.textContent=e.message;}finally{button.disabled=false;}
+      applyButton.hidden=false;
+    }catch(e){if(current())status.textContent=e.message;}finally{profilePending(false);}
   });
-  root.querySelector('[data-apply]').addEventListener('click',async event=>{
+  applyButton.addEventListener('click',async event=>{
     const button=event.currentTarget;button.disabled=true;
-    try{await api('profile/plan',{use_shared:input('use_shared').checked,apply:true});document.dispatchEvent(new Event('food:goal-updated'));status.textContent='Цель сохранена.';button.hidden=true;}
-    catch(e){status.textContent=e.message;}finally{button.disabled=false;}
+    const action=++actionRevision,revision=editRevision,chosen=plan;
+    const current=()=>action===actionRevision&&revision===editRevision;
+    try{
+      if(!chosen?.preview_id)throw new Error('Сначала рассчитайте ориентир.');
+      const receipt=await api('profile/plan/confirm',{use_shared:input('use_shared').checked,apply:true,preview_id:chosen.preview_id});
+      document.dispatchEvent(new Event('food:goal-updated'));
+      if(!current())return;
+      status.textContent=receipt.current_goal_matches===false?'Этот ориентир уже сохранялся. Позже цель изменена; оставили последнее значение.':'Цель сохранена.';
+      clearPlan();
+    }
+    catch(e){if(current()){status.textContent=e.message;if(e.status===409)clearPlan();}}
+    finally{button.disabled=false;}
   });
   // Editing after preview requires a new calculation; never apply an unseen profile.
-  form.addEventListener('input',()=>{plan=null;root.querySelector('[data-apply]').hidden=true;});
-  input('use_shared').addEventListener('change',()=>root.querySelector('[data-apply]').hidden=true);
+  function edited(){editRevision++;clearPlan();status.textContent='Есть новые изменения. Сохраните профиль или рассчитайте ориентир ещё раз.';}
+  form.addEventListener('input',edited);
+  input('use_shared').addEventListener('change',edited);
   reminders.addEventListener('change',async()=>{
     if(!loaded) return;
     const controls=[input('workout_enabled'),input('nutrient_enabled')];controls.forEach(c=>c.disabled=true);

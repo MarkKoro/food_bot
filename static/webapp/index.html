@@ -111,6 +111,8 @@
       .date-picker-wrapper {
         position: relative;
         display: inline-flex;
+        min-width: 0;
+        max-width: 100%;
       }
 
       /* было и остаётся базой: клики идут в кнопку на ПК */
@@ -186,10 +188,10 @@
         justify-content: space-between;
         align-items:center;
         gap:12px;
-        flex-wrap: nowrap; /* важно: не даём “выбрать дату” уезжать вниз на телефоне */
+        flex-wrap: wrap;
       }
       .today-header > div:first-child{
-        flex: 1 1 auto;
+        flex: 1 1 120px;
         min-width: 0;
       }
 
@@ -212,10 +214,13 @@
         align-items:center;
         gap:10px;
         min-width: 0;
-        flex: 0 0 auto;
+        max-width: 100%;
+        flex: 0 1 auto;
+        flex-wrap: wrap;
       }
       .date-label{
-        white-space: nowrap;
+        white-space: normal;
+        overflow-wrap: anywhere;
         opacity: 0.85;
         font-size: 0.9rem;
       }
@@ -250,11 +255,20 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
+        flex-wrap: wrap;
         gap: 10px;
         margin-bottom: 8px;
       }
       .today-meals-header h2 {
         margin: 0;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      #btn-date, .today-meals-header .meal-edit-btn {
+        max-width: 100%;
+        min-height: 44px;
+        white-space: normal;
+        overflow-wrap: anywhere;
       }
       .meal-edit-btn {
         border: 1px solid rgba(148, 163, 184, 0.35);
@@ -1035,7 +1049,22 @@
         isReady:()=>!!lastDayData && lastDayData.day===lastLoadedDateIso,
         hintHost:()=>document.getElementById('progressor-inline-host'),
         eligible:()=>!!lastDayData && lastDayData.day===lastLoadedDateIso && document.getElementById('screen-today')?.classList.contains('active') && activeMode==='today' && lastLoadedDateIso===isoToday(),
-        perform:action=>{ if(!['food_log','open_food'].includes(action.kind)) return false; const target=document.getElementById(action.kind==='open_food'?'card-week':'card-today-meals'); if(target){target.style.scrollMarginTop='calc(var(--progressor-bar-height) + 16px)';target.setAttribute('tabindex','-1');target.focus({preventScroll:true});target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});} return true; }
+        captureView:()=>mealEditorOpen || Object.keys(mealDrafts).length ? null : document.getElementById('screen-analytics')?.classList.contains('active') ? 'analytics' : document.getElementById('screen-subscription')?.classList.contains('active') ? 'subscription' : activeMode==='today' ? 'today' : null,
+        restoreView:view=>{if(mealEditorOpen || Object.keys(mealDrafts).length || !['today','analytics','subscription'].includes(view))return false;showScreen(view);return true;},
+        perform:async action=>{
+          if(!['food_goal','food_log','open_food'].includes(action.kind) || mealEditorOpen || Object.keys(mealDrafts).length)return false;
+          const revision=window.Progressor?.interactionRevision?.();
+          showScreen('today');setActiveMode('today');
+          const loading=loadDay('today'),requestId=dayRequest;
+          await loading;
+          if(requestId!==dayRequest || activeMode!=='today' || !screenToday?.classList.contains('active') || mealEditorOpen || (revision!==undefined && revision!==window.Progressor?.interactionRevision?.()))return false;
+          const target=document.getElementById(action.kind==='food_goal'?'food-context-settings':action.kind==='open_food'?'card-week':'card-today-meals');
+          if(!target)return false;
+          if(action.kind==='food_goal')target.open=true;
+          target.style.scrollMarginTop='calc(var(--progressor-bar-height) + 16px)';target.setAttribute('tabindex','-1');target.focus({preventScroll:true});
+          target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});
+          return true;
+        }
       };
       function showScreen(name) {
         screenToday?.classList.toggle("active", name === "today");
