@@ -2635,7 +2635,7 @@ def _build_stats_workbook(
     ws_meals = wb.create_sheet("Приёмы пищи")
     ws_meals.append([
         "Дата",
-        "Время",
+        "Добавлено",
         "Калории",
         "Белки",
         "Жиры",
@@ -2648,7 +2648,7 @@ def _build_stats_workbook(
         meal_time = ""
         if created_at:
             try:
-                meal_time = datetime.fromisoformat(created_at).strftime("%H:%M:%S")
+                meal_time = datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 meal_time = created_at
         ws_meals.append([
@@ -2665,7 +2665,7 @@ def _build_stats_workbook(
     ws_meals.freeze_panes = "A2"
     for col, width in {
         "A": 12,
-        "B": 10,
+        "B": 22,
         "C": 12,
         "D": 10,
         "E": 10,

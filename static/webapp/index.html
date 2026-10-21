@@ -563,7 +563,7 @@
       .meal-editor-card, .pay-modal-card { max-height: calc(var(--visible-height, 100svh) - 28px); overflow: auto; overscroll-behavior: contain; }
       .meal-editor-card { display: flex; flex-direction: column; overflow: hidden; }
       .meal-editor-list { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-      .meal-item-name, .meals-table td { overflow-wrap: anywhere; }
+      .meal-item-name, .meals-table td, .meals-table th { overflow-wrap: anywhere; }
       #meal-editor-status { min-height: 20px; margin: 4px 0; }
       .meal-editor-header { flex-shrink: 0; }
       @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
@@ -1569,7 +1569,7 @@
           } else {
             todayMealsEl.innerHTML = `
               <table class="meals-table">
-                <thead><tr><th>Время</th><th>Блюдо</th><th>КБЖУ</th></tr></thead>
+                <thead><tr><th>Добавлено</th><th>Блюдо</th><th>КБЖУ</th></tr></thead>
                 <tbody>
                   ${meals
                     .map((meal) => {
@@ -1577,7 +1577,7 @@
                         ? meal.items.map((it) => `<div class="meal-items-line">${escapeHtml(it.name)}${it.grams ? ` — ${fmt(it.grams, 0)} г` : ""} (К ${fmt(it.kcal,0)}, Б ${fmt(it.protein,0)}, Ж ${fmt(it.fat,0)}, У ${fmt(it.carbs,0)})</div>`).join("")
                         : '<div class="meal-items-line">Без детализации блюда</div>';
                       const editBtn = meal.id ? `<button class="pill meal-edit-btn" type="button" data-edit-meal-id="${meal.id}">✏️</button>` : "";
-                      return `<tr><td>${escapeHtml(meal.time || "—")} ${editBtn}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
+                      return `<tr><td>${escapeHtml(meal.recorded_display || meal.time || "—")} ${editBtn}</td><td>${itemLines}</td><td>К ${fmt(meal.kcal,0)} · Б ${fmt(meal.protein,0)} · Ж ${fmt(meal.fat,0)} · У ${fmt(meal.carbs,0)}</td></tr>`;
                     })
                     .join("")}
                 </tbody>
@@ -1685,7 +1685,7 @@
           }).join("") : '<div class="hint">Без детализации блюд.</div>';
 
           return `<div class="meal-block">
-            <h4>${escapeHtml(meal.time || "—")} · К ${fmt(meal.kcal,0)} / Б ${fmt(meal.protein,0)} / Ж ${fmt(meal.fat,0)} / У ${fmt(meal.carbs,0)}</h4>
+            <h4>Добавлено ${escapeHtml(meal.recorded_display || meal.time || "—")} · К ${fmt(meal.kcal,0)} / Б ${fmt(meal.protein,0)} / Ж ${fmt(meal.fat,0)} / У ${fmt(meal.carbs,0)}</h4>
             ${itemHtml}
           </div>`;
         }).join("");
