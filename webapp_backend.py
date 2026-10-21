@@ -206,6 +206,59 @@ def progressor_preferences(user_id:int=Depends(get_verified_user_id)):
     from progressor_preferences import get_settings
     return get_settings(DB_PATH,user_id)
 
+
+def _next_meal_access(user_id):
+    # Read the native owner's current access before the separate control call.
+    # This tool neither consumes the analysis allowance nor touches meal rows.
+    from progressor_client import bundle_until
+    from contextlib import closing
+    with closing(get_conn()) as conn:
+        user=conn.execute('SELECT * FROM users WHERE telegram_id=?',(user_id,)).fetchone()
+        if not user:raise HTTPException(403,'Сначала откройте Food из своего бота.')
+        try:
+            premium=bool(user['is_premium'] and user['premium_until'] and billing.utc_datetime(user['premium_until'])>billing.utc_datetime())
+            trial=bool(user['trial_until'] and billing.utc_datetime(user['trial_until'])>billing.utc_datetime()
+                       and (user['trial_used_count'] or 0)<billing.settings(conn)['trial_limit'])
+        except (ValueError,TypeError):premium=trial=False
+        reset=conn.execute('SELECT revision FROM progressor_food_resets WHERE user_id=?',(user_id,)).fetchone()
+        revision=reset['revision'] if reset else 0
+    if not premium and not trial and not bundle_until(DB_PATH,user_id):
+        raise HTTPException(403,'Нужен действующий доступ Food. Другие продукты для выбора еды не требуются.')
+    return revision
+
+
+async def _next_meal_proxy(user_id,operation=None):
+    revision=await asyncio.to_thread(_next_meal_access,user_id)
+    from progressor_client import call
+    body={'user_id':str(user_id),'data_reset_revision':revision}
+    if operation is not None:body['operation']=operation
+    try:
+        result=await call('food','/internal/v1/connections/next-meal',body,timeout=1.5)
+        current_revision=await asyncio.to_thread(_next_meal_access,user_id)
+        if current_revision!=revision:raise HTTPException(409,'Данные Food очищены. Обновите варианты.')
+        if (not isinstance(result,dict) or result.get('owner_subject')!=str(user_id)
+                or result.get('data_reset_revision')!=revision):raise ValueError('invalid_owner_or_reset')
+        return result
+    except HTTPException:raise
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code==409:
+            raise HTTPException(409,'Выбор или настройки изменились. Обновите варианты; съеденная еда не менялась.')
+        raise HTTPException(503,'Выбор следующей еды пока недоступен. Записывать съеденное можно как обычно.')
+    except Exception:
+        raise HTTPException(503,'Выбор следующей еды пока недоступен. Записывать съеденное можно как обычно.')
+
+
+@app.get('/api/next-meal')
+async def next_meal_view(user_id:int=Depends(get_verified_user_id)):
+    return await _next_meal_proxy(user_id)
+
+
+@app.post('/api/next-meal')
+async def next_meal_change(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    if set(payload)!={'operation'} or not isinstance(payload['operation'],dict):
+        raise HTTPException(422,'Требуется явный выбор показанного варианта.')
+    return await _next_meal_proxy(user_id,payload['operation'])
+
 @app.post('/api/integrations/timezone')
 def integration_timezone(payload:dict,user_id:int=Depends(get_verified_user_id)):
     from progressor_timezone import change

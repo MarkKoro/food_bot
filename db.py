@@ -15,6 +15,8 @@ _db_path = Path(os.getenv("DB_PATH", "data/food_bot.sqlite3")).expanduser()
 DB_PATH = str(_db_path if _db_path.is_absolute() else BASE_DIR / _db_path)
 
 
+FOOD_RESET_PROTOCOL = 1
+
 async def create_tables(db: aiosqlite.Connection) -> int:
     """Создаём все нужные таблицы, если их ещё нет."""
     await db.execute("PRAGMA busy_timeout=30000")
@@ -147,6 +149,7 @@ async def create_tables(db: aiosqlite.Connection) -> int:
     await db.executescript(PROGRESSOR_PREFERENCES_SCHEMA)
     from goal_preview import SCHEMA as GOAL_PREVIEW_SCHEMA
     await db.executescript(GOAL_PREVIEW_SCHEMA)
+    await db.execute('CREATE TABLE IF NOT EXISTS progressor_food_resets(user_id INTEGER PRIMARY KEY,revision INTEGER NOT NULL)')
     await db.execute("BEGIN IMMEDIATE")
     # Миграции: добавляем новые столбцы в users, если их ещё нет
     cur = await db.execute("PRAGMA table_info(users)")
@@ -342,6 +345,21 @@ async def grant_active_promotion(
 
 
 async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
+    await db.execute('SAVEPOINT food_clear_data')
+    try:
+        await _purge_user_data(db,user_id)
+    except BaseException:
+        await db.execute('ROLLBACK TO food_clear_data')
+        await db.execute('RELEASE food_clear_data')
+        raise
+    await db.execute('RELEASE food_clear_data')
+    await db.commit()
+
+
+async def _purge_user_data(db: aiosqlite.Connection, user_id: int) -> None:
+    # Same owner transaction as the existing clear-data operation. Retain this
+    # monotonic metadata with the retained paid account; it is not food history.
+    await db.execute('INSERT INTO progressor_food_resets VALUES(?,1) ON CONFLICT(user_id) DO UPDATE SET revision=revision+1',(user_id,))
     tables_with_user_id = [
         "meals",
         "goals",
@@ -366,8 +384,6 @@ async def purge_user(db: aiosqlite.Connection, user_id: int) -> None:
     await db.execute("UPDATE users SET last_menu_message_id=NULL WHERE telegram_id=?", (user_id,))
     await db.execute("DELETE FROM bot_state WHERE user_id=?", (user_id,))
     await db.execute("DELETE FROM invites WHERE referrer_id = ? OR invited_id = ?", (user_id, user_id))
-    await db.commit()
-
 async def set_premium_until(
     db: aiosqlite.Connection, user_id: int, premium_until: datetime
 ) -> None:

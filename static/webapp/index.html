@@ -632,6 +632,13 @@
       </div>
 
       <div id="progressor-inline-host" hidden></div>
+      <details class="card next-meal-choice" id="next-meal-choice">
+        <summary>Что выбрать на следующий приём</summary>
+        <p class="hint">Это ваш план на сегодня по времени Food (Москва). Выбор не добавляет еду в дневник. Когда поедите, отправьте фото или описание боту как обычно.</p>
+        <div data-next-meal-content></div>
+        <p data-next-meal-status role="status" aria-live="polite"></p>
+        <div data-next-meal-actions></div>
+      </details>
       <details class="card food-context-settings" id="food-context-settings">
         <summary>Профиль и напоминания</summary>
         <p class="hint">Ответы Food используются первыми. Недостающие поля можно взять из доступных разделов с вашим согласием.</p>
@@ -2406,5 +2413,6 @@ function setActiveAnalyticsPreset(range) {
     <script src="/webapp/nutrients.v1.js"></script>
     <script src="/webapp/subscriptions.v1.js"></script>
     <script src="/webapp/progressor-settings.v1.js"></script>
+    <script src="/webapp/next-meal.v1.js"></script>
 </body>
 </html>
