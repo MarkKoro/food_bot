@@ -373,8 +373,9 @@ class AuditTest(unittest.TestCase):
                     await bot.admin_setting_input(update,ctx)
                 self.assertEqual(billing.plans()['m1']['price_stars'],300)
                 async def first(update,ctx):
-                    ctx.user_data['pending_meal']={'photo_file_id':'abc','extras':{'portion':'200 г'}}
+                    ctx.user_data['pending_meal']={'photo_file_id':'abc','chat_id':99,'photo_msg_id':203,'source_message_at':time.time(),'extras':{'portion':'200 г'}}
                     ctx.user_data['state']='await_meal_extras_menu'
+                    await bot._checkpoint_photo(ctx,99)
                 await bot.persistent_handler(first)(update,ctx)
                 second=SimpleNamespace(bot_data={'db':conn},user_data={},chat_data={})
                 async def restored(update,ctx):

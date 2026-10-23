@@ -1,5 +1,7 @@
 # Instructions for coding agents
 
+Native Food recovery: read [docs/PHOTO_RECOVERY.md](docs/PHOTO_RECOVERY.md) before changing photo/text/voice analysis, bot_state saves, reset/purge, cache publication, billing save or retry UX. Preserve the exact owner/source/token/reset transaction boundaries, six-hour bounded metadata, explicit Resume/Cancel and ordinary one-step camera path. Canonical ai_cache stays identical to Core and all three mirrors; trusted publish_if is checked inside its own write transaction. Never restore old work after purge or infer a meal from unanalyzed input.
+
 This repository participates in the Progressor ecosystem. Before changing auth, database schema, user identity, meal/workout/intake writes, or the WebApp entry point, read [the integration contract](docs/PROGRESSOR_INTEGRATION.md).
 
 - Preserve the independent food bot/API/database. Core downtime must not block native domain operations. Do not introduce synchronous Core calls into write transactions.

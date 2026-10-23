@@ -361,13 +361,21 @@ def meal_is_saved(user_id, source_key):
         return bool(conn.execute('SELECT 1 FROM meals WHERE user_id=? AND source_key=?',(user_id,source_key)).fetchone())
 
 
-def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", admin=False, cost=None, day=None):
+def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", admin=False, cost=None, day=None, _attempt_token=None, _photo_draft=None, _expected_reset_revision=None):
     totals = validate_totals(totals)
     charge = 0
     with connection(write=True) as conn:
+        import photo_recovery
+        # Trusted outer native action epoch, never a public request argument.
+        # Serialize against purge_user before requests, meals or credit writes.
+        if _expected_reset_revision is not None:
+            if (type(_expected_reset_revision) is not int or _expected_reset_revision < 0 or
+                    photo_recovery.epoch(conn, user_id) != _expected_reset_revision):
+                raise photo_recovery.DraftConflict()
         row = conn.execute("SELECT id FROM meals WHERE user_id=? AND source_key=?",(user_id,source_key)).fetchone()
         if row:
             return row[0]
+        photo_recovery.check_commit(conn, user_id, source_key, _photo_draft)
         conn.execute("INSERT OR IGNORE INTO users(telegram_id) VALUES (?)",(user_id,))
         if kind:
             mode,charge=check_meal_budget(conn,user_id,mode=mode,admin=admin,cost=cost,consume=True)
@@ -376,4 +384,15 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
         cur = conn.execute("INSERT INTO meals(user_id,date,kcal,protein,fat,carbs,raw_json,source_key) VALUES (?,?,?,?,?,?,?,?)",
                            (user_id,day or datetime.now().date().isoformat(),totals["kcal"],totals["protein_g"],totals["fat_g"],totals["carbs_g"],raw_json,source_key))
         nutrients.save_automatic(conn, cur.lastrowid, raw_json)
+        if _attempt_token is not None:
+            # Internal native-handler token, never a request-body field. The
+            # meal is the known success boundary: close only this owner's
+            # actual analysis lease in the SAME commit, before any Telegram
+            # acknowledgement can be lost. Never release by subject alone.
+            attempt = conn.execute('SELECT subject,scope FROM progressor_ai_attempts WHERE token=?', (_attempt_token,)).fetchone()
+            if not attempt or attempt['subject'] != str(user_id) or attempt['scope'] != 'food_analysis':
+                raise ValueError('Meal analysis attempt does not belong to this action')
+            conn.execute('UPDATE progressor_ai_attempts SET finished=?,successful=1 WHERE token=? AND subject=? AND scope=? AND finished IS NULL',
+                         (time.time(), _attempt_token, str(user_id), 'food_analysis'))
+        photo_recovery.complete(conn, user_id, source_key, _photo_draft, meal_id=cur.lastrowid)
         return cur.lastrowid

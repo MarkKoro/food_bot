@@ -106,20 +106,30 @@ class PhotoQuality(unittest.TestCase):
         from unittest.mock import AsyncMock
         from progressor_ai_cache import purge
         with tempfile.TemporaryDirectory() as folder,patch.object(bot,'DB_PATH',str(Path(folder)/'food.db')):
+            import sqlite3
+            from contextlib import closing
+            with closing(sqlite3.connect(bot.DB_PATH)) as connection, connection:
+                connection.execute('CREATE TABLE progressor_food_resets(user_id INTEGER PRIMARY KEY,revision INTEGER NOT NULL)')
             provider=AsyncMock(return_value=read_response(answer(recognized())))
             async def run():
                 async def owned(uid,text):
                     marker=bot._food_ai_action.set((uid,asyncio.current_task()))
+                    reset=bot._food_ai_reset_revision.set(0)
                     try:return await bot.analyze_food_text(text)
-                    finally:bot._food_ai_action.reset(marker)
+                    finally:
+                        bot._food_ai_reset_revision.reset(reset)
+                        bot._food_ai_action.reset(marker)
                 with patch.object(bot,'_food_model_request',provider):
                     a=await owned(1,'Рис 150 г');self.assertNotIn('_progressor_cache_hit',a)
                     b=await owned(1,'Рис 150 г');self.assertTrue(b.cache_hit);self.assertEqual(provider.await_count,1)
                     await owned(2,'Рис 150 г');await owned(1,'Рис 200 г');self.assertEqual(provider.await_count,3)
                     purge(bot.DB_PATH,1);await owned(1,'Рис 150 г');self.assertEqual(provider.await_count,4)
                     marker=bot._food_ai_action.set((1,asyncio.current_task()))
+                    reset=bot._food_ai_reset_revision.set(0)
                     try:
                         c=await bot.analyze_food_photo(picture());d=await bot.analyze_food_photo(picture())
                         self.assertNotIn('_progressor_cache_hit',c);self.assertTrue(d.cache_hit);self.assertEqual(provider.await_count,5)
-                    finally:bot._food_ai_action.reset(marker)
+                    finally:
+                        bot._food_ai_reset_revision.reset(reset)
+                        bot._food_ai_action.reset(marker)
             asyncio.run(run())

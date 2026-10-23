@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from functools import wraps
 import billing
+import photo_recovery
 import asyncio
 import io
 import json
@@ -783,6 +784,10 @@ async def init_db(app):
     await create_tables(db)
     app.bot_data["db"] = db
     refresh_settings()
+    try:
+        await asyncio.to_thread(photo_recovery.sweep_expired, DB_PATH)
+    except Exception:
+        logger.exception('Photo metadata cleanup will retry')
     await asyncio.to_thread(billing.recover_telegram_events)
     app.bot_data["payment_recovery_task"] = asyncio.create_task(recover_payments_loop())
     logging.info("DB initialised at %s", DB_PATH)
@@ -791,6 +796,10 @@ async def init_db(app):
 async def recover_payments_loop():
     while True:
         await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(photo_recovery.sweep_expired, DB_PATH)
+        except Exception:
+            logger.exception('Photo metadata cleanup will retry')
         try:
             await asyncio.to_thread(billing.recover_telegram_events)
         except Exception:
@@ -891,7 +900,53 @@ async def build_main_keyboard(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> I
     db = get_db(ctx)
     has_tpl = await has_templates(db, user_id)
     mode = "admin" if is_admin(user_id) else "sub"
-    return kb_main(mode=mode, has_templates=has_tpl)
+    keyboard = kb_main(mode=mode, has_templates=has_tpl)
+    draft = await asyncio.to_thread(photo_recovery.read, DB_PATH, user_id)
+    if draft:
+        revision = draft['revision']
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('Продолжить фото', callback_data=f'photo_resume:{revision}'),
+             InlineKeyboardButton('Отменить фото', callback_data=f'photo_cancel:{revision}')],
+            *keyboard.inline_keyboard,
+        ])
+    saved = await asyncio.to_thread(photo_recovery.latest_saved, DB_PATH, user_id)
+    if saved:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton('Открыть сохранённый результат', callback_data=f"photo_resume:{saved['revision']}")],
+            *keyboard.inline_keyboard,
+        ])
+    return keyboard
+
+
+async def _checkpoint_photo(ctx, user_id):
+    value = ctx.user_data.get('pending_meal') or {}
+    ctx.user_data['pending_meal'] = await asyncio.to_thread(
+        photo_recovery.stage, DB_PATH, user_id, value, expected_reset=ctx.user_data.get('_food_state_epoch'))
+
+
+async def _show_saved_meal(update, ctx, user_id, meal_id):
+    def read_saved():
+        with billing.connection() as connection:
+            row = connection.execute('SELECT id,date,kcal,protein,fat,carbs FROM meals WHERE id=? AND user_id=?', (meal_id, user_id)).fetchone()
+            return dict(row) if row else None
+    row = await asyncio.to_thread(read_saved)
+    if not row:
+        await edit_menu_message(update, ctx, 'Запись уже недоступна. Откройте дневник.', await build_main_keyboard(ctx, user_id))
+        return
+    ctx.user_data['state'] = None
+    ctx.user_data['pending_meal'] = None
+    text = (f"Этот приём уже записан · {escape_md(str(row['date']))}\n\n"
+            f"Калории: ~{round(row['kcal'])} ккал\nБелки: ~{round(row['protein'])} г\n"
+            f"Жиры: ~{round(row['fat'])} г\nУглеводы: ~{round(row['carbs'])} г\n\n"
+            'Повторный расчёт и списание не нужны.')
+    ctx.user_data['progressor_last_meal'] = {'meal_id': row['id'], 'date': row['date'], 'text': text}
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton('Открыть запись', web_app=WebAppInfo(url=build_webapp_edit_meal_url(meal_date=row['date'], meal_id=row['id'])))],
+        [InlineKeyboardButton('Все нутриенты', callback_data=f"mealnut:{row['id']}:0")],
+        [InlineKeyboardButton('В меню', callback_data='main')],
+    ])
+    await edit_menu_message(update, ctx, text, keyboard)
+    await asyncio.to_thread(photo_recovery.acknowledge_saved, DB_PATH, user_id, meal_id)
 
 
 # ── Сервисные хелперы сообщений ───────────────────────
@@ -1186,6 +1241,8 @@ async def send_payment_block_notice(
         show_switch = True
 
     lines.append("Выберите, что сделать:")
+    if await asyncio.to_thread(photo_recovery.read, DB_PATH, update.effective_user.id):
+        lines.append('Фото сохранено не более чем на 6 часов. После восстановления доступа нажмите «Продолжить фото» в меню.')
 
     await edit_menu_message(
         update,
@@ -1359,7 +1416,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
     note = (extra_description or '').strip()[:2000]
     from progressor_ai_cache import get,put,key
     owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
-    request_key=key({'mode':'photo','model':VISION_MODEL,'detail':VISION_DETAIL,'prompt':FOOD_SYSTEM_PROMPT,'instructions':FOOD_USER_INSTRUCTIONS,'image_sha256':hashlib.sha256(image_bytes).hexdigest(),'note':note})
+    request_key=key({'mode':'photo','model':VISION_MODEL,'detail':VISION_DETAIL,'prompt':FOOD_SYSTEM_PROMPT,'instructions':FOOD_USER_INSTRUCTIONS,'image_sha256':hashlib.sha256(image_bytes).hexdigest(),'note':note,'owner_reset_revision':_food_ai_reset_revision.get()})
     cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
     if cached:
         from food_analysis import FoodAnalysisResult
@@ -1374,7 +1431,7 @@ async def analyze_food_photo(image_bytes: bytes, extra_description: str | None =
         # result, unreadable image, refusal, truncated answer or HTTP timeout.
         logging.info("food_vision_format_repair")
         result=await _food_model_request(VISION_MODEL, FOOD_SYSTEM_PROMPT_FALLBACK, user_message)
-    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
+    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600,publish_if=_food_cache_publish_if(uid))
     from food_analysis import FoodAnalysisResult
     return FoodAnalysisResult(result, cache_hit=False)
 
@@ -1416,14 +1473,14 @@ async def analyze_food_text(description: str) -> dict:
         raise FoodAnalysisError('Опишите один приём пищи и примерную порцию.')
     from progressor_ai_cache import get,put,key
     owner=_food_ai_action.get();uid=owner[0] if owner and owner[1] is asyncio.current_task() else None
-    request_key=key({'mode':'text','model':TEXT_MODEL,'prompt':TEXT_FOOD_SYSTEM_PROMPT,'instructions':TEXT_FOOD_USER_INSTRUCTIONS,'description':text})
+    request_key=key({'mode':'text','model':TEXT_MODEL,'prompt':TEXT_FOOD_SYSTEM_PROMPT,'instructions':TEXT_FOOD_USER_INSTRUCTIONS,'description':text,'owner_reset_revision':_food_ai_reset_revision.get()})
     cached=await asyncio.to_thread(get,DB_PATH,uid,'food_analysis',request_key) if uid else None
     if cached:
         from food_analysis import FoodAnalysisResult
         return FoodAnalysisResult(cached, cache_hit=True)
     result=await _food_model_request(TEXT_MODEL, TEXT_FOOD_SYSTEM_PROMPT,
         {"role": "user", "content": TEXT_FOOD_USER_INSTRUCTIONS + "\nFOOD_DESCRIPTION=" + json.dumps(text, ensure_ascii=False)})
-    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600)
+    if uid:await asyncio.to_thread(put,DB_PATH,uid,'food_analysis',request_key,result,21600,publish_if=_food_cache_publish_if(uid))
     from food_analysis import FoodAnalysisResult
     return FoodAnalysisResult(result, cache_hit=False)
 
@@ -1547,6 +1604,11 @@ async def show_main_menu(
         ]
     )
 
+    if await asyncio.to_thread(photo_recovery.read, DB_PATH, user_id):
+        lines.append('\nЕсть незавершённое фото. Его можно продолжить или отменить в течение 6 часов после отправки.')
+    elif await asyncio.to_thread(photo_recovery.latest_saved, DB_PATH, user_id):
+        lines.append('\nПредыдущий приём уже сохранился. Можно открыть результат без повторного расчёта.')
+
     if mode == "payg":
         lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
         lines.append(f"Баланс: {balance}₽.")
@@ -1644,6 +1706,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_menu_message(update, ctx, payg_topups_text(), kb_payg_topups())
         return
 
+    if await asyncio.to_thread(photo_recovery.read, DB_PATH, uid) or await asyncio.to_thread(photo_recovery.latest_saved, DB_PATH, uid):
+        await show_main_menu(update, ctx, notice=notice)
+        return
     goal = await get_goal(db, uid)
     if goal is None:
         await show_survey_offer(update, ctx)
@@ -2212,6 +2277,18 @@ from contextvars import ContextVar
 from functools import wraps
 from progressor_ai_guard import acquire as _ai_acquire, finish as _ai_finish, AttemptLimited
 _food_ai_action=ContextVar('food_ai_action',default=None)
+_food_ai_attempt_token=ContextVar('food_ai_attempt_token',default=None)
+_food_ai_reset_revision=ContextVar('food_ai_reset_revision',default=None)
+
+def _read_food_reset_revision(uid):
+    with photo_recovery.connection(DB_PATH, write=False) as connection:
+        return photo_recovery.epoch(connection, uid)
+
+def _food_cache_publish_if(uid):
+    # Capture before crossing to a thread. The shared helper checks using its
+    # OWN transaction connection, so purge and publication have one order.
+    expected = _food_ai_reset_revision.get()
+    return lambda connection: type(expected) is int and photo_recovery.epoch(connection, uid) == expected
 
 def _guard_food_ai(kind):
     def decorate(function):
@@ -2220,6 +2297,12 @@ def _guard_food_ai(kind):
             uid=update.effective_user.id
             if _food_ai_action.get()==(uid,asyncio.current_task()):
                 return await function(update,ctx,*args,**kwargs)
+            # Preserve the interaction's trusted epoch across voice→text and
+            # compression/provider awaits. A late operation cannot adopt a
+            # newer epoch after a user cleared data.
+            expected_reset = ctx.user_data.get('_food_state_epoch')
+            if type(expected_reset) is not int:
+                expected_reset = await asyncio.to_thread(_read_food_reset_revision, uid)
             try:
                 if kind!='goal':
                     pending=ctx.user_data.get('pending_meal') or {}
@@ -2229,18 +2312,29 @@ def _guard_food_ai(kind):
                     checked=await asyncio.to_thread(billing.preflight_meal,uid,source_key,mode=user.get('payment_mode','sub'),admin=is_admin(uid),cost=PAYG_COST_RUB)
                     if checked['existing_meal_id']:
                         if kind=='photo':
+                            try:
+                                await asyncio.to_thread(photo_recovery.retire_saved, DB_PATH, uid, source_key, photo_recovery.proof(pending))
+                            except photo_recovery.DraftConflict:
+                                pass  # An old receipt must not retire a newer draft.
                             ctx.user_data['pending_meal']=None
                             ctx.user_data['state']=None
-                        await edit_menu_message(update,ctx,'Этот приём уже записан. Повторный расчёт не нужен.',await build_main_keyboard(ctx,uid))
+                        await _show_saved_meal(update, ctx, uid, checked['existing_meal_id'])
                         return
                 token=await asyncio.to_thread(_ai_acquire,DB_PATH,uid,'food_goal' if kind=='goal' else 'food_analysis',
                                              hourly=6 if kind=='goal' else 18,daily=6 if kind=='goal' else 100,cooldown=15,success_cooldown=None if kind=='goal' else 0)
             except (AttemptLimited,billing.PaymentError) as exc:
+                if kind == 'photo':
+                    ctx.user_data['pending_meal'] = None
+                    ctx.user_data['state'] = None
                 await edit_menu_message(update,ctx,str(exc),await build_main_keyboard(ctx,uid))
                 return
             marker=_food_ai_action.set((uid,asyncio.current_task()))
+            attempt_marker=_food_ai_attempt_token.set(token)
+            reset_marker=_food_ai_reset_revision.set(expected_reset)
             try: return await function(update,ctx,*args,**kwargs)
             finally:
+                _food_ai_reset_revision.reset(reset_marker)
+                _food_ai_attempt_token.reset(attempt_marker)
                 _food_ai_action.reset(marker)
                 saved=await asyncio.to_thread(billing.meal_is_saved,uid,source_key) if kind!='goal' else False
                 await asyncio.to_thread(_ai_finish,DB_PATH,token,successful=saved)
@@ -2864,6 +2958,24 @@ async def export_stats_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pe
 
 # ── Обработка приёма пищи (общий helper) ─────────────-
 
+async def _photo_retry_available(update, ctx, pending):
+    """Offer old-photo controls only while that exact owner draft is current."""
+    uid = update.effective_user.id
+    try:
+        reference = photo_recovery.proof(pending)
+        current = await asyncio.to_thread(photo_recovery.read, DB_PATH, uid)
+        if (reference and current and current['revision'] == reference['revision'] and
+                current['reset_revision'] == reference['reset_revision'] and
+                current['source_key'] == f"photo:{pending.get('chat_id')}:{pending.get('photo_msg_id')}"):
+            return True
+    except photo_recovery.DraftConflict:
+        pass
+    ctx.user_data['pending_meal'] = None
+    ctx.user_data['state'] = None
+    await edit_menu_message(update, ctx, 'Это фото больше не ожидает расчёта: оно отменено, удалено или срок хранения истёк. Можно отправить новое фото.', await build_main_keyboard(ctx, uid))
+    return False
+
+
 @_guard_food_ai("photo")
 async def _process_meal_calculation(
     update: Update,
@@ -2888,6 +3000,15 @@ async def _process_meal_calculation(
             "Что-то пошло не так с фотографией. Попробуй отправить её ещё раз.",
             await build_main_keyboard(ctx, uid),
         )
+        return
+
+    try:
+        await _checkpoint_photo(ctx, uid)
+        pending = ctx.user_data['pending_meal']
+    except photo_recovery.DraftConflict as exc:
+        ctx.user_data['pending_meal'] = None
+        ctx.user_data['state'] = None
+        await edit_menu_message(update, ctx, str(exc), await build_main_keyboard(ctx, uid))
         return
 
     # Собираем текстовое описание из extras
@@ -2920,6 +3041,8 @@ async def _process_meal_calculation(
             raise FoodAnalysisError('Файл слишком большой')
     except Exception:
         logging.exception("failed to download photo for user %s", uid)
+        if not await _photo_retry_available(update, ctx, pending):
+            return
         ctx.user_data["state"] = "await_meal_extras_menu"
         await edit_menu_message(
             update,
@@ -2943,7 +3066,6 @@ async def _process_meal_calculation(
             has_subscription=has_subscription,
             subscription_until=subscription_until,
         )
-        await delete_user_message(update)
         ctx.user_data["state"] = None
         ctx.user_data["pending_meal"] = None
         return
@@ -2954,6 +3076,8 @@ async def _process_meal_calculation(
         totals = extract_totals(data)
     except Exception:
         logging.exception("analyze_food_photo failed for %s", uid)
+        if not await _photo_retry_available(update, ctx, pending):
+            return
         ctx.user_data["state"] = "await_meal_extras_menu"
         await edit_menu_message(
             update,
@@ -2976,10 +3100,19 @@ async def _process_meal_calculation(
 
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
-                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind=None if _analysis_was_cached(data) else "photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    source_key=f"photo:{chat_id}:{photo_msg_id}",kind=None if _analysis_was_cached(data) else "photo",mode=mode,admin=is_admin(uid),cost=PAYG_COST_RUB,
+                    _attempt_token=_food_ai_attempt_token.get(), _photo_draft=photo_recovery.proof(pending),
+                    _expected_reset_revision=_food_ai_reset_revision.get())
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
-        await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Повторите расчёт.",kb_meal_extras(extras))
+        if isinstance(exc, billing.PaymentError):
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
+            await edit_menu_message(update, ctx, str(exc), await build_main_keyboard(ctx, uid))
+        else:
+            if not await _photo_retry_available(update, ctx, pending):
+                return
+            await edit_menu_message(update,ctx,"Не удалось сохранить еду. Баланс не списан. Повторите расчёт.",kb_meal_extras(extras))
         return
 
     template_saved = False
@@ -3078,6 +3211,7 @@ async def _process_meal_calculation(
         msg,
         meal_keyboard,
     )
+    await asyncio.to_thread(photo_recovery.acknowledge_saved, DB_PATH, uid, meal_id)
 
 
 # ── Фото еды ─────────────────────────────────────────
@@ -3085,8 +3219,29 @@ async def _process_meal_calculation(
 async def _handle_image_message(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, photo_file_id: str
 ) -> None:
+    message = update.message
+    chat = message.chat
+    caption = (message.caption or '').strip()
+    extras = {'save_template': False}
+    if caption:
+        extras['portion' if _looks_like_portion(caption) else 'composition'] = caption
+    ctx.user_data['pending_meal'] = {
+        'photo_file_id': photo_file_id, 'photo_msg_id': message.message_id, 'chat_id': chat.id, 'extras': extras,
+        'source_message_at': message.date.timestamp() if isinstance(getattr(message, 'date', None), datetime) else time.time(),
+    }
+    ctx.user_data['state'] = 'await_meal_extras_menu'
+    try:
+        saved = await asyncio.to_thread(billing.meal_is_saved, update.effective_user.id, f'photo:{chat.id}:{message.message_id}')
+        if not saved:
+            await _checkpoint_photo(ctx, update.effective_user.id)
+    except photo_recovery.DraftConflict:
+        ctx.user_data['pending_meal'] = None
+        ctx.user_data['state'] = None
+        await edit_menu_message(update, ctx, 'Сначала продолжите или отмените сохранённое фото в меню.', await build_main_keyboard(ctx, update.effective_user.id))
+        return
     if not await ensure_subscription(update, ctx):
-        await delete_user_message(update)
+        ctx.user_data['pending_meal'] = None
+        ctx.user_data['state'] = None
         return
 
     existing = ctx.user_data.get("pending_meal")
@@ -3113,7 +3268,8 @@ async def _handle_image_message(
                 has_subscription=has_subscription,
                 subscription_until=subscription_until,
             )
-            await delete_user_message(update)
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
             return
         mode = "payg"
     else:
@@ -3126,42 +3282,27 @@ async def _handle_image_message(
                 has_subscription=has_subscription,
                 subscription_until=subscription_until,
             )
-            await delete_user_message(update)
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
             return
 
         mode = await require_access(update, ctx, consume=False, kind="photo")
         if not mode:
-            try:
-                await message.delete()
-            except Exception:
-                pass
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
             return
 
-    chat = message.chat
-
-    caption = ""
-    try:
-        caption = (message.caption or "").strip()
-    except Exception:
-        caption = ""
-
-    extras = {"save_template": False}
-    if caption:
-        # caption почти всегда “что это за еда”, а не “вес порции”
-        if _looks_like_portion(caption):
-            extras["portion"] = caption
-        else:
-            extras["composition"] = caption
-
-    # Сохраняем новую pending_meal, затирая старую
-    ctx.user_data["pending_meal"] = {
-        "photo_file_id": photo_file_id,
-        "photo_msg_id": message.message_id,
-        "chat_id": chat.id,
-        "extras": extras,
-    }
     ctx.user_data["pending_meal"]["trial_reserved"] = (mode == "trial")
     ctx.user_data["state"] = "await_meal_extras_menu"
+    try:
+        source_key = f"photo:{chat.id}:{message.message_id}"
+        if not await asyncio.to_thread(billing.meal_is_saved, update.effective_user.id, source_key):
+            await _checkpoint_photo(ctx, update.effective_user.id)
+    except photo_recovery.DraftConflict:
+        ctx.user_data['pending_meal'] = None
+        ctx.user_data['state'] = None
+        await edit_menu_message(update, ctx, 'Сначала продолжите или отмените сохранённое фото в меню.', await build_main_keyboard(ctx, update.effective_user.id))
+        return
 
     # Camera → ordinary Telegram photo → result. Caption is optional; the
     # existing clarification/retry menu appears only when analysis fails.
@@ -3218,7 +3359,8 @@ async def process_meal_description(
     try:
         meal_id = await asyncio.to_thread(billing.save_meal,uid,totals,json.dumps(data,ensure_ascii=False),
                     source_key=f"message:{update.effective_chat.id}:{update.message.message_id}",
-                    kind=None if _analysis_was_cached(data) else "voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB)
+                    kind=None if _analysis_was_cached(data) else "voice" if update.message.voice else "text",mode=pay_mode,admin=is_admin(uid),cost=PAYG_COST_RUB,
+                    _attempt_token=_food_ai_attempt_token.get(), _expected_reset_revision=_food_ai_reset_revision.get())
     except Exception as exc:
         logger.exception("Could not save meal for %s",uid)
         await edit_menu_message(update,ctx,str(exc) if isinstance(exc,billing.PaymentError) else "Не удалось сохранить еду. Баланс не списан. Отправьте сообщение повторно.",main_kb)
@@ -3460,7 +3602,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     extras = pending.get("extras") or {}
 
     if state == "await_meal_extras_menu":
-        await delete_user_message(update)
         cleaned = text.strip()
         if cleaned:
             # “3 яйца” — это состав, а “250 г” — это порция
@@ -3473,6 +3614,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ctx.user_data["pending_meal"] = pending
 
         ctx.user_data["state"] = "await_meal_extras_menu"
+        try:
+            await _checkpoint_photo(ctx, uid)
+        except photo_recovery.DraftConflict as exc:
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
+            await edit_menu_message(update, ctx, str(exc), await build_main_keyboard(ctx, uid))
+            return
+        await delete_user_message(update)
 
         # Обновляем меню уточнений
         chat_id = pending.get("chat_id") or update.effective_chat.id
@@ -3485,7 +3634,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if state in {"await_extra_portion", "await_extra_composition"}:
-        await delete_user_message(update)
 
         if state == "await_extra_portion":
             extras["portion"] = text
@@ -3495,6 +3643,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pending["extras"] = extras
         ctx.user_data["pending_meal"] = pending
         ctx.user_data["state"] = "await_meal_extras_menu"
+        try:
+            await _checkpoint_photo(ctx, uid)
+        except photo_recovery.DraftConflict as exc:
+            ctx.user_data['pending_meal'] = None
+            ctx.user_data['state'] = None
+            await edit_menu_message(update, ctx, str(exc), await build_main_keyboard(ctx, uid))
+            return
+        await delete_user_message(update)
 
         # Обновляем меню уточнений
         chat_id = pending.get("chat_id") or update.effective_chat.id
@@ -3717,7 +3873,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith(("gift_code:manage:","gift_code:delete:")) and not data.rsplit(":",1)[-1].isdigit():
         return
     db = get_db(ctx)
-    if data.startswith(("tpl_portion:","save_result_template","meal_extra_","survey_ans:","survey_skip:","gift_code:delete:","paychecks:sent:")):
+    if data.startswith(("tpl_portion:","save_result_template","meal_extra_","photo_resume:","photo_cancel:","survey_ans:","survey_skip:","gift_code:delete:","paychecks:sent:")):
         current_menu = ctx.chat_data.get("menu_message_id") or await get_last_menu_message_id(db,uid)
         if current_menu and query.message and query.message.message_id != current_menu:
             return
@@ -3767,6 +3923,31 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not await ensure_subscription(update, ctx):
+        return
+
+    if data.startswith(('photo_resume:', 'photo_cancel:')):
+        revision = data.split(':', 1)[1]
+        if not photo_recovery.valid_revision(revision):
+            return
+        draft = await asyncio.to_thread(photo_recovery.read, DB_PATH, uid)
+        if data.startswith('photo_cancel:'):
+            try:
+                await asyncio.to_thread(photo_recovery.cancel, DB_PATH, uid, revision)
+                notice = 'Фото отменено.'
+            except photo_recovery.DraftConflict:
+                notice = 'Это фото уже изменилось или недоступно.'
+            await show_main_menu(update, ctx, notice=notice)
+            return
+        if not draft or draft['revision'] != revision:
+            meal_id = await asyncio.to_thread(photo_recovery.saved, DB_PATH, uid, revision)
+            if meal_id:
+                await _show_saved_meal(update, ctx, uid, meal_id)
+            else:
+                await show_main_menu(update, ctx, notice='Это фото уже изменилось или срок его хранения истёк.')
+            return
+        ctx.user_data['pending_meal'] = photo_recovery.pending(draft)
+        ctx.user_data['state'] = 'await_meal_extras_menu'
+        await _process_meal_calculation(update, ctx)
         return
 
     if data == "pay_mode":
@@ -4179,6 +4360,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _process_meal_calculation(update, ctx)
     elif data == "meal_extra_cancel":
         pending = ctx.user_data.get("pending_meal") or {}
+        reference = photo_recovery.proof(pending)
+        if reference:
+            try:
+                await asyncio.to_thread(photo_recovery.cancel, DB_PATH, uid, reference['revision'])
+            except photo_recovery.DraftConflict:
+                pass
         chat_id = pending.get("chat_id")
         photo_msg_id = pending.get("photo_msg_id")
         if chat_id and photo_msg_id:
@@ -5014,17 +5201,25 @@ def persistent_handler(handler):
         # Food, profile and admin flows belong in a private chat.
         if update.effective_chat and update.effective_chat.type != "private":
             return
+        saved_state, reset_revision = await asyncio.to_thread(photo_recovery.load_state, DB_PATH, user.id)
+        if ctx.user_data.get('_loaded') and ctx.user_data.get('_food_state_epoch', reset_revision) != reset_revision:
+            ctx.user_data.clear()
         if not ctx.user_data.get("_loaded"):
-            with billing.connection() as conn:
-                row = conn.execute("SELECT data FROM bot_state WHERE user_id=?",(user.id,)).fetchone()
-            if row:
-                try:
-                    data = json.loads(row[0])
-                    if isinstance(data,dict):
-                        ctx.user_data.update(data)
-                except ValueError:
-                    logger.warning("Invalid saved conversation state for %s",user.id)
+            ctx.user_data.update(saved_state)
             ctx.user_data["_loaded"] = True
+        ctx.user_data['_food_state_epoch'] = reset_revision
+        active_photo = ctx.user_data.get('pending_meal')
+        if active_photo and 'photo_draft_revision' in saved_state:
+            try:
+                reference = photo_recovery.proof(active_photo)
+            except photo_recovery.DraftConflict:
+                reference = None
+            canonical_photo = saved_state.get('photo_draft')
+            if (not reference or not canonical_photo or reference['revision'] != canonical_photo['revision'] or
+                    reference['reset_revision'] != canonical_photo['reset_revision']):
+                ctx.user_data.pop('pending_meal', None)
+                if ctx.user_data.get('state') in photo_recovery.PHOTO_STATES:
+                    ctx.user_data['state'] = None
         refresh_settings()
         try:
             await handler(update,ctx)
@@ -5038,9 +5233,8 @@ def persistent_handler(handler):
                 except (TypeError,ValueError):
                     continue
                 data[key] = value
-            with billing.connection(write=True) as conn:
-                conn.execute("INSERT INTO bot_state VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data",
-                             (user.id,json.dumps(data,ensure_ascii=False,allow_nan=False)))
+            if not await asyncio.to_thread(photo_recovery.save_state, DB_PATH, user.id, json.loads(json.dumps(data, allow_nan=False)), reset_revision):
+                ctx.user_data.clear()  # A completed clear-data operation wins.
     return wrapped
 
 

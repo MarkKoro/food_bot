@@ -1,5 +1,31 @@
 # Work log
 
+## 2026-10-22 — fourth journey Food recovery candidate
+
+Isolated H01/H03 process-exit evidence confirmed lost first-photo state before
+finally and an active analysis lease after a durable meal commit. The candidate
+keeps one bounded six-hour metadata draft, explicit Resume/Cancel and the native
+one-step photo route. Exact owner/source/token completion shares the meal,
+nutrient, request and debit transaction. Known saved recovery opens the original
+owner KBJU/date without AI or another charge. Home/payment/start never auto-run
+the photo and do not leave a hidden clarification mode.
+
+Further private-DB counterfactuals proved old AI could republish Food cache after
+clear-data and text/voice could recreate a meal/request/debit. The candidate
+captures the existing native reset epoch before asynchronous analysis and
+checks final writes atomically. Canonical ai_cache adds only a trusted optional
+in-transaction publication predicate; root synchronizes canonical Core and all
+three mirrors. Invalidated photo exceptions show current native navigation,
+not stale retry controls. Bounded physical cleanup reuses the existing recovery
+loop and cannot skip payment reconciliation. See PHOTO_RECOVERY.md.
+
+This entry records prepared source, not deployment. Exact hashes, regressions,
+actual process exits, independent reviews and rollout/rollback receipts belong
+to the durable fourth-package journal. Tests use dummy providers/private DBs
+and deny external HTTP; no real Telegram, physical-device or paid behavior is
+claimed. No production data, server, Git or GitHub was changed in this isolated
+preparation.
+
 
 ## Selected native connections — prepared
 
