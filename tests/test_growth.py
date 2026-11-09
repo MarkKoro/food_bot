@@ -28,6 +28,7 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
         api.app.dependency_overrides[api.get_verified_user_id]=lambda:123
         self.client=TestClient(api.app);self.clock=patch.object(reminders,'datetime',Clock);self.clock.start()
         self.sender=SimpleNamespace(send_message=AsyncMock())
+        self.control=AsyncMock(return_value={'items':[self.item()]})
     async def asyncTearDown(self):
         self.client.close();api.app.dependency_overrides.clear();await self.conn.close();self.clock.stop()
         for p in self.patches:p.stop()
@@ -176,30 +177,136 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await db.get_goal(self.conn,123))
     async def test_duplicate_delivery_restart_and_daily_cap(self):
         prefs=self.optin();item=self.item()
-        self.assertTrue(await reminders.deliver(self.path,self.sender,item,prefs,'https://example.test/webapp/'))
-        self.assertFalse(await reminders.deliver(self.path,self.sender,item,prefs,'https://example.test/webapp/'))
+        self.assertTrue(await reminders.deliver(self.path,self.sender,item,prefs,'https://example.test/webapp/',control=self.control))
+        self.assertFalse(await reminders.deliver(self.path,self.sender,item,prefs,'https://example.test/webapp/',control=self.control))
         self.assertFalse(preferences.reserve(self.path,123,item['day'],'nutrient_review','other'))
         self.sender.send_message.assert_awaited_once()
+        self.control.assert_awaited_once()
     async def test_uncertain_delivery_is_never_retried(self):
         prefs=self.optin();self.sender.send_message.side_effect=TimeoutError('lost response')
-        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/'))
+        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control))
         self.sender.send_message.side_effect=None
-        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/'))
+        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control))
         self.sender.send_message.assert_awaited_once()
+        self.control.assert_awaited_once()
     async def test_rate_limit_known_failure_can_retry_blocked_disables(self):
         prefs=self.optin();self.sender.send_message.side_effect=RetryAfter(1)
-        await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/')
+        await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control)
         with closing(sqlite3.connect(self.path)) as conn:
             conn.execute('UPDATE progressor_food_deliveries SET retry_at=0.01');conn.commit()
         self.sender.send_message.side_effect=Forbidden('blocked')
-        await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/')
+        await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control)
         self.assertFalse(preferences.get_settings(self.path,123)['workout_enabled'])
     async def test_optout_race_and_core_outage_never_send(self):
         prefs=self.optin();preferences.save_preferences(self.path,123,False,False,'Europe/Moscow')
-        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/'))
+        self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control))
+        self.control.assert_not_awaited()
         self.optin();control=AsyncMock(side_effect=TimeoutError())
         self.assertEqual((await reminders.cycle(self.path,self.sender,'https://example.test/webapp/',control))[0],0)
         self.sender.send_message.assert_not_awaited()
+
+    async def test_core_revocation_while_native_menu_is_locked_skips_stale_reminder(self):
+        prefs = preferences.save_preferences(self.path, 123, True, True, 'Europe/Moscow')
+        old = self.item()
+        replacement = {
+            **self.item('nutrient_review'),
+            'delivery_key': 'food_sources_b12.v1:2026-10-08',
+        }
+        fresh = {**replacement, 'text': 'Current Food reminder'}
+        webapp_url = 'https://example.test/webapp/'
+        menu_lock = asyncio.Lock()
+        waiting_for_menu = asyncio.Event()
+        application = SimpleNamespace(bot_data={}, user_data={})
+        self.sender.send_message.return_value = SimpleNamespace(message_id=88)
+        self.sender.delete_message = AsyncMock()
+        ctx = SimpleNamespace(
+            application=application, bot_data={'db': self.conn}, bot=self.sender, chat_data={},
+        )
+        await db.set_last_menu_message_id(self.conn, 123, 77)
+        core_has_revoked = False
+        refresh_phases = []
+
+        async def core(source, path, body, **kwargs):
+            self.assertEqual((source, path), ('food', '/internal/v1/food-notifications'))
+            self.assertEqual(body['people'], [{
+                'user_id': '123',
+                'workout_enabled': True,
+                'nutrient_enabled': True,
+                'timezone': 'Europe/Moscow',
+                'enabled_at': prefs['enabled_at'],
+            }])
+            if waiting_for_menu.is_set():
+                refresh_phases.append((menu_lock.locked(), core_has_revoked))
+            return {'items': [fresh if core_has_revoked else old]}
+
+        async def send(uid, text, markup, *, prepare):
+            waiting_for_menu.set()
+            return await bot._progressor_scheduled_send(application, uid, text, markup, prepare=prepare)
+
+        control = AsyncMock(side_effect=core)
+        with patch.object(bot, '_menu_locks', {123: menu_lock}), patch('telegram.ext.CallbackContext', return_value=ctx):
+            async with menu_lock:
+                cycle = asyncio.create_task(reminders.cycle(self.path, self.sender, webapp_url, control, sender=send))
+                await asyncio.wait_for(waiting_for_menu.wait(), timeout=5)
+                control.assert_awaited_once()
+            core_has_revoked = True
+            self.assertEqual(await asyncio.wait_for(cycle, timeout=5), (0, 0))
+            self.sender.send_message.assert_not_awaited()
+            self.sender.delete_message.assert_not_awaited()
+            self.assertEqual(await db.get_last_menu_message_id(self.conn, 123), 77)
+
+            self.assertTrue(await reminders.deliver(
+                self.path, self.sender, replacement, prefs, webapp_url, send, control=control,
+            ))
+            self.assertFalse(await reminders.deliver(
+                self.path, self.sender, replacement, prefs, webapp_url, send, control=control,
+            ))
+        self.assertEqual(control.await_count, 3)
+        self.assertEqual(refresh_phases, [(True, True), (True, True)])
+        self.sender.send_message.assert_awaited_once()
+        self.assertEqual(self.sender.send_message.call_args.kwargs['text'], fresh['text'])
+        self.sender.delete_message.assert_awaited_once_with(chat_id=123, message_id=77)
+        self.assertEqual(await db.get_last_menu_message_id(self.conn, 123), 88)
+
+    async def test_busy_menu_leaves_room_for_a_new_candidate_next_cycle(self):
+        prefs = self.optin()
+        url = 'https://example.test/webapp/'
+        busy = AsyncMock(side_effect=reminders.NotificationDeferred)
+        self.assertFalse(await reminders.deliver(
+            self.path, self.sender, self.item(), prefs, url, busy, control=self.control,
+        ))
+        self.control.assert_not_awaited()
+        fresh = {**self.item(), 'delivery_key': 'workout_today.v1:updated'}
+        confirmed = AsyncMock(return_value={'items': [fresh]})
+        self.assertTrue(await reminders.deliver(
+            self.path, self.sender, fresh, prefs, url, control=confirmed,
+        ))
+        self.sender.send_message.assert_awaited_once()
+
+    async def test_recheck_requires_the_exact_candidate_and_recovers_after_outage(self):
+        prefs = self.optin()
+        item = self.item()
+        webapp_url = 'https://example.test/webapp/'
+        rejected = [
+            {'items': [{**item, 'user_id': '999'}]},
+            {'items': [{**item, 'kind': 'nutrient_review'}]},
+            {'items': [{**item, 'day': '2026-10-07'}]},
+            {'items': [{**item, 'delivery_key': 'different-event'}]},
+            {'items': [{**item, 'text': ''}]},
+            TimeoutError('Core unavailable'),
+        ]
+        control = AsyncMock(side_effect=[*rejected, {'items': [item]}])
+        for response in rejected:
+            with self.subTest(response=response):
+                self.assertFalse(await reminders.deliver(
+                    self.path, self.sender, item, prefs, webapp_url, control=control,
+                ))
+                self.sender.send_message.assert_not_awaited()
+        self.assertTrue(await reminders.deliver(
+            self.path, self.sender, item, prefs, webapp_url, control=control,
+        ))
+        self.sender.send_message.assert_awaited_once()
+
     async def test_weekly_review_cap_and_purge_owned_private_records(self):
         self.assertTrue(preferences.reserve(self.path,123,'2026-10-08','nutrient_review','week',now=1000000))
         self.assertFalse(preferences.reserve(self.path,123,'2026-10-09','nutrient_review','week2',now=1000000+86400))

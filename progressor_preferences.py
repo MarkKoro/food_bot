@@ -88,3 +88,13 @@ def delivery_status(path,user_id,day,status,retry_at=None):
         db.execute('UPDATE progressor_food_deliveries SET status=?,sent_at=?,retry_at=? WHERE user_id=? AND day=?',(status,time.time() if status=='sent' else None,retry_at,user_id,day))
         if status=='blocked':
             db.execute('UPDATE progressor_food_preferences SET workout_enabled=0,nutrient_enabled=0 WHERE user_id=?',(user_id,))
+
+
+def release_unsent(path,user_id,day,kind,key,stamp):
+    """Release this reservation only when no Telegram request was made."""
+    with closing(sqlite3.connect(path,timeout=5)) as db,db:
+        db.execute(
+            "DELETE FROM progressor_food_deliveries WHERE user_id=? AND day=? AND kind=? "
+            "AND delivery_key=? AND reserved_at=? AND status='reserved'",
+            (user_id,day,kind,key,stamp),
+        )

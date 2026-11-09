@@ -965,12 +965,14 @@ async def send_new_menu_message(ctx,chat_id,text,reply_markup=None,user_id=None)
 async def _progressor_render(update,ctx,text,markup):
     await edit_menu_message(update,ctx,text,markup)
 
-async def _progressor_scheduled_send(application,user_id,text,markup):
+async def _progressor_scheduled_send(application,user_id,text,markup,*,prepare=None):
     from telegram.ext import CallbackContext
     from progressor_bot import notification_preflight
     notification_preflight(application,user_id,'food')
     ctx=CallbackContext(application,chat_id=user_id,user_id=user_id)
-    await send_new_menu_message(ctx,user_id,text,markup,user_id=user_id)
+    async with _menu_locks.setdefault(user_id,asyncio.Lock()):
+        notification_preflight(application,user_id,'food')
+        return await _send_menu_unlocked(ctx,user_id,text,markup,user_id=user_id,prepare=prepare)
 
 async def _edit_menu_unlocked(
     update: Update,
@@ -1035,7 +1037,9 @@ async def _send_menu_unlocked(
     text: str,
     reply_markup=None,
     user_id: int | None = None,
-) -> None:
+    *,
+    prepare=None,
+) -> bool:
     db = get_db(ctx)
     uid = user_id or chat_id
     chat_data = ctx.chat_data
@@ -1043,14 +1047,23 @@ async def _send_menu_unlocked(
     if uid and not old_id:
         old_id = await get_last_menu_message_id(db, uid)
 
+    if prepare is not None:
+        text = await prepare()
+        if text is None:
+            return False
+        from progressor_bot import notification_preflight
+        notification_preflight(ctx.application,uid,'food')
+
     try:
         msg = await ctx.bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
-            parse_mode="Markdown",
+            parse_mode="Markdown" if prepare is None else None,
         )
     except BadRequest as e:
+        if prepare is not None:
+            raise
         logger.warning("send_message Markdown fallback in send_new_menu_message: %s", e)
         msg = await ctx.bot.send_message(
             chat_id=chat_id,
@@ -1065,6 +1078,7 @@ async def _send_menu_unlocked(
     chat_data["menu_message_id"] = msg.message_id
     if uid:
         await set_last_menu_message_id(db, uid, msg.message_id)
+    return True
 
 
 async def delete_menu_message(
@@ -5260,7 +5274,7 @@ def main() -> None:
     install_progressor(application, "food", DB_PATH,render=_progressor_render,back_callback='main',notify=lambda uid,text,kb:_progressor_scheduled_send(application,uid,text,kb))
     application.add_handler(CallbackQueryHandler(progressor_nutrient_page,pattern=r'^mealnut:'),group=-10)
     from progressor_notifications import install as install_reminders
-    install_reminders(application,DB_PATH,FOOD_WEBAPP_URL,sender=lambda uid,text,kb:_progressor_scheduled_send(application,uid,text,kb))
+    install_reminders(application,DB_PATH,FOOD_WEBAPP_URL,sender=lambda uid,text,kb,**options:_progressor_scheduled_send(application,uid,text,kb,**options))
     application.add_handler(CommandHandler("start", persistent_handler(cmd_start)))
     application.add_handler(CommandHandler("help", persistent_handler(cmd_help)))
     application.add_handler(CommandHandler("pay", persistent_handler(cmd_pay)))
