@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from datetime import date, datetime, timezone
+from urllib.parse import unquote_plus, urlsplit
 from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.error import Forbidden, RetryAfter
@@ -11,6 +12,24 @@ from progressor_preferences import opted_in, get_settings, reserve, release_unse
 from progressor_bot import NotificationDeferred
 
 log=logging.getLogger(__name__)
+
+REMINDER_ACTIONS = {
+    'post_workout': ('food_log', 'Открыть дневник питания'),
+    'weight_review': ('food_goal', 'Проверить цель питания'),
+    'weekly_plan': ('open_food', 'Открыть питание за неделю'),
+    'nutrient_review': ('open_food', 'Открыть питание за неделю'),
+}
+
+
+def reminder_markup(webapp_url, kind):
+    action, label = REMINDER_ACTIONS[kind]
+    url = urlsplit(webapp_url)
+    query = [field for field in url.query.split('&')
+             if unquote_plus(field.partition('=')[0]) != 'food_hint_action'] if url.query else []
+    query.append('food_hint_action=' + action)
+    launch_url = url._replace(query='&'.join(query)).geturl()
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, web_app=WebAppInfo(url=launch_url))]])
+
 
 def notification_person(user_id, preferences):
     return {
@@ -64,7 +83,7 @@ async def deliver(path,bot,item,pref,webapp_url,sender=None,*,control=call):
         if await asyncio.to_thread(eligible_person,path,item,pref)!=person:return None
         return text
 
-    markup=InlineKeyboardMarkup([[InlineKeyboardButton('Проверить питание',web_app=WebAppInfo(url=webapp_url))]])
+    markup=reminder_markup(webapp_url,item['kind'])
     try:
         if sender:
             sent=await sender(uid,item['text'],markup,prepare=prepare)
@@ -107,7 +126,8 @@ async def cycle(path,bot,webapp_url,control=call,after=0,sender=None):
         by_id={str(r['user_id']):r for r in rows}
         for item in response.get('items',[])[:50]:
             uid=item.get('user_id')
-            if uid not in by_id or item.get('kind') not in ('post_workout','nutrient_review','weekly_plan','weight_review'): continue
+            kind=item.get('kind')
+            if uid not in by_id or not isinstance(kind,str) or kind not in REMINDER_ACTIONS: continue
             if not isinstance(item.get('text'),str) or not 1<=len(item['text'])<=3500 or not isinstance(item.get('delivery_key'),str) or len(item['delivery_key'])>160: continue
             try: date.fromisoformat(item['day'])
             except (ValueError,TypeError,KeyError): continue

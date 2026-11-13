@@ -1059,6 +1059,18 @@
         eligible:()=>!!lastDayData && lastDayData.day===lastLoadedDateIso && document.getElementById('screen-today')?.classList.contains('active') && activeMode==='today' && lastLoadedDateIso===isoToday(),
         captureView:()=>mealEditorOpen || Object.keys(mealDrafts).length ? null : document.getElementById('screen-analytics')?.classList.contains('active') ? 'analytics' : document.getElementById('screen-subscription')?.classList.contains('active') ? 'subscription' : activeMode==='today' ? 'today' : null,
         restoreView:view=>{if(mealEditorOpen || Object.keys(mealDrafts).length || !['today','analytics','subscription'].includes(view))return false;showScreen(view);return true;},
+        focusAction:kind=>{
+          const destinations = {food_goal: 'food-context-settings', food_log: 'card-today-meals', open_food: 'card-week'};
+          if (!Object.hasOwn(destinations, kind)) return false;
+          const target = document.getElementById(destinations[kind]);
+          if (!target) return false;
+          if (kind === 'food_goal') target.open = true;
+          target.style.scrollMarginTop = 'calc(var(--progressor-bar-height) + 16px)';
+          target.setAttribute('tabindex', '-1');
+          target.focus({preventScroll: true});
+          target.scrollIntoView({behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start'});
+          return true;
+        },
         perform:async action=>{
           if(!['food_goal','food_log','open_food'].includes(action.kind) || mealEditorOpen || Object.keys(mealDrafts).length)return false;
           const revision=window.Progressor?.interactionRevision?.();
@@ -1066,12 +1078,7 @@
           const loading=loadDay('today'),requestId=dayRequest;
           await loading;
           if(requestId!==dayRequest || activeMode!=='today' || !screenToday?.classList.contains('active') || mealEditorOpen || (revision!==undefined && revision!==window.Progressor?.interactionRevision?.()))return false;
-          const target=document.getElementById(action.kind==='food_goal'?'food-context-settings':action.kind==='open_food'?'card-week':'card-today-meals');
-          if(!target)return false;
-          if(action.kind==='food_goal')target.open=true;
-          target.style.scrollMarginTop='calc(var(--progressor-bar-height) + 16px)';target.setAttribute('tabindex','-1');target.focus({preventScroll:true});
-          target.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});
-          return true;
+          return window.ProgressorDomain.focusAction(action.kind);
         }
       };
       function showScreen(name) {
@@ -1766,6 +1773,7 @@
           renderToday(stats, title, caption);
           updateDayReview(effectiveDate,requestId);
           storage.setItem(`day:${effectiveDate}`,JSON.stringify({ts:Date.now(),data:stats}));
+          return true;
         } catch (err) {
           console.error(err);
           dlog(err?.stack || String(err));
@@ -2319,8 +2327,22 @@ function setActiveAnalyticsPreset(range) {
       window.addEventListener("online",() => { if (mealEditorOpen) flushMealDrafts(); });
       window.addEventListener("pagehide",persistDrafts);
 
+      function takeFoodHintAction() {
+        const url = new URL(location.href);
+        const actions = url.searchParams.getAll("food_hint_action");
+        if (!actions.length) return null;
+        url.searchParams.delete("food_hint_action");
+        try {
+          history.replaceState(history.state, "", url.href);
+        } catch (_) {
+          return null;
+        }
+        return actions.length === 1 && ["food_goal", "food_log", "open_food"].includes(actions[0]) ? actions[0] : null;
+      }
+
       (async function init() {
 
+        const foodHintAction = takeFoodHintAction();
         const queryPayment = paymentQueryConfig();
         let forcePaymentScreen = false;
         try {
@@ -2336,6 +2358,13 @@ function setActiveAnalyticsPreset(range) {
           todayErrorEl.textContent = errMsg;
           dlog(errMsg);
           return;
+        }
+
+        const hintFocus = foodHintAction && !queryPayment ? new AbortController() : null;
+        if (hintFocus) {
+          for (const event of ["pointerdown", "keydown", "input", "change"]) {
+            document.addEventListener(event, () => hintFocus.abort(), {capture: true, signal: hintFocus.signal});
+          }
         }
 
         try {
@@ -2397,14 +2426,21 @@ function setActiveAnalyticsPreset(range) {
         setActiveAnalyticsPreset("7d");
         const initParams = new URLSearchParams(location.search);
         const dateFromQuery = initParams.get("date") || "";
+        const mealIdFromQuery = Number(initParams.get("edit_meal_id") || 0);
         if (/^\d{4}-\d{2}-\d{2}$/.test(dateFromQuery)) {
           setActiveMode("date");
           selectedISO = dateFromQuery;
           await loadDay("date", dateFromQuery);
         } else {
-          await loadDay("today");
+          const requestId = dayRequest + 1;
+          const loaded = await loadDay("today");
+          if (hintFocus && !hintFocus.signal.aborted && loaded && !mealIdFromQuery &&
+              requestId === dayRequest && activeMode === "today" && screenToday?.classList.contains("active") &&
+              !mealEditorOpen && !Object.keys(mealDrafts).length) {
+            window.ProgressorDomain.focusAction(foodHintAction);
+          }
         }
-        const mealIdFromQuery = Number(initParams.get("edit_meal_id") || 0);
+        hintFocus?.abort();
         if (mealIdFromQuery) openMealEditor(mealIdFromQuery);
         await loadHistory();
         await loadAdvancedStats("7d");

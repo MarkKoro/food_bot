@@ -1,5 +1,6 @@
 """Real owner API/SQLite and fake Telegram sender; no consumer/provider/charge."""
 import os,json,sqlite3,tempfile,unittest,asyncio
+import time
 from contextlib import closing
 from datetime import datetime,timezone
 from pathlib import Path
@@ -182,6 +183,35 @@ class FoodGrowth(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(preferences.reserve(self.path,123,item['day'],'nutrient_review','other'))
         self.sender.send_message.assert_awaited_once()
         self.control.assert_awaited_once()
+
+    async def test_delivered_reminder_opens_allowlisted_food_action(self):
+        from progressor_links import cache_settings, ensure_schema
+
+        ensure_schema(self.path)
+        cases = (
+            ('post_workout', 'food_log', 'Открыть дневник питания'),
+            ('weight_review', 'food_goal', 'Проверить цель питания'),
+            ('weekly_plan', 'open_food', 'Открыть питание за неделю'),
+            ('nutrient_review', 'open_food', 'Открыть питание за неделю'),
+        )
+        base = 'https://example.test/webapp/'
+        url = base + '?keep=a%20b&food_hint_action=old&keep=&%66ood_hint_action=duplicate#view'
+        for user, (kind, action, label) in enumerate(cases, 123):
+            with self.subTest(kind=kind):
+                await db.ensure_user(self.conn, user)
+                prefs = preferences.save_preferences(self.path, user, True, True, 'Europe/Moscow')
+                cache_settings(self.path, [{'user_id': user, 'preferences': {
+                    'revision': 1, 'weekly_plan': True, 'weight_notifications': True,
+                    'synced_at': time.time(),
+                }}])
+                item = {**self.item(kind), 'user_id': str(user), 'action': 'https://untrusted.test'}
+                control = AsyncMock(return_value={'items': [item]})
+                self.assertTrue(await reminders.deliver(self.path, self.sender, item, prefs, url, control=control))
+                markup = self.sender.send_message.call_args.kwargs['reply_markup']
+                button = markup.inline_keyboard[0][0]
+                self.assertEqual(button.text, label)
+                self.assertEqual(button.web_app.url, base + '?keep=a%20b&keep=&food_hint_action=' + action + '#view')
+
     async def test_uncertain_delivery_is_never_retried(self):
         prefs=self.optin();self.sender.send_message.side_effect=TimeoutError('lost response')
         self.assertFalse(await reminders.deliver(self.path,self.sender,self.item(),prefs,'https://example.test/webapp/',control=self.control))
