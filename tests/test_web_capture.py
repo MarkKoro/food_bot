@@ -39,6 +39,7 @@ class WebCapture(unittest.IsolatedAsyncioTestCase):
         self.model = AsyncMock(return_value=dict(ANALYSIS))
         self.speech = AsyncMock(return_value='рис сто пятьдесят грамм')
         self.patches = [patch.object(db, 'DB_PATH', self.path), patch.object(web_capture, 'DB_PATH', self.path),
+                        patch.object(web_capture, 'CAPTURE_USERS', {str(USER), str(USER + 1)}),
                         patch.object(web_capture, 'model_request', self.model), patch.object(web_capture, 'transcribe', self.speech)]
         for entry in self.patches:
             entry.start()
@@ -143,6 +144,17 @@ class WebCapture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rows('SELECT 1 FROM meals'), [])
         self.assertEqual(self.rows('SELECT 1 FROM requests'), [])
         self.assertEqual(self.credits(), 50)
+
+    async def test_rollout_list_hides_capture_from_everyone_else(self):
+        for listed, allowed in ((set(), False), ({str(USER + 5)}, False), ({'*'}, True)):
+            with patch.object(web_capture, 'CAPTURE_USERS', listed):
+                if allowed:
+                    self.assertTrue((await web_capture.capture(USER, RID, 'text', text='рис'))['created'])
+                else:
+                    with self.assertRaises(web_capture.CaptureError) as caught:
+                        await web_capture.capture(USER, RID, 'text', text='рис')
+                    self.assertEqual(caught.exception.status, 404)
+                    self.model.assert_not_awaited()
 
     async def test_invalid_inputs_are_rejected_before_any_attempt(self):
         cases = [('bad-id', 'text', {'text': 'рис'}, 400), (RID, 'photo', {'image': b''}, 400),

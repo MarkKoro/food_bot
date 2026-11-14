@@ -37,6 +37,8 @@ except ValueError:
     MAX_TOKENS = 9000
 PAYG_COST_RUB = 2
 ADMINS = {int(x) for x in (os.getenv('ADMINS') or os.getenv('ADMIN_IDS', '')).split(',') if x.strip()}
+# Staged rollout: empty is off, '*' is everyone, otherwise listed Telegram ids.
+CAPTURE_USERS = {v.strip() for v in os.getenv('FOOD_WEB_CAPTURE_USERS', '').split(',') if v.strip() == '*' or v.strip().isdecimal()}
 MAX_AUDIO_BYTES = 4 * 1024 * 1024
 MAX_TEXT_CHARS = 2000
 AUDIO_TYPES = {'audio/webm': 'voice.webm', 'audio/ogg': 'voice.ogg', 'audio/mp4': 'voice.m4a',
@@ -128,6 +130,8 @@ async def _analyze_text(user_id, revision, text):
 
 async def capture(user_id, request_id, kind, *, image=None, audio=None, content_type='', text=''):
     """Analyze one meal and save it. Returns {'meal_id','day','transcript','created'}."""
+    if '*' not in CAPTURE_USERS and str(user_id) not in CAPTURE_USERS:
+        raise CaptureError(404, 'not_available', 'Эта возможность пока недоступна.')
     if kind not in ('photo', 'voice', 'text') or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
         raise CaptureError(400, 'invalid_request', 'Некорректный запрос. Обновите страницу и повторите.')
     text = (text or '').strip()
