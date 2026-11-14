@@ -21,7 +21,7 @@ import re
 from typing import List, Dict, Any, Optional
 from urllib.parse import parse_qsl
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -193,6 +193,39 @@ def recent_meal_preview(payload:dict,user_id:int=Depends(get_verified_user_id)):
     from recent_meals import preview
     try:return preview(DB_PATH,user_id,payload['meal_id'],payload['portion'])
     except (ValueError,KeyError,TypeError) as error:raise HTTPException(409,str(error))
+
+async def _capture_body(request, limit):
+    # Bounded raw body: no multipart parser and no unbounded buffering.
+    declared = request.headers.get('content-length') or ''
+    if declared.isdecimal() and int(declared) > limit: raise HTTPException(413, 'Файл слишком большой')
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit: raise HTTPException(413, 'Файл слишком большой')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+async def _capture_meal(user_id, request_id, kind, **inputs):
+    import web_capture
+    try: result = await web_capture.capture(user_id, request_id, kind, **inputs)
+    except web_capture.CaptureError as error:
+        raise HTTPException(error.status, {'code': error.code, 'message': error.message})
+    meal = next((m for m in get_meals_for_user_day(user_id, result['day']) if m.get('id') == result['meal_id']), None)
+    return {'ok': True, 'meal_id': result['meal_id'], 'day': result['day'], 'created': result['created'], 'transcript': result['transcript'], 'meal': meal}
+
+@app.post('/api/meals/capture/photo')
+async def meal_capture_photo(request: Request, request_id: str = Query(...), note: str = Query('', max_length=2000), user_id: int = Depends(get_verified_user_id)):
+    import web_capture
+    return await _capture_meal(user_id, request_id, 'photo', image=await _capture_body(request, web_capture.MAX_IMAGE_BYTES), text=note)
+
+@app.post('/api/meals/capture/voice')
+async def meal_capture_voice(request: Request, request_id: str = Query(...), user_id: int = Depends(get_verified_user_id)):
+    import web_capture
+    return await _capture_meal(user_id, request_id, 'voice', audio=await _capture_body(request, web_capture.MAX_AUDIO_BYTES), content_type=request.headers.get('content-type', ''))
+
+@app.post('/api/meals/capture/text')
+async def meal_capture_text(payload: dict, user_id: int = Depends(get_verified_user_id)):
+    return await _capture_meal(user_id, payload.get('request_id'), 'text', text=payload.get('text') if isinstance(payload.get('text'), str) else '')
 
 @app.post('/api/meals/recent/confirm')
 def recent_meal_confirm(payload:dict,user_id:int=Depends(get_verified_user_id)):
