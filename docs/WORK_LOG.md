@@ -142,3 +142,15 @@ Fresh combined browser evidence on runtime-identical source A passed 58 regressi
 These are completed release gates, not proof of a completed deployment or activation. Before publication the four-database off-server restore-tested backup b5c3cc16befec2650b67afb5271210dc1bdb0e70d275b787c3011ff00442734b contains financial2 and owner-consent1; it does not establish next-meal readiness. Install through the existing coordinated updater with next-meal gate absent, verify the completed transaction, new actually running Food/Core services, fresh private Food reset projection, compatible current/updater/fallback and a new compatible backup. Activate next-meal-v1-ready only under both updater locks and then capture/restore-test a post-activation backup containing all three gates. Never remove persistent gates or restore databases over later user writes during ordinary code rollback.
 
 Food exposes an explicit next-meal qualitative choice using native verified owner/access and the signed Food-only Core control route. Choice does not log food or nutrients, spend an AI quota, create a shopping list or read Gym/Supply personal data. Keep the existing native clear-data operation atomic with its monotonic reset epoch and preserve paid account data.
+
+## Mini App meal capture — 2026-11-15, branch home-today (not published)
+
+`web_capture.py` and `/api/meals/capture/{photo,voice,text}` let the Mini App
+record a meal with the bot's own prompt, models, attempt guard, cache, reset
+epoch and billing. Source key is `web:<client uuid>`; a repeat returns the saved
+meal without a provider call or charge. Staged rollout:
+`FOOD_WEB_CAPTURE_USERS` (empty = off, ids, or `*`).
+
+Evidence: macOS/Python 3.12.10, 206 tests including 10 new ones with mocked
+providers. Not run: Playwright UI suites, a real provider request, physical
+devices. Voice text is analysed by TEXT_MODEL, as in the bot.
