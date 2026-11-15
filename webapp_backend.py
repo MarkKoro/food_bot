@@ -213,6 +213,13 @@ async def _capture_meal(user_id, request_id, kind, **inputs):
     meal = next((m for m in get_meals_for_user_day(user_id, result['day']) if m.get('id') == result['meal_id']), None)
     return {'ok': True, 'meal_id': result['meal_id'], 'day': result['day'], 'created': result['created'], 'transcript': result['transcript'], 'meal': meal}
 
+@app.post('/api/ask')
+async def ask_about_my_data(payload: dict, user_id: int = Depends(get_verified_user_id)):
+    import web_ask
+    try: return {'ok': True, **await web_ask.ask(user_id, payload.get('question') if isinstance(payload.get('question'), str) else '')}
+    except web_ask.AskError as error:
+        raise HTTPException(error.status, {'code': error.code, 'message': error.message})
+
 @app.post('/api/meals/capture/photo')
 async def meal_capture_photo(request: Request, request_id: str = Query(...), note: str = Query('', max_length=2000), user_id: int = Depends(get_verified_user_id)):
     import web_capture
