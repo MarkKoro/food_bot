@@ -19,7 +19,7 @@ import billing
 import photo_recovery
 from db import DB_PATH
 from food_analysis import (FoodAnalysisError, FoodFormatError, MAX_IMAGE_BYTES, SYSTEM_PROMPT, USER_IMAGE,
-                           USER_TEXT, image_mime, prepare_image, read_response, response_format)
+                           USER_TEXT, image_mime, prepare_image, read_response, reasoning_model, request_payload)
 from progressor_ai_cache import get as cache_get, key as cache_key, put as cache_put
 from progressor_ai_guard import AttemptLimited, acquire, finish
 
@@ -57,10 +57,9 @@ class CaptureError(Exception):
 
 
 async def model_request(model, system_prompt, user_message):
-    payload = {'model': model, 'messages': [{'role': 'system', 'content': system_prompt}, user_message],
-               'max_completion_tokens': MAX_TOKENS, 'temperature': 0, 'response_format': response_format(model)}
+    payload = request_payload(model, system_prompt, user_message, MAX_TOKENS)
     async with _semaphore:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0 if reasoning_model(model) else 60.0) as client:
             response = await client.post('https://api.openai.com/v1/chat/completions',
                                          headers={'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'}, json=payload)
             response.raise_for_status()

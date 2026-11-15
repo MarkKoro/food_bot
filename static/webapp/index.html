@@ -6,7 +6,7 @@
     <meta name="robots" content="noindex" />
     <title>FoodBot — статистика</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <script>try{if(localStorage.getItem('progressor.ui')==='2')document.documentElement.dataset.pgUi='2';}catch(e){}</script>
+    <script>try{var d=document.documentElement,l=localStorage;if(l.getItem('progressor.ui')==='2')d.dataset.pgUi='2';var t=l.getItem('progressor.theme');if(t)d.dataset.pgTheme=t;var s=l.getItem('progressor.scheme');if(s)d.dataset.pgScheme=s;}catch(e){}</script>
     <link rel="stylesheet" href="/webapp/ui2.v1.css" />
     <style>
       * {
@@ -954,6 +954,8 @@
         el.textContent += `${msg}\n`;
       }
 
+      // Axis labels: the page's own light tint, or the shared look's muted text colour.
+      const chartInk = () => document.documentElement.dataset.pgUi === '2' ? (getComputedStyle(document.documentElement).getPropertyValue('--pg-muted').trim() || '#6B7585') : '#cbd5f5';
       const todaySummaryEl = document.getElementById("today-summary");
       const todayMacrosEl = document.getElementById("today-macros");
       const todayHintEl = document.getElementById("today-hint");
@@ -1828,10 +1830,10 @@
             },
             scales: {
               x: {
-                ticks: { color: "#cbd5f5", font: { size: 10 } },
+                ticks: { color: chartInk(), font: { size: 10 } },
               },
               y: {
-                ticks: { color: "#cbd5f5", font: { size: 10 } },
+                ticks: { color: chartInk(), font: { size: 10 } },
               },
             },
           },
@@ -1865,10 +1867,10 @@
             },
             scales: {
               x: {
-                ticks: { color: "#cbd5f5", font: { size: 9 } },
+                ticks: { color: chartInk(), font: { size: 9 } },
               },
               y: {
-                ticks: { color: "#cbd5f5", font: { size: 10 } },
+                ticks: { color: chartInk(), font: { size: 10 } },
               },
             },
           },
@@ -1945,7 +1947,7 @@ function setActiveAnalyticsPreset(range) {
         analyticsChart = new Chart(ctx, {
           type: "line",
           data: { labels, datasets },
-          options: { responsive: true, interaction: { mode: "index", intersect: false }, scales: { y: { position: "left", ticks: { color: "#cbd5f5" } }, y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: "#cbd5f5" } }, x: { ticks: { color: "#cbd5f5", font: { size: 10 } } } } },
+          options: { responsive: true, interaction: { mode: "index", intersect: false }, scales: { y: { position: "left", ticks: { color: chartInk() } }, y1: { position: "right", grid: { drawOnChartArea: false }, ticks: { color: chartInk() } }, x: { ticks: { color: chartInk(), font: { size: 10 } } } } },
         });
       }
 

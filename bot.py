@@ -1411,11 +1411,10 @@ def _analysis_was_cached(data):
 
 
 async def _food_model_request(model, system_prompt, user_message):
-    payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, user_message],
-               "max_completion_tokens": FOOD_ANALYSIS_MAX_TOKENS, "temperature": 0,
-               "response_format": response_format(model)}
+    from food_analysis import request_payload, reasoning_model
+    payload = request_payload(model, system_prompt, user_message, FOOD_ANALYSIS_MAX_TOKENS)
     async with _OPENAI_SEM:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0 if reasoning_model(model) else 60.0) as client:
             resp = await client.post("https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json=payload)
             resp.raise_for_status()

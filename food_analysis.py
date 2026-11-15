@@ -85,7 +85,24 @@ Do not invent foods in blurred/hidden areas. Include visible foods and drinks
 across the whole image. Include a non-visible item only if explicitly described
 as consumed. Group repeated pieces of the same food; at most 16 items.
 Prefer explicit user grams/counts and readable label values. Otherwise estimate
-a typical portion and mark portion_basis=estimated, confidence=low or medium.
+the portion and mark portion_basis=estimated, confidence=low or medium.
+Estimate mass in this order, before any nutrient number:
+1) Find a size reference in the image: a dinner plate is usually 24-27 cm, a side
+plate 18-20 cm, a fork or tablespoon about 19-20 cm, a teaspoon 13-14 cm, a
+standard glass or mug 200-300 ml, a hand or a phone if visible. Judge how much
+of the plate each food covers and how high it is piled.
+2) Count discrete pieces (slices, dumplings, eggs, cutlets) and multiply by a
+typical piece mass instead of guessing one total.
+3) Use cooked mass for cooked foods; cooked grains and pasta weigh about 2.5-3
+times their dry mass. Do not report dry mass for a cooked dish.
+4) Add fat that is not visible as a separate item when the dish implies it:
+frying oil absorbed by fried food, butter in porridge or mash, dressing or
+mayonnaise in salads, oil on roasted vegetables. Use a modest typical amount
+and say so in note. Do not add it to boiled, steamed or plainly raw food.
+5) Split a composite plate into its components (garnish, meat, sauce, bread)
+and never count the same food twice, as an item and inside a mixed dish.
+A close-up without a reference is uncertain: keep typical single-serving
+masses, set confidence=low and name the missing reference in note.
 An image is not a measurement of mass or laboratory composition. Report major
 portion/preparation uncertainty in note. Oils, sauces, preparation and units matter.
 Each item: name (Russian), grams (consumed mass), kcal, protein_g, fat_g, carbs_g
@@ -119,11 +136,33 @@ class FoodAnalysisResult(dict):
         return self._cache_hit
 
 
+def reasoning_model(model):
+    return str(model or '').startswith('gpt-5')
+
+
+def request_payload(model, system_prompt, user_message, max_tokens):
+    """One chat-completions body for the bot and the Mini App.
+
+    The GPT-5 family rejects temperature and spends part of the completion
+    budget on hidden reasoning, so it gets low effort and a larger ceiling;
+    without that a long nutrient table would be cut off as a format error.
+    """
+    payload = {'model': model, 'messages': [{'role': 'system', 'content': system_prompt}, user_message],
+               'response_format': response_format(model)}
+    if reasoning_model(model):
+        payload['reasoning_effort'] = 'low'
+        payload['max_completion_tokens'] = max(int(max_tokens), 16000)
+    else:
+        payload['temperature'] = 0
+        payload['max_completion_tokens'] = int(max_tokens)
+    return payload
+
+
 def response_format(model):
     # gpt-4o-2024-05-13 predates schema support. Keep arbitrary environment
     # overrides on validated JSON mode rather than changing the owner's model.
     schema_supported = (model in ('gpt-4o', 'gpt-4o-mini') or
-                        model.startswith(('gpt-4o-2024-08', 'gpt-4o-2024-11', 'gpt-4o-mini-2024-07', 'gpt-4.1')))
+                        model.startswith(('gpt-4o-2024-08', 'gpt-4o-2024-11', 'gpt-4o-mini-2024-07', 'gpt-4.1', 'gpt-5')))
     if not schema_supported:
         return {'type': 'json_object'}
     number = {'type': 'number'}

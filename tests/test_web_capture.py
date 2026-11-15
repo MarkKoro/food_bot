@@ -170,3 +170,25 @@ class WebCapture(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RequestPayload(unittest.TestCase):
+    def test_older_models_keep_temperature_and_the_configured_ceiling(self):
+        from food_analysis import request_payload
+        body = request_payload('gpt-4o', 'sys', {'role': 'user', 'content': 'x'}, 9000)
+        self.assertEqual((body['temperature'], body['max_completion_tokens']), (0, 9000))
+        self.assertNotIn('reasoning_effort', body)
+        self.assertEqual(body['response_format']['type'], 'json_schema')
+
+    def test_gpt5_family_gets_low_effort_no_temperature_and_room_for_reasoning(self):
+        from food_analysis import request_payload
+        for model in ('gpt-5-mini', 'gpt-5.4-mini', 'gpt-5.6-terra'):
+            body = request_payload(model, 'sys', {'role': 'user', 'content': 'x'}, 9000)
+            self.assertNotIn('temperature', body, model)
+            self.assertEqual((body['reasoning_effort'], body['max_completion_tokens']), ('low', 16000), model)
+            self.assertEqual(body['response_format']['type'], 'json_schema', model)
+
+    def test_portion_guidance_is_part_of_the_shared_prompt(self):
+        from food_analysis import SYSTEM_PROMPT
+        for phrase in ('size reference', 'Count discrete pieces', 'cooked mass', 'not visible', 'never count the same food twice'):
+            self.assertIn(phrase, SYSTEM_PROMPT)
