@@ -154,3 +154,14 @@ meal without a provider call or charge. Staged rollout:
 Evidence: macOS/Python 3.12.10, 206 tests including 10 new ones with mocked
 providers. Not run: Playwright UI suites, a real provider request, physical
 devices. Voice text is analysed by TEXT_MODEL, as in the bot.
+
+## Shared Progressor look — 2026-11-15
+
+The page gained the shared light look (ui2), enabled per account by the Core
+session field `home` and remembered in localStorage `progressor.ui`. Rules are
+scoped to html[data-pg-ui="2"]; removing the flag returns the previous interface.
+The Core shell hides its top bar on such pages and shows one bottom tab bar.
+Evidence and limits are in the commit messages: Node suites and a desktop
+browser against canned answers only; Playwright, Linux Python suites on a
+workstation and physical Telegram devices were not run by the author. The
+coordinated updater ran each repository's own checks before switching.
