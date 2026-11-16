@@ -234,6 +234,18 @@ async def meal_capture_voice(request: Request, request_id: str = Query(...), use
 async def meal_capture_text(payload: dict, user_id: int = Depends(get_verified_user_id)):
     return await _capture_meal(user_id, payload.get('request_id'), 'text', text=payload.get('text') if isinstance(payload.get('text'), str) else '')
 
+@app.get('/api/water')
+def water_status(day:str|None=None,user_id:int=Depends(get_verified_user_id)):
+    import water
+    try:return water.status(DB_PATH,user_id,day)
+    except ValueError:raise HTTPException(422,'Некорректный день')
+
+@app.post('/api/water')
+def water_add(payload:dict,user_id:int=Depends(get_verified_user_id)):
+    import water
+    try:return water.add(DB_PATH,user_id,payload.get('delta_ml'))
+    except ValueError as error:raise HTTPException(400,str(error))
+
 @app.post('/api/meals/recent/confirm')
 def recent_meal_confirm(payload:dict,user_id:int=Depends(get_verified_user_id)):
     from recent_meals import confirm

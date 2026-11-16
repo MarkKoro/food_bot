@@ -376,7 +376,7 @@ async def _purge_user_data(db: aiosqlite.Connection, user_id: int) -> None:
 
     for table in tables_with_user_id:
         await db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
-    for table in ('progressor_ai_cache','progressor_link_cache','progressor_owner_commands','progressor_recent_intents','progressor_day_closure','progressor_evening_questions'):
+    for table in ('progressor_ai_cache','progressor_link_cache','progressor_owner_commands','progressor_recent_intents','progressor_day_closure','progressor_evening_questions','progressor_water'):
         cursor=await db.execute('SELECT 1 FROM sqlite_master WHERE name=?',(table,))
         if await cursor.fetchone():await db.execute(f'DELETE FROM {table} WHERE user_id=?',(str(user_id),))
 

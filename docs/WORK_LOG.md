@@ -165,3 +165,12 @@ Evidence and limits are in the commit messages: Node suites and a desktop
 browser against canned answers only; Playwright, Linux Python suites on a
 workstation and physical Telegram devices were not run by the author. The
 coordinated updater ran each repository's own checks before switching.
+
+## 2026-11-16 — Water counter and one-tap repeat
+
+`water.py`: one bounded counter per owner and diary day (`GET/POST /api/water`),
+target 30 ml per kg of reported weight, cleared with the owner's data. The ui2
+Today view shows the water row and a repeat button; both call the shared Core
+sheets. Repeat reuses the existing `/api/meals/recent` preview/confirm (no AI,
+no charge). Evidence: `tests/test_water.py`, full local suite, desktop browser
+against canned answers. Not run on a phone.

@@ -74,3 +74,7 @@ html[data-pg-ui="2"] .u2-macros span{font-size:12px}
 html[data-pg-ui="2"] .u2-bar{height:4px;border-radius:2px;background:rgba(6,49,28,.14);margin-top:8px;overflow:hidden}
 html[data-pg-ui="2"] .u2-bar i{display:block;height:100%;background:#06311C;border-radius:2px}
 html[data-pg-ui="2"] .u2-status{font-size:13px;color:var(--pg-muted,#6B7585);margin:-8px 0 12px;min-height:0}
+
+html[data-pg-ui="2"] .u2-water{display:flex;align-items:center;gap:8px;background:var(--pg-surface,#F3F4F7);border-radius:16px;padding:10px 12px;margin:10px 0;font-size:14px;font-weight:600}
+html[data-pg-ui="2"] .u2-water[hidden]{display:none}html[data-pg-ui="2"] .u2-water span{flex:1}
+html[data-pg-ui="2"] .u2-water button{border:0;font:inherit;font-size:13px;font-weight:600;padding:8px 12px;border-radius:12px;background:var(--pg-raise,#fff);color:var(--pg-text,#10131A);cursor:pointer}
