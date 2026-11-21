@@ -87,7 +87,7 @@
         return;
       }
       const t=plan.targets;
-      const names={food:'Food',supply:'Supply',gym:'Gym'};
+      const names={food:'Еда',supply:'БАДы',gym:'Тренировки'};
       const sources=[...new Set(Object.values(plan.provenance||{}).map(v=>v?.source).filter(Boolean))];
       status.textContent=`Ориентир: ${t.kcal} ккал · Б ${t.protein} г · Ж ${t.fat} г · У ${t.carbs} г. Обычная активность уже учтена. Источники: ${sources.map(s=>names[s]||s).join(', ')}. Сохранение заменит текущую цель.`;
       applyButton.hidden=false;

@@ -41,7 +41,7 @@ class NativeMealReply(unittest.IsolatedAsyncioTestCase):
         with patch.object(client,'configured',return_value=True),patch.object(client,'call',AsyncMock(return_value=data)):
             text=await extension(self.path,123,self.meal,totals,goal,date.today().isoformat())
             self.assertIn('800 ккал',text);self.assertIn('Б 60 г',text);self.assertIn('Рабочих подходов: 15',text)
-            self.assertNotIn('По дневнику Gym',await extension(self.path,123,self.meal,totals,goal,date.today().isoformat()))
+            self.assertNotIn('По дневнику тренировок',await extension(self.path,123,self.meal,totals,goal,date.today().isoformat()))
         with patch.object(client,'configured',return_value=True),patch.object(client,'call',AsyncMock(side_effect=TimeoutError())):
             self.assertIn('Нутриенты',await extension(self.path,123,self.meal,totals,goal,date.today().isoformat()))
     async def test_native_menu_reuses_persisted_id_and_cleanup_rate_limit_never_retries_accepted_send(self):
@@ -59,7 +59,7 @@ class NativeMealReply(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workout_text(value,totals,goal,day),'')
         value['activity']['workouts'][0]['session_complete']=True
         text=workout_text(value,totals,goal,day)
-        self.assertIn('Этот приём пищи уже входит в итог Food',text)
+        self.assertIn('Этот приём пищи уже входит в итог дня',text)
         self.assertIn('1500 ккал',text)
     async def test_owner_paid_grant_transaction_and_revocation_do_not_credit_gifts(self):
         # Gift access alone creates no payment evidence.

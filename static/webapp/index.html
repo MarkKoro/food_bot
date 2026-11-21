@@ -4,7 +4,7 @@
   <script data-progressor-source="food" src="./assets/progressor-bootstrap.v1.js"></script>
     <meta charset="utf-8" />
     <meta name="robots" content="noindex" />
-    <title>FoodBot — статистика</title>
+    <title>Еда — статистика</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <script>try{var d=document.documentElement,l=localStorage;if(l.getItem('progressor.ui')==='2')d.dataset.pgUi='2';var t=l.getItem('progressor.theme');if(t)d.dataset.pgTheme=t;var s=l.getItem('progressor.scheme');if(s)d.dataset.pgScheme=s;}catch(e){}</script>
     <link rel="stylesheet" href="/webapp/ui2.v1.css" />
@@ -637,14 +637,14 @@
       <div id="progressor-inline-host" hidden></div>
       <details class="card next-meal-choice" id="next-meal-choice">
         <summary>Что выбрать на следующий приём</summary>
-        <p class="hint">Это ваш план на сегодня по времени Food (Москва). Выбор не добавляет еду в дневник. Когда поедите, отправьте фото или описание боту как обычно.</p>
+        <p class="hint">Это ваш план на сегодня по московскому времени. Выбор не добавляет еду в дневник. Когда поедите, отправьте фото или описание боту как обычно.</p>
         <div data-next-meal-content></div>
         <p data-next-meal-status role="status" aria-live="polite"></p>
         <div data-next-meal-actions></div>
       </details>
       <details class="card food-context-settings" id="food-context-settings">
         <summary>Профиль и напоминания</summary>
-        <p class="hint">Ответы Food используются первыми. Недостающие поля можно взять из доступных разделов с вашим согласием.</p>
+        <p class="hint">Ответы из раздела «Еда» используются первыми. Недостающие поля можно взять из доступных разделов с вашим согласием.</p>
         <form>
           <label>Пол для расчёта<select name="sex_at_birth"><option value="">Не указан</option><option value="male">Мужской</option><option value="female">Женский</option></select></label>
           <label>Возраст<input name="age_years" type="number" min="1" max="110" step="1" inputmode="numeric" /></label>
@@ -756,14 +756,14 @@
             <h3 id="payment-amount">Сумма: —</h3>
             <p id="payment-kind" class="plan-description"></p>
             <div id="email-collect-card" class="email-collect-card" style="display:none;">
-              <div id="email-collect-title">Укажите email для отправки чека.</div>
+              <div id="email-collect-title">Укажите эл. почту для отправки чека.</div>
               <div id="email-saved-caption" class="hint" style="display:none;"></div>
               <div class="email-collect-row" id="email-input-row">
                 <input id="receipt-email-input" class="email-input" type="email" placeholder="example@mail.com" autocomplete="email" />
-                <button class="pill pill-secondary" id="btn-save-email">Сохранить email</button>
+                <button class="pill pill-secondary" id="btn-save-email">Сохранить почту</button>
               </div>
               <div class="email-collect-row" id="email-edit-row" style="display:none;">
-                <button class="pill pill-secondary" id="btn-change-email">Изменить email</button>
+                <button class="pill pill-secondary" id="btn-change-email">Изменить почту</button>
               </div>
               <div id="email-error" class="field-error"></div>
             </div>
@@ -782,7 +782,7 @@
       <section id="screen-subscription" class="screen">
         <div class="card">
           <h2>💳 Подписка и оплата</h2>
-          <p class="subscription-intro">Вы оплачиваете доступ к анализу питания по фото, голосу и тексту. Можно выбрать фиксированный тариф на срок или Pay-as-you-go с оплатой по фактическому использованию. Ниже коротко объяснили разницу, чтобы было проще выбрать подходящий вариант.</p>
+          <p class="subscription-intro">Вы оплачиваете доступ к анализу питания по фото, голосу и тексту. Можно выбрать фиксированный тариф на срок или оплату по факту — только за фактическое использование. Ниже коротко объяснили разницу, чтобы было проще выбрать подходящий вариант.</p>
 
           <div class="plan-card">
             <h3>⭐ Подписка (фиксированный срок)</h3>
@@ -799,13 +799,13 @@
           </div>
 
           <div class="plan-card">
-            <h3>➕ Pay-as-you-go</h3>
+            <h3>➕ Оплата по факту</h3>
             <p class="plan-description">Пополняете баланс и платите только за использованные запросы. Стоимость одного запроса — <span data-payg-cost>2</span> ₽ (фото/голос/текст). Подходит, если вы пользуетесь ботом нерегулярно и хотите платить только по факту.</p>
             <ul class="plan-list">
               <li>Списания идут за каждый анализ</li>
               <li>Пополнения: 60 / 100 / 200 / 400 ₽</li>
             </ul>
-            <div class="pay-actions"><button class="pill pill-primary" id="btn-open-payg-modal">Пополнить Pay-as-you-go</button></div>
+            <div class="pay-actions"><button class="pill pill-primary" id="btn-open-payg-modal">Пополнить баланс</button></div>
             <div class="pay-actions" id="payg-buttons" style="display:none;"></div>
             <div id="payg-loading" class="loading-note">Открываем счёт в боте…</div>
           </div>
@@ -820,7 +820,7 @@
           <h3>⭐ Оформление подписки</h3>
           <button class="pay-modal-close" id="sub-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите срок подписки и нажмите «Оплатить подписку». Откроется платёжная страница YooKassa в браузере. После успешной оплаты активируется доступ к выбранному тарифу, и в этом режиме не будет отдельного списания за каждый запрос.</p>
+        <p class="pay-modal-note">Выберите срок подписки и нажмите «Оплатить подписку». Откроется платёжная страница ЮKassa в браузере. После успешной оплаты активируется доступ к выбранному тарифу, и в этом режиме не будет отдельного списания за каждый запрос.</p>
         <div class="plan-controls">
           <label for="sub-plan-select" class="muted">Срок подписки</label>
           <select id="sub-plan-select" class="pill pill-secondary">
@@ -840,10 +840,10 @@
     <div id="payg-modal" class="pay-modal" aria-hidden="true">
       <div class="pay-modal-card">
         <div class="pay-modal-header">
-          <h3>➕ Пополнение Pay-as-you-go</h3>
+          <h3>➕ Пополнение баланса</h3>
           <button class="pay-modal-close" id="payg-modal-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Выберите сумму пополнения и перейдите к оплате. Откроется платёжная страница YooKassa в браузере, после оплаты сумма зачислится на баланс Pay-as-you-go. Далее с баланса будет списываться по <span data-payg-cost>2</span> ₽ за каждый запрос (фото/голос/текст).</p>
+        <p class="pay-modal-note">Выберите сумму пополнения и перейдите к оплате. Откроется платёжная страница ЮKassa в браузере, после оплаты сумма зачислится на баланс оплаты по факту. Далее с баланса будет списываться по <span data-payg-cost>2</span> ₽ за каждый запрос (фото/голос/текст).</p>
         <div class="pay-actions" id="payg-modal-buttons"></div>
       </div>
     </div>
@@ -863,10 +863,10 @@
     <div id="email-required-modal" class="pay-modal" aria-hidden="true">
       <div class="pay-modal-card">
         <div class="pay-modal-header">
-          <h3>📩 Email для чека</h3>
+          <h3>📩 Эл. почта для чека</h3>
           <button class="pay-modal-close" id="email-required-close" aria-label="Закрыть">×</button>
         </div>
-        <p class="pay-modal-note">Перед оплатой нужен email для отправки чека. Введите его один раз — дальше сможете оплачивать без этого шага.</p>
+        <p class="pay-modal-note">Перед оплатой нужна эл. почта для отправки чека. Введите его один раз — дальше сможете оплачивать без этого шага.</p>
         <div class="email-collect-row">
           <input id="email-required-input" class="email-input" type="email" placeholder="example@mail.com" autocomplete="email" />
         </div>
@@ -1158,7 +1158,7 @@
           const val = plan ? [plan.title, plan.price_rub] : [cfg.plan_id, "уточняется"];
           return { title: `Подписка ${val[0]}`, amount: `${val[1]} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
         }
-        return { title: "Пополнение PAYG", amount: `${cfg.rub} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
+        return { title: "Пополнение баланса", amount: `${cfg.rub} ₽`, description: "Оплата откроется во внешнем браузере для корректной работы всех способов оплаты." };
       }
 
       function savePendingPayment(data) {
@@ -1237,7 +1237,7 @@
         if (receiptEmailState.ready) {
           if (emailSavedCaption) {
             emailSavedCaption.style.display = "block";
-            emailSavedCaption.textContent = `Email для чека: ${receiptEmailState.email}`;
+            emailSavedCaption.textContent = `Почта для чека: ${receiptEmailState.email}`;
           }
           if (emailInput) emailInput.value = receiptEmailState.email;
           if (emailInputRow) emailInputRow.style.display = "none";
@@ -1728,7 +1728,7 @@
         const requestId = ++dayRequest;
         if (!tgInitData) {
           todayErrorEl.textContent =
-            "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
+            "Откройте приложение внутри Telegram. В обычном браузере данных Telegram нет.";
           return;
         }
 
@@ -2131,7 +2131,7 @@ function setActiveAnalyticsPreset(range) {
             }
           } catch (err) {
             if (paymentStatusEl) {
-              paymentStatusEl.textContent = String(err?.message || "Не удалось получить email").replace(/^HTTP \d+:\s*/, "");
+              paymentStatusEl.textContent = String(err?.message || "Не удалось получить эл. почту").replace(/^HTTP \d+:\s*/, "");
             }
           }
         }
@@ -2141,7 +2141,7 @@ function setActiveAnalyticsPreset(range) {
       btnSaveEmail?.addEventListener("click", async () => {
         const email = String(emailInput?.value || "").trim();
         if (!validateEmail(email)) {
-          if (emailError) emailError.textContent = "Введите корректный email.";
+          if (emailError) emailError.textContent = "Введите корректный адрес эл. почты.";
           setPaymentStep(1);
           return;
         }
@@ -2150,7 +2150,7 @@ function setActiveAnalyticsPreset(range) {
         try {
           await saveReceiptEmail(email);
         } catch (err) {
-          if (emailError) emailError.textContent = String(err?.message || "Не удалось сохранить email").replace(/^HTTP \d+:\s*/, "");
+          if (emailError) emailError.textContent = String(err?.message || "Не удалось сохранить эл. почту").replace(/^HTTP \d+:\s*/, "");
         } finally {
           btnSaveEmail.disabled = false;
         }
@@ -2167,7 +2167,7 @@ function setActiveAnalyticsPreset(range) {
       emailRequiredSave?.addEventListener("click", async () => {
         const email = String(emailRequiredInput?.value || "").trim();
         if (!validateEmail(email)) {
-          if (emailRequiredError) emailRequiredError.textContent = "Введите корректный email.";
+          if (emailRequiredError) emailRequiredError.textContent = "Введите корректный адрес эл. почты.";
           emailRequiredInput?.focus({ preventScroll: true });
           return;
         }
@@ -2182,7 +2182,7 @@ function setActiveAnalyticsPreset(range) {
           if (nextConfig) await openInWebappWidget(nextConfig);
         } catch (err) {
           if (emailRequiredError) {
-            emailRequiredError.textContent = String(err?.message || "Не удалось сохранить email").replace(/^HTTP \d+:\s*/, "");
+            emailRequiredError.textContent = String(err?.message || "Не удалось сохранить эл. почту").replace(/^HTTP \d+:\s*/, "");
           }
         } finally {
           emailRequiredSave.disabled = false;
@@ -2358,7 +2358,7 @@ function setActiveAnalyticsPreset(range) {
 
         if (!tgInitData) {
           const errMsg =
-            "Открой WebApp внутри Telegram. В обычном браузере данных Telegram (initData) нет.";
+            "Откройте приложение внутри Telegram. В обычном браузере данных Telegram нет.";
           todayErrorEl.textContent = errMsg;
           dlog(errMsg);
           return;
@@ -2390,9 +2390,9 @@ function setActiveAnalyticsPreset(range) {
           paymentDescriptionEl.textContent = desc.description;
           paymentKindEl.textContent = queryPayment.kind === "subscription"
             ? "После оплаты подписка активируется автоматически."
-            : "После оплаты баланс PAYG пополнится автоматически.";
+            : "После оплаты баланс пополнится автоматически.";
           forcePaymentScreen = true;
-          try { await fetchReceiptEmail(); } catch { if (paymentStatusEl) paymentStatusEl.textContent = "Email пока не загрузился. Можно повторить позже."; }
+          try { await fetchReceiptEmail(); } catch { if (paymentStatusEl) paymentStatusEl.textContent = "Эл. почта пока не загрузилась. Можно повторить позже."; }
           if (receiptOptIn) receiptOptIn.checked = false;
           syncPaymentEmailGate();
           btnPreparePayment?.addEventListener("click", async () => {

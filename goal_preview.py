@@ -79,7 +79,7 @@ def _targets(result):
     t=result['targets']
     values=validate_totals({'kcal':t['kcal'],'protein_g':t['protein'],'fat_g':t['fat'],'carbs_g':t['carbs']})
     if result.get('status')!='estimated' or not 1<=values['kcal']<=20000 or any(v>5000 for k,v in values.items() if k!='kcal'):
-        raise ValueError('Invalid goal')
+        raise ValueError('Некорректная цель')
     return {k:t[k] for k in ('kcal','protein','fat','carbs')}
 
 

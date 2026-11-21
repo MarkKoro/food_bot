@@ -528,10 +528,10 @@ def kb_pay_mode(current_mode: str, has_sub: bool, payg_balance: int, sub_until_t
             InlineKeyboardButton(
                 f"{sub_mark} ⭐ Подписка", callback_data="pay_mode_set:sub"
             ),
-            InlineKeyboardButton(f"{payg_mark} Pay-as-you-go", callback_data="pay_mode_set:payg"),
+            InlineKeyboardButton(f"{payg_mark} Оплата по факту", callback_data="pay_mode_set:payg"),
         ],
         [InlineKeyboardButton("⭐ Купить подписку", callback_data="premium_menu")],
-        [InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")],
+        [InlineKeyboardButton("➕ Пополнить баланс", callback_data="payg_topups")],
         [InlineKeyboardButton("⬅ Назад", callback_data="settings")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -576,10 +576,10 @@ def kb_payg_topups():
 
 def payg_topups_text() -> str:
     return (
-        "➕ Пополнение PAYG\n\n"
-        "Pay-as-you-go — это оплата по факту: баланс пополняется на выбранную сумму, "
+        "➕ Пополнение баланса\n\n"
+        "Оплата по факту: баланс пополняется на выбранную сумму, "
         "и далее списывается только за выполненные запросы.\n"
-        "Рублёвая оплата откроется на безопасной внешней странице YooKassa.\n"
+        "Рублёвая оплата откроется на безопасной внешней странице ЮKassa.\n"
         "Выбери сумму пополнения ниже."
     )
 
@@ -1181,7 +1181,7 @@ def kb_payment_offer(
             ]
         )
 
-    rows.append([InlineKeyboardButton("➕ Пополнить PAYG", callback_data="payg_topups")])
+    rows.append([InlineKeyboardButton("➕ Пополнить баланс", callback_data="payg_topups")])
 
     if show_templates_button:
         rows.append([
@@ -1216,13 +1216,13 @@ async def send_payment_block_notice(
         "Мы бы очень хотели обработать это сообщение, но сейчас не можем.",
     ]
 
-    balance_text = f"Баланс PAYG: {payg_balance}₽"
+    balance_text = f"Баланс: {payg_balance}₽"
 
     has_saved_templates = await has_templates(get_db(ctx), update.effective_user.id)
 
     if payg_balance < PAYG_COST_RUB and not has_subscription:
         lines.append(
-            "Сейчас нет активной подписки и нет средств на Pay-as-you-go."\
+            "Сейчас нет активной подписки и нет средств на балансе."\
             " Пополните баланс или оформите подписку."
         )
         if has_saved_templates:
@@ -1233,7 +1233,7 @@ async def send_payment_block_notice(
             )
     elif pay_mode == "payg" and payg_balance < PAYG_COST_RUB:
         lines.append(
-            f"Выбран Pay-as-you-go, но баланс пуст. {balance_text}."
+            f"Выбрана оплата по факту, но баланс пуст. {balance_text}."
         )
     elif pay_mode != "payg" and not has_subscription:
         lines.append("Подписка не активна, поэтому запрос не можем выполнить.")
@@ -1249,7 +1249,7 @@ async def send_payment_block_notice(
         show_switch = True
     elif pay_mode != "payg" and payg_balance >= PAYG_COST_RUB:
         lines.append(
-            f"На балансе PAYG есть {payg_balance}₽ — можно перейти в этот режим "
+            f"На балансе есть {payg_balance}₽ — можно перейти в этот режим "
             f"и списывать по {PAYG_COST_RUB}₽ за запрос. Перейти в выбор режима?"
         )
         show_switch = True
@@ -1623,7 +1623,7 @@ async def show_main_menu(
         lines.append('\nПредыдущий приём уже сохранился. Можно открыть результат без повторного расчёта.')
 
     if mode == "payg":
-        lines.append("💳 Выбранный режим оплаты — Pay as You Go.")
+        lines.append("💳 Выбранный режим оплаты — оплата по факту.")
         lines.append(f"Баланс: {balance}₽.")
         lines.append(f"Цена: {PAYG_COST_RUB}₽ за запрос (фото/голос/текст).")
     else:
@@ -1754,7 +1754,7 @@ async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "⚙️ Настройки\n\n"
         "• 🎯 Задать цель КБЖУ вручную — дневная норма по калориям и БЖУ.\n"
         "• 🧮 Опрос — автоматически подберу норму на основе коротких ответов.\n"
-        "• 💳 Режим оплаты — управление подпиской и PAYG внутри настроек.\n"
+        "• 💳 Режим оплаты — управление подпиской и балансом внутри настроек.\n"
         "• 🎁 Подарочный код — активируйте код на премиум-подписку.\n"
     )
     await edit_menu_message(update, ctx, text, kb_settings())
@@ -2180,11 +2180,11 @@ async def show_pay_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• Лимит: **10 запросов в день** (фото/голос/текст)\n"
         "• Деньги с баланса не списываются\n"
         "• Нажми «⭐ Купить подписку», чтобы оплатить срок\n\n"
-        f"2) **Pay-as-you-go** {'✅' if mode == 'payg' else ''}\n"
+        f"2) **Оплата по факту** {'✅' if mode == 'payg' else ''}\n"
         f"• Баланс: **{balance}₽**\n"
         f"• Цена: **{PAYG_COST_RUB}₽ за запрос** (фото/голос/текст)\n"
         "• Лимитов нет\n"
-        "• Нажми «➕ Пополнить PAYG», чтобы пополнить\n\n"
+        "• Нажми «➕ Пополнить баланс», чтобы пополнить\n\n"
         "Выбери режим кнопками ниже — галочка переедет, а режим сохранится."
     )
 
@@ -2604,7 +2604,7 @@ def _build_stats_workbook(
     stat_fill = PatternFill("solid", fgColor="1D4ED8")
 
     ws_summary.merge_cells("A1:L1")
-    ws_summary["A1"] = "FoodBot — расширенный отчёт по питанию"
+    ws_summary["A1"] = "Еда — расширенный отчёт по питанию"
     ws_summary["A1"].font = Font(bold=True, size=14, color="FFFFFF")
     ws_summary["A1"].fill = title_fill
     ws_summary["A1"].alignment = Alignment(horizontal="left", vertical="center")
@@ -3435,7 +3435,7 @@ async def process_meal_description(
     if pay_mode == "payg":
         user_state = await db_get_user_row(db, uid)
         payg_balance = int(user_state.get("credits", 0) or 0)
-        payg_footer = f"\n💳 Остаток PAYG: {payg_balance}₽"
+        payg_footer = f"\n💳 Остаток на балансе: {payg_balance}₽"
 
     msg = "\n".join(lines) + payg_footer
     from progressor_meal_reply import extension
@@ -4402,7 +4402,7 @@ async def on_premium_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, oth
         "⭐ Подписка\n\n"
         "Подписка — это фиксированная оплата за выбранный срок. Пока она активна, "
         "ты используешь бота каждый день в рамках лимита и не платишь отдельно за каждый запрос.\n\n"
-        "Рубли — на внешней платёжной странице ЮKassa, Stars — внутри Telegram. "
+        "Рубли — на внешней платёжной странице ЮKassa, звёзды — внутри Telegram. "
         "Выбери удобный способ в строке нужного срока.\n\n"
         "В разделе «Другие сроки» доступны три месяца и одноразовый вариант «Одна неделя», если ещё не покупал."
     )
@@ -4417,7 +4417,7 @@ async def on_premium_menu_stars(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _send_order_invoice(update, ctx, kind, *, plan_id=None, rub=0, currency="XTR"):
     if currency == "RUB" and not YOOKASSA_PROVIDER_TOKEN:
-        await edit_menu_message(update,ctx,"Оплата картой пока недоступна. Выберите Stars.",kb_back_to_main())
+        await edit_menu_message(update,ctx,"Оплата картой пока недоступна. Выберите оплату звёздами.",kb_back_to_main())
         return False
     try:
         order = await asyncio.to_thread(billing.create_order,update.effective_user.id,kind,plan_id=plan_id,rub=rub,currency=currency)
@@ -4490,8 +4490,8 @@ def format_payment_success_notice(
 
 PAYCHECK_FILTERS = [
     ("all", "Все"),
-    ("missing_email", "Без email"),
-    ("with_email", "С email"),
+    ("missing_email", "Без почты"),
+    ("with_email", "С почтой"),
     ("receipt_pending", "Чек не отправлен"),
     ("receipt_sent", "Чек отправлен"),
     ("wants_receipt", "Хочет чека"),
@@ -4516,15 +4516,15 @@ def _paycheck_card_text(item: dict, index: int, total: int, filter_key: str) -> 
         f"Фильтр: *{escape_md(_paychecks_filter_title(filter_key))}*\n\n"
         f"ID записи: `{item.get('id')}`\n"
         f"Оплачено: `{escape_md(str(item.get('payment_succeeded_at') or '—'))}`\n"
-        f"Provider payment id: `{escape_md(str(item.get('provider_charge_id') or '—'))}`\n"
+        f"Номер платежа у провайдера: `{escape_md(str(item.get('provider_charge_id') or '—'))}`\n"
         f"Сумма: *{item.get('amount_rub')} {escape_md(str(item.get('currency') or 'RUB'))}*\n"
         f"Что куплено: {escape_md(str(item.get('product_title') or '—'))}\n"
-        f"product_kind: `{escape_md(str(item.get('product_kind') or '—'))}`\n"
-        f"Email: `{escape_md(str(item.get('receipt_email') or '—'))}`\n"
-        f"Email status: `{escape_md(str(item.get('receipt_email_status') or 'missing'))}`\n"
-        f"Receipt status: `{escape_md(str(item.get('receipt_status') or 'pending'))}`\n\n"
+        f"Тип покупки: `{escape_md(str(item.get('product_kind') or '—'))}`\n"
+        f"Почта: `{escape_md(str(item.get('receipt_email') or '—'))}`\n"
+        f"Статус почты: `{escape_md(str(item.get('receipt_email_status') or 'нет'))}`\n"
+        f"Статус чека: `{escape_md(str(item.get('receipt_status') or 'ожидается'))}`\n\n"
         f"Пользователь: *{escape_md(full_name)}*\n"
-        f"username: {escape_md(username_line)}\n"
+        f"Имя пользователя: {escape_md(username_line)}\n"
         f"user_id: `{user_id}` · {mention}"
     )
 
@@ -4915,7 +4915,7 @@ async def cmd_grant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not is_admin(update.effective_user.id):
         return
     if not ctx.args:
-        await update.message.reply_text("Использование: /grant_payg <user_id> [rub]")
+        await update.message.reply_text("Использование: /grant_payg <id пользователя> [сумма в ₽]")
         return
 
     try:
@@ -4939,7 +4939,7 @@ async def cmd_grant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         u = await db_get_user_row(db, target_id)
         new_bal = int(u.get("credits", 0) or 0)
 
-    await update.message.reply_text(f"✅ PAYG включен для {target_id}. Баланс: {new_bal}₽")
+    await update.message.reply_text(f"✅ Оплата по факту включена для {target_id}. Баланс: {new_bal}₽")
 
 
 async def cmd_degrant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4962,7 +4962,7 @@ async def cmd_degrant_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     u = await db_get_user_row(db, target_id)
     bal = int(u.get("credits", 0) or 0)
 
-    await update.message.reply_text(f"✅ PAYG выключен для {target_id}. Баланс сохранён: {bal}₽")
+    await update.message.reply_text(f"✅ Оплата по факту выключена для {target_id}. Баланс сохранён: {bal}₽")
 
 
 async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5078,31 +5078,31 @@ async def cmd_stats_payg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     conv_sub  = (sub_users / total_users * 100.0) if total_users else 0.0
 
     text = (
-        "📊 **PAYG / SUB метрики**\n\n"
-        f"1) Users total: **{total_users}**\n"
-        f"2) Users SUB-mode: **{sub_users}** ({conv_sub:.1f}%)\n"
-        f"3) Users PAYG-mode: **{payg_users}** ({conv_payg:.1f}%)\n"
-        f"4) Active SUB (premium_until > now): **{sub_active}**\n\n"
-        f"5) PAYG users with balance>0: **{payg_bal_users}**\n"
-        f"6) PAYG balance sum: **{payg_bal_sum}₽**\n"
-        f"7) PAYG balance avg: **{payg_bal_avg:.1f}₽**\n\n"
-        f"8) Requests today total: **{req_today_total}**\n"
-        f"9) Requests today PAYG: **{req_today_payg}**\n"
-        f"10) Requests today SUB: **{req_today_sub}**\n\n"
-        f"11) Requests 7d total: **{req_7d_total}**\n"
-        f"12) Requests 7d PAYG: **{req_7d_payg}**\n"
-        f"13) Requests 7d SUB: **{req_7d_sub}**\n\n"
-        f"14) Active users 7d total: **{active_7d_total}**\n"
-        f"15) Active users 7d PAYG: **{active_7d_payg}**\n"
-        f"16) Active users 7d SUB: **{active_7d_sub}**\n\n"
-        f"17) PAYG spent today (usage): **{payg_spent_today}₽**\n"
-        f"18) PAYG spent 7d (usage): **{payg_spent_7d}₽**\n"
-        f"19) Avg req/day per active PAYG user (7d): **{(req_7d_payg / (active_7d_payg * 7) if active_7d_payg else 0):.2f}**\n"
-        f"20) Avg req/day per active SUB user (7d): **{(req_7d_sub / (active_7d_sub * 7) if active_7d_sub else 0):.2f}**\n"
+        "📊 **Метрики: подписка и оплата по факту**\n\n"
+        f"1) Всего пользователей: **{total_users}**\n"
+        f"2) В режиме подписки: **{sub_users}** ({conv_sub:.1f}%)\n"
+        f"3) В режиме оплаты по факту: **{payg_users}** ({conv_payg:.1f}%)\n"
+        f"4) Активных подписок: **{sub_active}**\n\n"
+        f"5) С положительным балансом: **{payg_bal_users}**\n"
+        f"6) Сумма балансов: **{payg_bal_sum}₽**\n"
+        f"7) Средний баланс: **{payg_bal_avg:.1f}₽**\n\n"
+        f"8) Запросов сегодня всего: **{req_today_total}**\n"
+        f"9) Запросов сегодня по факту: **{req_today_payg}**\n"
+        f"10) Запросов сегодня по подписке: **{req_today_sub}**\n\n"
+        f"11) Запросов за 7 дней всего: **{req_7d_total}**\n"
+        f"12) Запросов за 7 дней по факту: **{req_7d_payg}**\n"
+        f"13) Запросов за 7 дней по подписке: **{req_7d_sub}**\n\n"
+        f"14) Активных за 7 дней всего: **{active_7d_total}**\n"
+        f"15) Активных за 7 дней по факту: **{active_7d_payg}**\n"
+        f"16) Активных за 7 дней по подписке: **{active_7d_sub}**\n\n"
+        f"17) Списано по факту сегодня: **{payg_spent_today}₽**\n"
+        f"18) Списано по факту за 7 дней: **{payg_spent_7d}₽**\n"
+        f"19) Запросов в день на активного (по факту, 7 дней): **{(req_7d_payg / (active_7d_payg * 7) if active_7d_payg else 0):.2f}**\n"
+        f"20) Запросов в день на активного (подписка, 7 дней): **{(req_7d_sub / (active_7d_sub * 7) if active_7d_sub else 0):.2f}**\n"
     )
 
     if payments_by_provider:
-        text += "\n💰 **Payments by provider (all-time)**\n"
+        text += "\n💰 **Платежи по способам оплаты (за всё время)**\n"
         for prov, cnt, rub, stars in payments_by_provider:
             text += f"• {escape_md(prov)}: {cnt} / {rub}₽ / {stars}⭐\n"
 
@@ -5172,7 +5172,7 @@ async def admin_callback(update,ctx,data):
                 rows.append([InlineKeyboardButton(f"{plan['title']}: {plan['price_rub']}₽",callback_data=f"admin:set:price_{key}_rub"),
                              InlineKeyboardButton(f"{plan['price_stars']}⭐",callback_data=f"admin:set:price_{key}_stars")])
         else:
-            labels = {"payg_cost":"Цена запроса PAYG, ₽","daily_limit":"Запросов в день по подписке","trial_limit":"Запросов за пробный период"}
+            labels = {"payg_cost":"Цена запроса (оплата по факту), ₽","daily_limit":"Запросов в день по подписке","trial_limit":"Запросов за пробный период"}
             rows = [[InlineKeyboardButton(f"{label}: {values[key]}",callback_data=f"admin:set:{key}")] for key,label in labels.items()]
         rows.append([InlineKeyboardButton("⬅️ Управление",callback_data="admin:menu")])
         return await edit_menu_message(update,ctx,"Выберите параметр для изменения:",InlineKeyboardMarkup(rows))
@@ -5183,7 +5183,7 @@ async def admin_callback(update,ctx,data):
         ctx.user_data["state"] = "admin_setting"
         ctx.user_data["admin_setting"] = key
         low, high = billing.LIMITS[key]
-        await edit_menu_message(update,ctx,f"Сейчас: {values[key]}.\nПришлите новое целое значение от {low} до {high}.\nЦены в рублях и Stars задаются отдельно.",
+        await edit_menu_message(update,ctx,f"Сейчас: {values[key]}.\nПришлите новое целое значение от {low} до {high}.\nЦены в рублях и звёздах задаются отдельно.",
                                 InlineKeyboardMarkup([[InlineKeyboardButton("Отмена",callback_data="admin:menu")]]))
 
 

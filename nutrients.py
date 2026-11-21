@@ -8,17 +8,17 @@ NUTRIENTS = {
     'fiber': ('Клетчатка', 'g'), 'sugar': ('Сахара', 'g'),
     'saturated_fat': ('Насыщенные жиры', 'g'), 'monounsaturated_fat': ('Мононенасыщенные жиры', 'g'),
     'polyunsaturated_fat': ('Полиненасыщенные жиры', 'g'), 'trans_fat': ('Трансжиры', 'g'),
-    'omega_3': ('Омега-3', 'g'), 'omega_6': ('Омега-6', 'g'), 'epa': ('EPA', 'mg'), 'dha': ('DHA', 'mg'), 'ala': ('ALA', 'g'),
+    'omega_3': ('Омега-3', 'g'), 'omega_6': ('Омега-6', 'g'), 'epa': ('ЭПК (омега-3)', 'mg'), 'dha': ('ДГК (омега-3)', 'mg'), 'ala': ('АЛК (омега-3)', 'g'),
     'cholesterol': ('Холестерин', 'mg'), 'water': ('Вода в пище', 'g'), 'alcohol': ('Алкоголь', 'g'),
     'calcium': ('Кальций', 'mg'), 'iron': ('Железо', 'mg'), 'magnesium': ('Магний', 'mg'),
     'phosphorus': ('Фосфор', 'mg'), 'potassium': ('Калий', 'mg'), 'sodium': ('Натрий', 'mg'),
     'zinc': ('Цинк', 'mg'), 'copper': ('Медь', 'mg'), 'manganese': ('Марганец', 'mg'),
     'selenium': ('Селен', 'ug'), 'iodine': ('Йод', 'ug'), 'chromium': ('Хром', 'ug'),
     'molybdenum': ('Молибден', 'ug'), 'chloride': ('Хлориды', 'mg'),
-    'vitamin_a_rae': ('Витамин A (RAE)', 'ug'), 'retinol': ('Ретинол', 'ug'), 'beta_carotene': ('Бета-каротин', 'ug'),
+    'vitamin_a_rae': ('Витамин A (ретиноловый эквивалент)', 'ug'), 'retinol': ('Ретинол', 'ug'), 'beta_carotene': ('Бета-каротин', 'ug'),
     'vitamin_b1': ('Витамин B1', 'mg'), 'vitamin_b2': ('Витамин B2', 'mg'), 'vitamin_b3': ('Ниацин', 'mg'),
     'vitamin_b5': ('Пантотеновая кислота', 'mg'), 'vitamin_b6': ('Витамин B6', 'mg'), 'biotin': ('Биотин', 'ug'),
-    'folate_dfe': ('Фолат (DFE)', 'ug'), 'folic_acid': ('Фолиевая кислота', 'ug'), 'vitamin_b12': ('Витамин B12', 'ug'),
+    'folate_dfe': ('Фолат (пищевой эквивалент)', 'ug'), 'folic_acid': ('Фолиевая кислота', 'ug'), 'vitamin_b12': ('Витамин B12', 'ug'),
     'vitamin_c': ('Витамин C', 'mg'), 'vitamin_d': ('Витамин D', 'ug'), 'vitamin_e': ('Витамин E', 'mg'), 'vitamin_k': ('Витамин K', 'ug'),
     'choline': ('Холин', 'mg'), 'leucine': ('Лейцин', 'g'), 'isoleucine': ('Изолейцин', 'g'),
     'valine': ('Валин', 'g'), 'lysine': ('Лизин', 'g'), 'methionine': ('Метионин', 'g'),
@@ -46,7 +46,7 @@ def normalize(code, value, unit):
     unit = {'µg': 'ug', 'μg': 'ug', 'mcg': 'ug'}.get(unit, unit)
     factors = {'g': 1, 'mg': .001, 'ug': .000001}
     if unit not in factors:
-        raise ValueError('Нужны г, мг или мкг; IU без формы вещества не переводятся')
+        raise ValueError('Нужны г, мг или мкг; МЕ без формы вещества не переводятся')
     if value is None:
         return None, expected
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:

@@ -11,7 +11,7 @@ def change(path,tg_id,body):
     if body.get('action') not in ('preview','apply'):raise ValueError('invalid_action')
     settings=get_settings(path,tg_id);current=settings['timezone']
     value=preview(current,selected,['Связанные подсказки: 19:00–21:00','Недельная сводка: выбранный вами день и час'])
-    value['note']+=' В Food это пояс уведомлений; даты существующего дневника продолжают считаться по Москве.'
+    value['note']+=' В разделе «Еда» это пояс уведомлений; даты существующего дневника продолжают считаться по Москве.'
     if body['action']=='apply':
         with closing(sqlite3.connect(path,timeout=5)) as conn,conn:
             conn.execute('BEGIN IMMEDIATE')

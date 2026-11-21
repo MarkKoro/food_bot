@@ -32,7 +32,7 @@ def save_preferences(path,user_id,workout,nutrient,tz):
     if type(workout) is not bool or type(nutrient) is not bool or not isinstance(tz,str) or len(tz)>80:
         raise ValueError('Укажите настройки уведомлений')
     try: ZoneInfo(tz)
-    except (ValueError,KeyError): raise ValueError('Укажите часовой пояс из списка IANA')
+    except (ValueError,KeyError): raise ValueError('Выберите часовой пояс из списка')
     stamp=time.time()
     with closing(sqlite3.connect(path,timeout=5)) as db, db:
         old=db.execute('SELECT workout_enabled,nutrient_enabled,enabled_at FROM progressor_food_preferences WHERE user_id=?',(user_id,)).fetchone()

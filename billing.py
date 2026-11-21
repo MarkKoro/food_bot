@@ -101,7 +101,7 @@ def utc_datetime(value=None):
 
 def extend_subscription(conn, user_id, days):
     if not 1 <= days <= 36500:
-        raise ValueError("Invalid subscription duration")
+        raise ValueError("Некорректный срок подписки")
     conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
     row = conn.execute("SELECT premium_until FROM users WHERE telegram_id=?", (user_id,)).fetchone()
     now = utc_datetime()
@@ -134,7 +134,7 @@ def start_user(user_id):
 def remember_telegram_event(user_id, event):
     charge_id = event.get("telegram_payment_charge_id")
     if not charge_id:
-        raise PaymentError("Missing Telegram charge id")
+        raise PaymentError("Нет номера платежа Telegram")
     with connection(write=True) as conn:
         conn.execute("INSERT OR IGNORE INTO payment_events(charge_id,user_id,event_json) VALUES(?,?,?)",
                      (charge_id,user_id,json.dumps(event,ensure_ascii=False)))
@@ -145,7 +145,7 @@ def apply_telegram_event(user_id, event):
     order_id = payload[5:] if payload.startswith("food:") else None
     order = get_order(order_id) if order_id else legacy_order(payload,user_id,event["total_amount"],event["currency"])
     if order_id and order["channel"] != "telegram":
-        raise PaymentError("Invalid payment channel")
+        raise PaymentError("Неизвестный способ оплаты")
     applied = settle(user_id=user_id,amount=event["total_amount"],currency=event["currency"],
                      provider="stars" if event["currency"]=="XTR" else "card",payload=payload,
                      telegram_id=event["telegram_payment_charge_id"],provider_id=event.get("provider_payment_charge_id"),
@@ -180,7 +180,7 @@ def create_order(user_id, kind, *, plan_id=None, rub=0, currency="RUB", channel=
             days, credit, title = plan["days"], 0, f"Подписка: {plan['title']}"
             amount = plan["price_rub"] * 100 if currency == "RUB" else plan["price_stars"]
         elif kind == "payg_topup" and type(rub) is int and rub in {60, 100, 200, 400}:
-            days, credit, title = 0, rub, f"Пополнение PAYG: {rub}₽"
+            days, credit, title = 0, rub, f"Пополнение баланса: {rub}₽"
             amount = rub * 100 if currency == "RUB" else (rub * 2 + 2) // 3
         else:
             raise PaymentError("Неизвестный вид оплаты")
@@ -249,7 +249,7 @@ def legacy_order(payload, user_id, amount, currency):
         rub = data.get("rub")
         if type(rub) is not int or rub not in {60,100,200,400}:
             raise PaymentError("Некорректная сумма")
-        order = dict(kind="payg_topup",plan_id=None,days=0,credit_rub=rub,title=f"PAYG +{rub}₽",
+        order = dict(kind="payg_topup",plan_id=None,days=0,credit_rub=rub,title=f"Пополнение баланса +{rub}₽",
                      amount=rub*100 if currency=="RUB" else (rub*2+2)//3)
     elif plan_id in PLANS:
         plan = PLANS[plan_id]
@@ -332,11 +332,11 @@ def check_meal_budget(conn, user_id, *, mode='sub', admin=False, cost=None, cons
     charge=0
     if mode=='payg':
         charge=cost if cost is not None else values['payg_cost']
-        if type(charge) is not int or charge<1: raise ValueError('Invalid charge')
-        if (user['credits'] or 0)<charge: raise PaymentError('Недостаточно средств. Пополните PAYG и повторите запрос.')
+        if type(charge) is not int or charge<1: raise ValueError('Некорректное списание')
+        if (user['credits'] or 0)<charge: raise PaymentError('Недостаточно средств. Пополните баланс и повторите запрос.')
         if consume:
             changed=conn.execute('UPDATE users SET credits=credits-? WHERE telegram_id=? AND credits>=?',(charge,user_id,charge))
-            if changed.rowcount!=1: raise PaymentError('Недостаточно средств. Пополните PAYG и повторите запрос.')
+            if changed.rowcount!=1: raise PaymentError('Недостаточно средств. Пополните баланс и повторите запрос.')
     else:
         used=conn.execute("SELECT COUNT(*) FROM requests WHERE user_id=? AND date(created_at)=date('now','localtime')",(user_id,)).fetchone()[0]
         if used>=values['daily_limit']: raise PaymentError('Дневной лимит исчерпан. Баланс не списан.')
@@ -391,7 +391,7 @@ def save_meal(user_id, totals, raw_json, *, source_key, kind=None, mode="sub", a
             # acknowledgement can be lost. Never release by subject alone.
             attempt = conn.execute('SELECT subject,scope FROM progressor_ai_attempts WHERE token=?', (_attempt_token,)).fetchone()
             if not attempt or attempt['subject'] != str(user_id) or attempt['scope'] != 'food_analysis':
-                raise ValueError('Meal analysis attempt does not belong to this action')
+                raise ValueError('Эта попытка анализа относится к другому действию')
             conn.execute('UPDATE progressor_ai_attempts SET finished=?,successful=1 WHERE token=? AND subject=? AND scope=? AND finished IS NULL',
                          (time.time(), _attempt_token, str(user_id), 'food_analysis'))
         photo_recovery.complete(conn, user_id, source_key, _photo_draft, meal_id=cur.lastrowid)

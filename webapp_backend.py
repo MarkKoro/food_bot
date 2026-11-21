@@ -91,10 +91,10 @@ app.mount(
 
 def parse_init_data(init_data: str) -> Dict[str, str]:
     if not isinstance(init_data, str) or len(init_data) > 16384:
-        raise HTTPException(401, "Invalid init data")
+        raise HTTPException(401, "Некорректные данные запуска. Откройте приложение заново из бота.")
     pairs = parse_qsl(init_data, keep_blank_values=True)
     if len({k for k,v in pairs}) != len(pairs):
-        raise HTTPException(401, "Duplicate init data fields")
+        raise HTTPException(401, "Некорректные данные запуска. Откройте приложение заново из бота.")
     return dict(pairs)
 
 
@@ -112,9 +112,9 @@ def verify_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -
     params = parse_init_data(init_data)
     signature = params.get("hash", "")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", signature):
-        raise HTTPException(401, "Invalid hash")
+        raise HTTPException(401, "Не удалось подтвердить вход. Откройте приложение заново из бота.")
     if not hmac.compare_digest(calc_hash(build_data_check_string(params), bot_token), signature.lower()):
-        raise HTTPException(401, "Invalid init data signature")
+        raise HTTPException(401, "Не удалось подтвердить вход. Откройте приложение заново из бота.")
     try:
         auth_ts = int(params["auth_date"])
         user = json.loads(params["user"])
@@ -123,7 +123,7 @@ def verify_init_data(init_data: str, bot_token: str, max_age_sec: int = 86400) -
         if not isinstance(user, dict) or type(user.get("id")) is not int or not 0 < user["id"] < 2**63:
             raise ValueError("user")
     except (KeyError, ValueError, TypeError, OverflowError):
-        raise HTTPException(401, "Invalid or expired Telegram session")
+        raise HTTPException(401, "Сессия Telegram истекла. Откройте приложение заново из бота.")
     return {**params, "user": user}
 
 
@@ -132,12 +132,12 @@ def get_verified_user_id(init_data: str = Header(None, alias="X-Tg-Init-Data")) 
     if shared:
         return int(shared["sub"])
     if not init_data:
-        raise HTTPException(status_code=401, detail="Missing Telegram init data")
+        raise HTTPException(status_code=401, detail="Нет данных Telegram. Откройте приложение из бота.")
 
     params = verify_init_data(init_data, BOT_TOKEN)
     user = params.get("user")
     if not user or "id" not in user:
-        raise HTTPException(status_code=401, detail="Missing user in init data")
+        raise HTTPException(status_code=401, detail="Не удалось определить пользователя. Откройте приложение из бота.")
 
     return int(user["id"])
 
@@ -147,11 +147,11 @@ def get_verified_user(init_data: str = Header(None, alias="X-Tg-Init-Data")) -> 
     if shared:
         return shared["user"]
     if not init_data:
-        raise HTTPException(status_code=401, detail="Missing Telegram init data")
+        raise HTTPException(status_code=401, detail="Нет данных Telegram. Откройте приложение из бота.")
     params = verify_init_data(init_data, BOT_TOKEN)
     user = params.get("user")
     if not user or "id" not in user:
-        raise HTTPException(status_code=401, detail="Missing user in init data")
+        raise HTTPException(status_code=401, detail="Не удалось определить пользователя. Откройте приложение из бота.")
     return user
 
 
@@ -162,7 +162,7 @@ def _normalize_email(email: str) -> str:
 def _validate_email_or_400(email: str) -> str:
     normalized = _normalize_email(email)
     if not normalized or len(normalized)>254 or not EMAIL_RE.fullmatch(normalized):
-        raise HTTPException(status_code=400, detail="Укажите корректный email")
+        raise HTTPException(status_code=400, detail="Укажите корректный адрес эл. почты")
     return normalized
 
 
@@ -266,7 +266,7 @@ def _next_meal_access(user_id):
     from contextlib import closing
     with closing(get_conn()) as conn:
         user=conn.execute('SELECT * FROM users WHERE telegram_id=?',(user_id,)).fetchone()
-        if not user:raise HTTPException(403,'Сначала откройте Food из своего бота.')
+        if not user:raise HTTPException(403,'Сначала откройте раздел «Еда» из своего бота.')
         try:
             premium=bool(user['is_premium'] and user['premium_until'] and billing.utc_datetime(user['premium_until'])>billing.utc_datetime())
             trial=bool(user['trial_until'] and billing.utc_datetime(user['trial_until'])>billing.utc_datetime()
@@ -275,7 +275,7 @@ def _next_meal_access(user_id):
         reset=conn.execute('SELECT revision FROM progressor_food_resets WHERE user_id=?',(user_id,)).fetchone()
         revision=reset['revision'] if reset else 0
     if not premium and not trial and not bundle_until(DB_PATH,user_id):
-        raise HTTPException(403,'Нужен действующий доступ Food. Другие продукты для выбора еды не требуются.')
+        raise HTTPException(403,'Нужен действующий доступ к разделу «Еда». Другие продукты для выбора еды не требуются.')
     return revision
 
 
@@ -287,7 +287,7 @@ async def _next_meal_proxy(user_id,operation=None):
     try:
         result=await call('food','/internal/v1/connections/next-meal',body,timeout=1.5)
         current_revision=await asyncio.to_thread(_next_meal_access,user_id)
-        if current_revision!=revision:raise HTTPException(409,'Данные Food очищены. Обновите варианты.')
+        if current_revision!=revision:raise HTTPException(409,'Данные питания очищены. Обновите варианты.')
         if (not isinstance(result,dict) or result.get('owner_subject')!=str(user_id)
                 or result.get('data_reset_revision')!=revision):raise ValueError('invalid_owner_or_reset')
         return result
@@ -353,7 +353,7 @@ async def progressor_profile_plan(payload:dict,user_id:int=Depends(get_verified_
             conflicts=shared['conflicts']
             for field,value in shared['values'].items():
                 if field not in profile: profile[field]=value;provenance[field]=shared['provenance'].get(field)
-        except Exception: raise HTTPException(503,'Общий профиль пока недоступен; можно заполнить поля Food')
+        except Exception: raise HTTPException(503,'Общий профиль пока недоступен; можно заполнить поля в разделе «Еда»')
     result=calculate_plan(profile) if not conflicts else {'status':'conflicting_profile','missing_fields':[]}
     result['provenance']=provenance;result['conflicts']=conflicts
     context_hash=previews.fingerprint({'profile':profile,'provenance':provenance,'conflicts':conflicts,'use_shared':use_shared})
@@ -410,7 +410,7 @@ def _require_user_receipt_email(conn: sqlite3.Connection, user_id: int) -> str:
     email = _normalize_email(info.get("receipt_email") or "")
     status = str(info.get("receipt_email_status") or "missing")
     if not email or status != "provided":
-        raise HTTPException(status_code=409, detail="Перед оплатой нужно сохранить email для чека")
+        raise HTTPException(status_code=409, detail="Перед оплатой нужно сохранить эл. почту для чека")
     return email
 
 
@@ -420,18 +420,18 @@ def _require_user_receipt_email(conn: sqlite3.Connection, user_id: int) -> str:
 
 def _widget_guard() -> None:
     if not YOOKASSA_WIDGET_ENABLED:
-        raise HTTPException(status_code=503, detail="YooKassa Widget payments are disabled")
+        raise HTTPException(status_code=503, detail="Оплата картой внутри приложения отключена")
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         logger.error("YooKassa widget misconfigured: missing shop credentials")
-        raise HTTPException(status_code=503, detail="YooKassa Widget is not configured")
+        raise HTTPException(status_code=503, detail="Оплата картой временно недоступна")
 
 
 def _yookassa_guard() -> None:
     if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
         logger.error("YooKassa misconfigured: missing shop credentials")
-        raise HTTPException(status_code=503, detail="YooKassa is not configured")
+        raise HTTPException(status_code=503, detail="Оплата картой временно недоступна")
     if not YOOKASSA_RETURN_URL:
-        raise HTTPException(status_code=503, detail="YooKassa return URL is not configured")
+        raise HTTPException(status_code=503, detail="Оплата картой временно недоступна")
 
 
 def _yookassa_headers(idempotence_key: Optional[str] = None) -> Dict[str, str]:
@@ -468,7 +468,7 @@ def _provider_request(order, request):
     with billing.connection(write=True) as conn:
         saved = billing.get_order(order["id"], conn)
         if saved["external_id"] and saved["external_id"] != payment["id"]:
-            raise HTTPException(502, "Provider payment mismatch")
+            raise HTTPException(502, "Платёж не совпадает со счётом. Не оплачивайте повторно; обратитесь в поддержку.")
         conn.execute("UPDATE payment_orders SET external_id=?, response_json=? WHERE id=?",
                      (payment["id"], json.dumps(payment, ensure_ascii=False), order["id"]))
     return payment
@@ -508,22 +508,22 @@ def _create_redirect_payment(user_id: int, kind: str, plan_id: Optional[str], ru
 def _fetch_yookassa_payment(payment_id: str) -> Dict[str, Any]:
     _yookassa_guard()
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,100}", payment_id):
-        raise HTTPException(400, "Invalid payment id")
+        raise HTTPException(400, "Некорректный номер платежа")
     auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
     try:
         with httpx.Client(timeout=20.0, auth=auth) as client:
             res = client.get(f"https://api.yookassa.ru/v3/payments/{payment_id}")
     except Exception as exc:
         logger.exception("YooKassa fetch payment failed: %s", payment_id)
-        raise HTTPException(status_code=502, detail="YooKassa status request failed") from exc
+        raise HTTPException(status_code=502, detail="Не удалось получить статус оплаты. Попробуйте ещё раз.") from exc
 
     if res.status_code >= 400:
         logger.error("YooKassa status HTTP %s for %s", res.status_code, payment_id)
-        raise HTTPException(status_code=502, detail="YooKassa status request error")
+        raise HTTPException(status_code=502, detail="Не удалось получить статус оплаты. Попробуйте ещё раз.")
 
     payment = res.json()
     if not isinstance(payment, dict) or payment.get("id") != payment_id:
-        raise HTTPException(502, "Provider payment mismatch")
+        raise HTTPException(502, "Платёж не совпадает со счётом. Не оплачивайте повторно; обратитесь в поддержку.")
     return payment
 
 
@@ -1175,7 +1175,7 @@ def stats_day(
     try:
         day = dt.date.fromisoformat(date or _today_str()).isoformat()
     except ValueError:
-        raise HTTPException(400,"Invalid date")
+        raise HTTPException(400,"Некорректная дата")
     return _build_stats_for_day(user_id, day)
 
 
@@ -1233,16 +1233,16 @@ def stats_advanced(
             end = today
         elif range == "custom":
             if not start_date or not end_date:
-                raise HTTPException(status_code=400, detail="start_date and end_date are required for custom range")
+                raise HTTPException(status_code=400, detail="Укажите начало и конец периода")
             start = dt.date.fromisoformat(start_date)
             end = dt.date.fromisoformat(end_date)
         else:
-            raise HTTPException(status_code=400, detail="Unsupported range")
+            raise HTTPException(status_code=400, detail="Неизвестный период")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+        raise HTTPException(status_code=400, detail="Неверный формат даты, нужен ГГГГ-ММ-ДД")
 
     if start > end:
-        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+        raise HTTPException(status_code=400, detail="Начало периода должно быть не позже его конца")
 
     if (end-start).days > 3660:
         raise HTTPException(400,"Выберите период не больше 10 лет")
@@ -1403,11 +1403,11 @@ def _create_invoice_link(
     with httpx.Client(timeout=15.0) as client:
         res = client.post(_telegram_api_url("createInvoiceLink"), data=body)
     if res.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Telegram API HTTP {res.status_code}")
+        raise HTTPException(status_code=502, detail=f"Telegram временно недоступен (код {res.status_code}). Попробуйте ещё раз.")
 
     payload = res.json()
     if not payload.get("ok"):
-        raise HTTPException(status_code=502, detail=f"Telegram API error: {payload.get('description', 'unknown')}" )
+        raise HTTPException(status_code=502, detail="Telegram не принял запрос. Попробуйте ещё раз." )
     return str(payload.get("result") or "")
 
 
@@ -1426,7 +1426,7 @@ def create_redirect_payment(
     kind = str((body or {}).get("kind") or "").strip()
     wants_receipt = (body or {}).get("wants_receipt",False)
     if type(wants_receipt) is not bool:
-        raise HTTPException(400,"wants_receipt must be boolean")
+        raise HTTPException(400,"Некорректный выбор чека")
     receipt_email = ""
     if wants_receipt:
         conn = get_conn()
@@ -1438,7 +1438,7 @@ def create_redirect_payment(
     if kind == "subscription":
         plan_id = str((body or {}).get("plan_id") or "").strip()
         if not plan_id:
-            raise HTTPException(status_code=400, detail="plan_id is required")
+            raise HTTPException(status_code=400, detail="Выберите тариф")
         return _create_redirect_payment(
             user_id=user_id,
             kind=kind,
@@ -1457,7 +1457,7 @@ def create_redirect_payment(
                 raise ValueError
             rub = rub_raw
         except Exception:
-            raise HTTPException(status_code=400, detail="rub must be integer")
+            raise HTTPException(status_code=400, detail="Сумма должна быть целым числом рублей")
         return _create_redirect_payment(
             user_id=user_id,
             kind=kind,
@@ -1469,7 +1469,7 @@ def create_redirect_payment(
             full_name=full_name,
         )
 
-    raise HTTPException(status_code=400, detail="Unsupported payment kind")
+    raise HTTPException(status_code=400, detail="Неизвестный вид оплаты")
 
 
 @app.get("/api/payments/yookassa/status")
@@ -1487,14 +1487,14 @@ def create_widget_payment(
 ) -> Dict[str, Any]:
     # deprecated: redirect flow is the primary RUB path
     if PAYMENTS_EXTERNAL_ONLY:
-        raise HTTPException(status_code=410, detail="Deprecated: use /api/payments/redirect/create")
+        raise HTTPException(status_code=410, detail="Этот способ оплаты устарел. Обновите приложение.")
 
     kind = str((body or {}).get("kind") or "").strip()
 
     if kind == "subscription":
         plan_id = str((body or {}).get("plan_id") or "").strip()
         if not plan_id:
-            raise HTTPException(status_code=400, detail="plan_id is required")
+            raise HTTPException(status_code=400, detail="Выберите тариф")
         return _create_widget_payment(user_id=user_id, kind=kind, plan_id=plan_id, rub=0)
 
     if kind == "payg_topup":
@@ -1504,10 +1504,10 @@ def create_widget_payment(
                 raise ValueError
             rub = rub_raw
         except Exception:
-            raise HTTPException(status_code=400, detail="rub must be integer")
+            raise HTTPException(status_code=400, detail="Сумма должна быть целым числом рублей")
         return _create_widget_payment(user_id=user_id, kind=kind, plan_id=None, rub=rub)
 
-    raise HTTPException(status_code=400, detail="Unsupported payment kind")
+    raise HTTPException(status_code=400, detail="Неизвестный вид оплаты")
 
 
 @app.get("/api/payments/widget/status")
@@ -1540,7 +1540,7 @@ def create_payment_invoice_link(
     user_id: int = Depends(get_verified_user_id),
 ) -> Dict[str, Any]:
     if not YOOKASSA_PROVIDER_TOKEN:
-        raise HTTPException(status_code=503, detail="Card payments are temporarily unavailable")
+        raise HTTPException(status_code=503, detail="Оплата картой временно недоступна")
 
     try:
         rub = int(value) if mode == "payg" else 0

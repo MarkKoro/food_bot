@@ -28,7 +28,7 @@ def image_mime(data):
     if data.startswith(b'\x89PNG\r\n\x1a\n'): return 'image/png'
     if data[:6] in (b'GIF87a', b'GIF89a'): return 'image/gif'
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP': return 'image/webp'
-    raise FoodAnalysisError('Отправьте фото еды в JPEG, PNG или WEBP.')
+    raise FoodAnalysisError('Отправьте фото еды в формате JPEG, PNG или WEBP.')
 
 
 def prepare_image(data, max_side=2048, quality=90, threshold=2_500_000):

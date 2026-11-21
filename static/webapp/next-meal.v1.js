@@ -21,14 +21,14 @@
   const removeSaved=uid=>{try{sessionStorage.removeItem(key(uid));}catch{}};
   function element(tag,text,parent=content){const node=document.createElement(tag);if(text!==null)node.textContent=text;parent.append(node);return node;}
   function button(text,fn,parent=actions){const b=element('button',text,parent);b.type='button';b.className='pill pill-secondary';b.disabled=busy;b.onclick=fn;return b;}
-  async function proofHash(value){if(!crypto?.subtle)throw Error('Не удалось подтвердить сессию. Откройте Food заново из бота.');return [...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))].map(n=>n.toString(16).padStart(2,'0')).join('');}
+  async function proofHash(value){if(!crypto?.subtle)throw Error('Не удалось подтвердить сессию. Откройте раздел «Еда» заново из бота.');return [...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))].map(n=>n.toString(16).padStart(2,'0')).join('');}
   function clearIdentity(){serial++;state=null;owner=null;pending=null;busy=false;content.replaceChildren();actions.replaceChildren();notice.textContent='Сессия изменилась. Обновите варианты.';button('Обновить варианты',load);}
   const active=(ticket,proof)=>ticket===serial&&box.open&&proof===scope();
   async function request(operation,proof){
     const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
     try{
       const response=await fetch('/api/next-meal',{method:operation?'POST':'GET',headers:{...(proof?{'X-Tg-Init-Data':proof}:{}),...(operation?{'Content-Type':'application/json'}:{})},body:operation?JSON.stringify({operation}):undefined,signal:controller.signal,cache:'no-store'});
-      if(!response.ok){const error=Error(response.status===409?'Выбор или настройки изменились. Обновите варианты.':response.status===401?'Откройте Food заново из бота.':response.status===403?'Нужен действующий доступ Food.':'Выбор пока недоступен. Еду можно записывать как обычно.');error.status=response.status;throw error;}
+      if(!response.ok){const error=Error(response.status===409?'Выбор или настройки изменились. Обновите варианты.':response.status===401?'Откройте раздел «Еда» заново из бота.':response.status===403?'Нужен действующий доступ к разделу «Еда».':'Выбор пока недоступен. Еду можно записывать как обычно.');error.status=response.status;throw error;}
       const result=await response.json();
       if(!result||typeof result.owner_subject!=='string'||!/^[1-9][0-9]*$/.test(result.owner_subject))throw Error('Сессия не подтверждена.');
       return result;
@@ -44,7 +44,7 @@
     content.replaceChildren();actions.replaceChildren();if(!state)return;
     if(pending){element('p','Ответ на ваш выбор пока не подтверждён. Проверка повторяет ту же операцию; второй выбор не создаётся.');button('Проверить выбор',send);return;}
     if(!state.available){
-      const reasons={preferences_required:'Сначала выберите рацион и исключения в общих настройках. Если исключений нет, это тоже нужно подтвердить.',preferences_unavailable:'Настройки питания не удалось прочитать. Проверьте рацион и исключения.',food_connection_disabled:'Связь Food отключена. Её можно включить в общих настройках.',food_access_required:'Нужен действующий доступ Food. Другие продукты не требуются.'};
+      const reasons={preferences_required:'Сначала выберите рацион и исключения в общих настройках. Если исключений нет, это тоже нужно подтвердить.',preferences_unavailable:'Настройки питания не удалось прочитать. Проверьте рацион и исключения.',food_connection_disabled:'Связь с разделом «Еда» отключена. Её можно включить в общих настройках.',food_access_required:'Нужен действующий доступ к разделу «Еда». Другие продукты не требуются.'};
       element('p',reasons[state.unavailable_reason]||'Данные связи пока недоступны. Записывать съеденное можно как обычно.');
       if(['preferences_required','preferences_unavailable','food_connection_disabled'].includes(state.unavailable_reason))button('Рацион и исключения',()=>window.Progressor?.openConnections?.());
       button('Обновить варианты',load);return;
@@ -74,7 +74,7 @@
     const proof=scope(),ticket=++serial,uid=owner;busy=true;render();
     try{
       const hash=await proofHash(proof);if(!active(ticket,proof)||owner!==uid)return;
-      if(typeof crypto.randomUUID!=='function')throw Error('Откройте Food в актуальной версии Telegram.');
+      if(typeof crypto.randomUUID!=='function')throw Error('Откройте раздел «Еда» в актуальной версии Telegram.');
       pending={operation_id:crypto.randomUUID().replaceAll('-',''),action:idea?'choose':'cancel',day:state.day,choice_revision:state.choice_revision,preferences_revision:state.preferences_revision,catalog_version:state.catalog_version,data_reset_revision:state.data_reset_revision,...(idea?{idea_id:idea}:{})};
       try{sessionStorage.setItem(key(uid),JSON.stringify({owner:uid,proof:hash,expires:Date.now()+86400000,operation:pending}));}catch{}
     }catch(error){if(active(ticket,proof))notice.textContent=error.message;}
